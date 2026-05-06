@@ -4,11 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import clsx from "clsx";
 import {
+  AlertTriangle,
   BadgeCheck,
   Bot,
-  ChevronRight,
   Clipboard,
   Cloud,
+  Clock3,
+  Download,
   ExternalLink,
   FileJson,
   Fingerprint,
@@ -16,21 +18,22 @@ import {
   Laptop,
   LockKeyhole,
   Plus,
+  Power,
   RefreshCw,
   Search,
   Settings,
   ShieldCheck,
+  Trash2,
   Upload,
 } from "lucide-react";
 import "./App.css";
 import logoUrl from "./assets/logo.svg";
-import { parseAuthJson, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
+import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 
 type ImportMode = "paste" | "file" | "local" | "oauth";
-type ViewMode = "list" | "card";
 type OAuthProvider = "codex" | "gemini";
 
-const viewModeStorageKey = "super-ai.account-view-mode";
+const autoRefreshIntervalSeconds = 300;
 
 type BackendImportResult = {
   imported: ManagedAccount[];
@@ -60,6 +63,33 @@ const seedAccounts: ManagedAccount[] = [
       hasIdToken: true,
       expiresAt: Math.floor(Date.now() / 1000) + 3600 * 24,
     },
+    accountName: "Personal Codex",
+    planType: "plus",
+    subscriptionActiveUntil: Math.floor(Date.now() / 1000) + 3600 * 24 * 30,
+    status: {
+      state: "available",
+      label: "可用",
+      updatedAt: Math.floor(Date.now() / 1000) - 900,
+    },
+    quota: {
+      metrics: [
+        {
+          key: "codex-5h",
+          label: "5H",
+          remainingPercent: 68,
+          resetAt: Math.floor(Date.now() / 1000) + 3600 * 2,
+          state: "available",
+        },
+        {
+          key: "codex-weekly",
+          label: "WEEKLY",
+          remainingPercent: 24,
+          resetAt: Math.floor(Date.now() / 1000) + 3600 * 28,
+          state: "warning",
+        },
+      ],
+      lastUpdated: Math.floor(Date.now() / 1000) - 900,
+    },
     createdAt: Math.floor(Date.now() / 1000) - 3600 * 48,
     updatedAt: Math.floor(Date.now() / 1000) - 900,
   },
@@ -76,6 +106,32 @@ const seedAccounts: ManagedAccount[] = [
       hasAccessToken: true,
       hasRefreshToken: true,
       hasIdToken: false,
+    },
+    accountName: "Workspace Gemini",
+    status: {
+      state: "unavailable",
+      label: "不可用",
+      reason: "最近一次额度查询返回 403",
+      updatedAt: Math.floor(Date.now() / 1000) - 420,
+    },
+    quota: {
+      metrics: [
+        {
+          key: "gemini-pro",
+          label: "PRO",
+          remainingPercent: 0,
+          detail: "403",
+          state: "unavailable",
+        },
+        {
+          key: "gemini-flash",
+          label: "FLASH",
+          remainingPercent: 42,
+          state: "available",
+        },
+      ],
+      error: "最近一次额度查询返回 403",
+      lastUpdated: Math.floor(Date.now() / 1000) - 420,
     },
     createdAt: Math.floor(Date.now() / 1000) - 3600 * 12,
     updatedAt: Math.floor(Date.now() / 1000) - 420,
@@ -128,32 +184,193 @@ function formatRelative(timestamp: number) {
   return `${Math.floor(diff / 86400)} 天前`;
 }
 
+function formatDateTime(timestamp?: number | string) {
+  if (timestamp === undefined) return undefined;
+  const date = typeof timestamp === "number" ? new Date(timestamp * 1000) : new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return undefined;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatReset(resetAt?: number | string) {
+  if (resetAt === undefined) return undefined;
+  if (typeof resetAt === "string") return resetAt;
+  const diff = resetAt - Math.floor(Date.now() / 1000);
+  if (diff <= 0) return "已重置";
+  if (diff < 3600) return `${Math.ceil(diff / 60)}m`;
+  if (diff < 86400) return `${Math.ceil(diff / 3600)}h`;
+  return `${Math.ceil(diff / 86400)}d`;
+}
+
+function formatCountdown(seconds: number) {
+  const total = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(total / 60);
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  const remainingSeconds = total % 60;
+  if (hours > 0) return `${hours}:${String(remainingMinutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+  return `${String(remainingMinutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
+function stateLabel(state: AccountState) {
+  if (state === "available") return "可用";
+  if (state === "warning") return "需关注";
+  if (state === "unavailable") return "不可用";
+  return "未知";
+}
+
+function normalizePlanKey(value?: string) {
+  return (value || "").trim().toLowerCase();
+}
+
+function resolveCodexPlanBadge(account: ManagedAccount) {
+  const raw = normalizePlanKey(account.planType || account.plan);
+  const authFile = normalizePlanKey(account.authFilePlanType);
+  if (!raw) {
+    return { label: account.plan || "未知", tone: "unknown" };
+  }
+  if (raw.includes("enterprise")) return { label: "Enterprise", tone: "enterprise" };
+  if (raw.includes("team") || raw.includes("business") || raw.includes("edu")) return { label: "Team", tone: "team" };
+  if (raw.includes("plus")) return { label: "Plus", tone: "plus" };
+  if (raw.includes("pro")) {
+    if (authFile.includes("5x") || authFile.includes("prolite") || authFile.includes("pro-lite") || authFile.includes("pro-5x")) {
+      return { label: "Pro 5x", tone: "pro" };
+    }
+    if (authFile.includes("20x") || authFile.includes("promax") || authFile.includes("pro-max") || authFile.includes("pro-20x")) {
+      return { label: "Pro 20x", tone: "pro" };
+    }
+    return { label: "Pro 20x", tone: "pro" };
+  }
+  if (raw.includes("free")) return { label: "Free", tone: "free" };
+  return { label: account.plan || raw, tone: "unknown" };
+}
+
+function resolveValidityUntil(account: ManagedAccount) {
+  if (typeof account.subscriptionActiveUntil === "number") return account.subscriptionActiveUntil;
+  if (typeof account.subscriptionActiveUntil === "string") {
+    const parsed = Date.parse(account.subscriptionActiveUntil);
+    if (!Number.isNaN(parsed)) return Math.floor(parsed / 1000);
+    const numeric = Number(account.subscriptionActiveUntil);
+    if (Number.isFinite(numeric)) return numeric > 1e12 ? Math.floor(numeric / 1000) : numeric;
+  }
+  return account.tokenMeta.expiresAt;
+}
+
+function formatValidityText(account: ManagedAccount) {
+  const until = resolveValidityUntil(account);
+  if (until === undefined) return { label: "有效期", detail: "未读到有效期信息" };
+  const now = Math.floor(Date.now() / 1000);
+  const remaining = until - now;
+  if (remaining <= 0) {
+    return { label: "有效期", detail: formatDateTime(until) ?? "已过期", expired: true };
+  }
+  return {
+    label: "有效期",
+    detail: formatDateTime(until) ?? "可用",
+  };
+}
+
+function fallbackStatus(account: ManagedAccount) {
+  const now = Math.floor(Date.now() / 1000);
+  if (!account.tokenMeta.hasAccessToken) return { state: "unavailable" as const, label: "不可用", reason: "缺少 access token" };
+  if (account.tokenMeta.expiresAt && account.tokenMeta.expiresAt <= now) {
+    return { state: "unavailable" as const, label: "已过期", reason: "本地 token 已过期" };
+  }
+  if (!account.tokenMeta.hasRefreshToken) return { state: "warning" as const, label: "需关注", reason: "缺少 refresh token" };
+  return { state: "available" as const, label: "可用" };
+}
+
+function AccountStatusBadge({ account }: { account: ManagedAccount }) {
+  const status = account.status ?? fallbackStatus(account);
+  const Icon = status.state === "available" ? ShieldCheck : AlertTriangle;
+  return (
+    <span className={clsx("status-badge", status.state)} title={status.reason ?? stateLabel(status.state)}>
+      <Icon size={15} />
+      {status.label}
+    </span>
+  );
+}
+
+function AccountPlanBadge({ account }: { account: ManagedAccount }) {
+  const badge = resolveCodexPlanBadge(account);
+  return <span className={clsx("pill", "plan", badge.tone)}>{badge.label}</span>;
+}
+
+function QuotaMeters({ account }: { account: ManagedAccount }) {
+  const metrics = account.quota?.metrics ?? [];
+  if (account.quota?.error && metrics.length === 0) {
+    return (
+      <div className="quota-empty warning">
+        <AlertTriangle size={15} />
+        <span>额度查询失败</span>
+      </div>
+    );
+  }
+
+  if (metrics.length === 0) {
+    return <div className="quota-empty">暂无配额数据</div>;
+  }
+
+  return (
+    <div className="quota-meters">
+      {metrics.slice(0, 3).map((metric) => {
+        const remaining = metric.remainingPercent;
+        const state = metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available");
+        return (
+          <div className="quota-meter" key={metric.key} title={metric.detail ?? account.quota?.error ?? metric.label}>
+            <div className="quota-meter-head">
+              <span>{metric.label}</span>
+              <strong>{remaining === undefined ? "N/A" : `${remaining}%`}</strong>
+            </div>
+            <div className={clsx("quota-track", state)}>
+              <i style={{ width: `${remaining ?? 0}%` }} />
+            </div>
+            <small>{formatReset(metric.resetAt) ?? metric.detail ?? (state === "unavailable" ? "不可用" : "可用")}</small>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ValidityMeter({ account }: { account: ManagedAccount }) {
+  const validity = formatValidityText(account);
+  return validity.detail ? (
+    <div className={clsx("validity-line", validity.expired && "expired")}>
+      <span>{validity.label}</span>
+      <strong>{validity.detail}</strong>
+    </div>
+  ) : (
+    <div className="validity-line">
+      <span>{validity.label}</span>
+      <strong>未读到有效期信息</strong>
+    </div>
+  );
+}
+
+function serializeAccount(account: ManagedAccount) {
+  return JSON.stringify(account, null, 2);
+}
+
 function mergeAccounts(current: ManagedAccount[], next: ManagedAccount[]) {
   const map = new Map(current.map((account) => [account.id, account]));
   for (const account of next) map.set(account.id, account);
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
-function readStoredViewMode(): ViewMode {
-  try {
-    const stored = window.localStorage.getItem(viewModeStorageKey);
-    return stored === "card" || stored === "list" ? stored : "list";
-  } catch {
-    return "list";
-  }
-}
-
 function App() {
   const [accounts, setAccounts] = useState<ManagedAccount[]>(seedAccounts);
   const [activeProvider, setActiveProvider] = useState<Provider>("codex");
   const [mode, setMode] = useState<ImportMode>("paste");
-  const [viewMode, setViewMode] = useState<ViewMode>(() => readStoredViewMode());
   const [pasteValue, setPasteValue] = useState("");
   const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("原型已就绪：粘贴 JSON 或选择文件即可测试解析。");
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
+  const [isBatchDetecting, setIsBatchDetecting] = useState(false);
+  const [lastBatchDetectAt, setLastBatchDetectAt] = useState<number>(() => Math.floor(Date.now() / 1000));
+  const [autoRefreshRemaining, setAutoRefreshRemaining] = useState(autoRefreshIntervalSeconds);
   const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const appWindow = useMemo(() => {
@@ -163,14 +380,6 @@ function App() {
       return null;
     }
   }, []);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(viewModeStorageKey, viewMode);
-    } catch {
-      // Ignore storage failures; the view still works for the current session.
-    }
-  }, [viewMode]);
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -323,9 +532,6 @@ function App() {
       });
     });
   };
-  const handleRefresh = () => {
-    setNotice(`已刷新界面状态：当前管理 ${accounts.length} 个账号。`);
-  };
   const handleAddAccount = () => {
     setMode("paste");
     setIsImportModalOpen(true);
@@ -333,14 +539,119 @@ function App() {
   const handleSettings = () => {
     setNotice("设置页稍后接入：这里会放主题、隐私模式、本地路径和 OAuth 参数。");
   };
-  const handleAccountOpen = (account: ManagedAccount) => {
-    setNotice(`已选中 ${providerLabel(account.provider)} 账号：${account.email}`);
+  const updateAccount = (accountId: string, updater: (account: ManagedAccount) => ManagedAccount) => {
+    setAccounts((current) => current.map((account) => (account.id === accountId ? updater(account) : account)));
+  };
+  const handleToggleAccount = (account: ManagedAccount) => {
+    const now = Math.floor(Date.now() / 1000);
+    const nextStatus =
+      account.status?.state === "unavailable"
+        ? { state: "available" as const, label: "可用", updatedAt: now }
+        : { state: "unavailable" as const, label: "不可用", reason: "已在本地停用", updatedAt: now };
+    updateAccount(account.id, (current) => ({
+      ...current,
+      status: nextStatus,
+      updatedAt: now,
+    }));
+    setNotice(`${providerLabel(account.provider)} 账号 ${account.email} 已${nextStatus.state === "available" ? "启用" : "停用"}。`);
+  };
+  const handleRefreshAccount = (account: ManagedAccount) => {
+    const now = Math.floor(Date.now() / 1000);
+    updateAccount(account.id, (current) => ({
+      ...current,
+      updatedAt: now,
+      status: current.status
+        ? {
+            ...current.status,
+            updatedAt: now,
+          }
+        : {
+            state: "available",
+            label: "可用",
+            updatedAt: now,
+          },
+      quota: current.quota
+        ? {
+            ...current.quota,
+            lastUpdated: now,
+          }
+        : current.quota,
+    }));
+    setNotice(`已刷新 ${providerLabel(account.provider)} 账号：${account.email}`);
+  };
+  const handleExportAccount = async (account: ManagedAccount) => {
+    const payload = serializeAccount(account);
+    const blob = new Blob([payload], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${account.provider}-${account.email.replace(/[^a-z0-9._-]+/gi, "_")}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setNotice(`已导出 ${providerLabel(account.provider)} 账号：${account.email}`);
+  };
+  const handleDeleteAccount = (account: ManagedAccount) => {
+    const confirmed = window.confirm(`删除 ${account.email}？这会从当前列表移除本地预览。`);
+    if (!confirmed) return;
+    setAccounts((current) => current.filter((item) => item.id !== account.id));
+    setNotice(`已删除 ${providerLabel(account.provider)} 账号：${account.email}`);
   };
   const handleOpenStore = (event: React.MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
     setNotice("正在打开 Super Store AI 权益页面...");
     void openUrl("https://ai.talentisan.cn/");
   };
+
+  const handleBatchDetect = async (reason: "startup" | "manual" | "timer" = "manual") => {
+    const now = Math.floor(Date.now() / 1000);
+    setIsBatchDetecting(true);
+    await new Promise((resolve) => window.setTimeout(resolve, 150));
+    let accountCount = 0;
+    setAccounts((current) => {
+      accountCount = current.length;
+      return current
+        .map((account): ManagedAccount => ({
+          ...account,
+          status: account.status
+            ? { ...account.status, updatedAt: now }
+            : {
+                state: account.tokenMeta.hasAccessToken ? "available" : "unavailable",
+                label: account.tokenMeta.hasAccessToken ? "可用" : "不可用",
+                reason: account.tokenMeta.hasAccessToken ? undefined : "缺少 access token",
+                updatedAt: now,
+              },
+          quota: account.quota ? { ...account.quota, lastUpdated: now } : account.quota,
+          updatedAt: now,
+        }))
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+    });
+    setLastBatchDetectAt(now);
+    setAutoRefreshRemaining(autoRefreshIntervalSeconds);
+    setIsBatchDetecting(false);
+    const prefix =
+      reason === "startup" ? "已启动批量检测" : reason === "timer" ? "定时批量检测完成" : "已完成批量检测";
+    setNotice(`${prefix}：当前管理 ${accountCount || accounts.length} 个账号。`);
+  };
+
+  useEffect(() => {
+    const startupTimer = window.setTimeout(() => {
+      void handleBatchDetect("startup");
+    }, 0);
+    const timer = window.setInterval(() => {
+      setAutoRefreshRemaining((current) => {
+        if (current <= 1) {
+          void handleBatchDetect("timer");
+          return autoRefreshIntervalSeconds;
+        }
+        return current - 1;
+      });
+    }, 1000);
+    return () => {
+      window.clearTimeout(startupTimer);
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <main className="shell">
@@ -360,12 +671,12 @@ function App() {
 
         <nav className="nav-list" aria-label="Providers">
             <button className={clsx(activeProvider === "codex" && "active")} onClick={() => setActiveProvider("codex")}>
-            <Bot size={17} />
+            <Bot size={20} />
             <span>Codex</span>
             <b>{counts.codex}</b>
           </button>
           <button className={clsx(activeProvider === "gemini" && "active")} onClick={() => setActiveProvider("gemini")}>
-            <Fingerprint size={17} />
+            <Fingerprint size={20} />
             <span>Gemini Cli</span>
             <b>{counts.gemini}</b>
           </button>
@@ -377,10 +688,10 @@ function App() {
               <span>AI 权益补给站</span>
               <strong>购买 AI 到 Super Store</strong>
             </div>
-            <ExternalLink size={16} />
+            <ExternalLink size={18} />
           </a>
           <button onClick={handleSettings}>
-            <Settings size={17} />
+            <Settings size={18} />
             设置
           </button>
           <p>所有凭证只在本机处理。桌面版会把敏感读写放进 Rust 后端。</p>
@@ -395,76 +706,97 @@ function App() {
           </div>
           <div className="topbar-actions">
             <label className="search">
-              <Search size={16} />
+              <Search size={18} />
               <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮箱、计划或账号 ID" />
             </label>
             <button className="primary" onClick={handleAddAccount}>
-              <Plus size={17} />
+              <Plus size={18} />
               添加账号
             </button>
           </div>
         </header>
 
         <section className="status-strip">
-          <div>
-            <ShieldCheck size={18} />
+          <div className="status-copy">
+            <ShieldCheck size={20} />
             <span>{notice}</span>
           </div>
-          <button onClick={handleRefresh}>
-            <RefreshCw size={16} />
-            刷新状态
-          </button>
+          <div className="status-actions">
+            <span className="countdown-pill" title={formatDateTime(lastBatchDetectAt)}>
+              <Clock3 size={15} />
+              自动检测 {formatCountdown(autoRefreshRemaining)}
+            </span>
+            <button onClick={() => void handleBatchDetect("manual")} disabled={isBatchDetecting}>
+              <RefreshCw size={18} />
+              {isBatchDetecting ? "检测中..." : "立即检测"}
+            </button>
+          </div>
         </section>
 
         <section className="content-grid">
           <div className="accounts-panel">
             <div className="panel-head">
               <div>
-                <h2>账号</h2>
+                <h2>账号列表</h2>
                 <p>
                   {providerLabel(activeProvider)} · {filteredAccounts.length} 个匹配项
                 </p>
               </div>
-              <div className="segmented">
-                <button className={clsx(viewMode === "list" && "active")} onClick={() => setViewMode("list")}>
-                  列表
-                </button>
-                <button className={clsx(viewMode === "card" && "active")} onClick={() => setViewMode("card")}>
-                  卡片
-                </button>
-              </div>
             </div>
 
-            <div className={clsx("account-list", viewMode === "card" && "card-mode")}>
+            <div className="account-list card-mode">
               {filteredAccounts.map((account) => (
-                <article className="account-row" key={account.id}>
+                <article className={clsx("account-row", account.status?.state === "unavailable" && "disabled")} key={account.id}>
                   <div className="account-provider">
                     <div className={clsx("provider-dot", providerClass(account.provider))}>
-                      {account.provider === "codex" ? <Bot size={18} /> : <Fingerprint size={18} />}
+                      {account.provider === "codex" ? <Bot size={24} /> : <Fingerprint size={24} />}
                     </div>
                   </div>
                   <div className="account-main">
                     <div className="account-title">
                       <strong>{account.displayName || account.email}</strong>
-                      <span className={clsx("pill", providerClass(account.provider))}>{providerLabel(account.provider)}</span>
+                      <AccountPlanBadge account={account} />
+                      <AccountStatusBadge account={account} />
                       {account.tokenMeta.hasRefreshToken && (
                         <span className="pill muted">
-                          <BadgeCheck size={13} />
+                          <BadgeCheck size={15} />
                           Refresh
                         </span>
                       )}
                     </div>
-                    <p>{account.email}</p>
+                    <div className="account-subtitle">
+                      <span>用户名：{account.accountName || account.displayName || account.userId || account.email.split("@")[0]}</span>
+                      <span>邮箱：{account.email}</span>
+                      {account.organizationId && <span>组织：{account.organizationId}</span>}
+                    </div>
                   </div>
                   <div className="account-meta">
                     <div>
-                      <span>{account.plan || "Unknown Plan"}</span>
+                      <span>最后检测</span>
                       <small>{formatRelative(account.updatedAt)}</small>
                     </div>
                   </div>
-                  <button className="icon-button" aria-label="Open Account" onClick={() => handleAccountOpen(account)}>
-                    <ChevronRight size={18} />
-                  </button>
+                  <ValidityMeter account={account} />
+                  <QuotaMeters account={account} />
+                  <div className="account-actions">
+                    <button
+                      className="icon-button"
+                      aria-label={account.status?.state === "unavailable" ? "启用账号" : "停用账号"}
+                      title={account.status?.state === "unavailable" ? "启用" : "停用"}
+                      onClick={() => handleToggleAccount(account)}
+                    >
+                      <Power size={20} />
+                    </button>
+                    <button className="icon-button" aria-label="刷新账号" title="刷新" onClick={() => handleRefreshAccount(account)}>
+                      <RefreshCw size={20} />
+                    </button>
+                    <button className="icon-button" aria-label="导出账号" title="导出" onClick={() => void handleExportAccount(account)}>
+                      <Download size={20} />
+                    </button>
+                    <button className="icon-button danger" aria-label="删除账号" title="删除" onClick={() => handleDeleteAccount(account)}>
+                      <Trash2 size={20} />
+                    </button>
+                  </div>
                 </article>
               ))}
             </div>
@@ -488,7 +820,7 @@ function App() {
                 const Icon = item.icon;
                 return (
                   <button key={key} className={clsx("mode-button", mode === key && "active")} onClick={() => setMode(key)}>
-                    <Icon size={17} />
+                    <Icon size={20} />
                     <span>{item.title}</span>
                   </button>
                 );
@@ -497,7 +829,7 @@ function App() {
 
             <div className="import-body">
               <div className="import-title">
-                <ModeIcon size={20} />
+                <ModeIcon size={24} />
                 <div>
                   <strong>{selectedMode.title}</strong>
                   <p>{selectedMode.desc}</p>
@@ -513,7 +845,7 @@ function App() {
                     placeholder={'{\n  "tokens": {\n    "id_token": "eyJ...",\n    "access_token": "eyJ...",\n    "refresh_token": "rt_..."\n  }\n}'}
                   />
                   <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim() || isBusy}>
-                    <Clipboard size={17} />
+                    <Clipboard size={20} />
                     {isBusy ? "处理中..." : "解析并导入"}
                   </button>
                 </>
@@ -530,7 +862,7 @@ function App() {
                     onChange={(event) => handleFileImport(event.target.files)}
                   />
                   <button className="drop-zone" onClick={() => fileInputRef.current?.click()} disabled={isBusy}>
-                    <Upload size={22} />
+                    <Upload size={28} />
                     <strong>选择 JSON 文件</strong>
                     <span>支持 auth.json、oauth_creds.json、导出数组</span>
                   </button>
@@ -546,7 +878,7 @@ function App() {
                     </p>
                   </div>
                   <button className="wide" onClick={() => handleLocalImport(activeProvider)} disabled={isBusy}>
-                    <FolderDown size={17} />
+                    <FolderDown size={20} />
                     读取 {providerLabel(activeProvider)} 本机账号
                   </button>
                 </div>
@@ -561,11 +893,11 @@ function App() {
                     </p>
                   </div>
                   <button className="wide" onClick={() => handleOAuthStart(activeProvider)} disabled={isBusy}>
-                    <LockKeyhole size={17} />
+                    <LockKeyhole size={20} />
                     启动 {providerLabel(activeProvider)} OAuth
                   </button>
                   <button className="wide" onClick={() => handleOAuthComplete(activeProvider)} disabled={isBusy}>
-                    <BadgeCheck size={17} />
+                    <BadgeCheck size={20} />
                     完成 {providerLabel(activeProvider)} 导入
                   </button>
                 </div>

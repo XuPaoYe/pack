@@ -7,7 +7,12 @@ export type ManagedAccount = {
   provider: Provider;
   email: string;
   displayName?: string;
+  accountName?: string;
+  organizationId?: string;
   plan?: string;
+  planType?: string;
+  authFilePlanType?: string;
+  subscriptionActiveUntil?: number | string;
   accountId?: string;
   userId?: string;
   source: ImportSource;
@@ -17,8 +22,35 @@ export type ManagedAccount = {
     hasIdToken: boolean;
     expiresAt?: number;
   };
+  status?: AccountStatus;
+  quota?: AccountQuota;
   createdAt: number;
   updatedAt: number;
+};
+
+export type AccountState = "available" | "warning" | "unavailable" | "unknown";
+
+export type AccountStatus = {
+  state: AccountState;
+  label: string;
+  reason?: string;
+  updatedAt?: number;
+};
+
+export type QuotaMetric = {
+  key: string;
+  label: string;
+  remainingPercent?: number;
+  resetAt?: number | string;
+  detail?: string;
+  state?: AccountState;
+};
+
+export type AccountQuota = {
+  metrics: QuotaMetric[];
+  lastUpdated?: number;
+  error?: string;
+  isForbidden?: boolean;
 };
 
 export type ImportFailure = {
@@ -50,6 +82,32 @@ function numberField(value: unknown): number | undefined {
     if (Number.isFinite(parsed)) return parsed;
   }
   return undefined;
+}
+
+function timestampField(value: unknown): number | undefined {
+  const numeric = numberField(value);
+  if (numeric !== undefined) return numeric;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
+  }
+  return undefined;
+}
+
+function boolField(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes"].includes(normalized)) return true;
+    if (["false", "0", "no"].includes(normalized)) return false;
+  }
+  return undefined;
+}
+
+function percentField(value: unknown): number | undefined {
+  const parsed = numberField(value);
+  if (parsed === undefined) return undefined;
+  return Math.max(0, Math.min(100, Math.round(parsed)));
 }
 
 function decodeBase64Url(input: string): string | null {
@@ -92,6 +150,140 @@ function stableHash(value: string): string {
 
 function accountIdFor(provider: Provider, email: string, discriminator: string): string {
   return `${provider}_${stableHash(`${email.toLowerCase()}::${discriminator}`)}`;
+}
+
+function quotaState(remainingPercent?: number): AccountState {
+  if (remainingPercent === undefined) return "unknown";
+  if (remainingPercent <= 0) return "unavailable";
+  if (remainingPercent <= 15) return "warning";
+  return "available";
+}
+
+function parseCodexQuota(value: JsonObject): AccountQuota | undefined {
+  const quota = isObject(value.quota) ? value.quota : undefined;
+  const quotaError = isObject(value.quota_error) ? value.quota_error : undefined;
+  const metrics: QuotaMetric[] = [];
+  const hourly = percentField(quota?.hourly_percentage ?? value.hourly_percentage);
+  const weekly = percentField(quota?.weekly_percentage ?? value.weekly_percentage);
+
+  if (hourly !== undefined) {
+    metrics.push({
+      key: "codex-5h",
+      label: "5H",
+      remainingPercent: hourly,
+      resetAt: numberField(quota?.hourly_reset_time ?? value.hourly_reset_time),
+      state: quotaState(hourly),
+    });
+  }
+
+  if (weekly !== undefined) {
+    metrics.push({
+      key: "codex-weekly",
+      label: "WEEKLY",
+      remainingPercent: weekly,
+      resetAt: numberField(quota?.weekly_reset_time ?? value.weekly_reset_time),
+      state: quotaState(weekly),
+    });
+  }
+
+  const error = stringField(quotaError?.message) ?? stringField(value.quota_query_last_error);
+  const isForbidden = boolField(quota?.is_forbidden ?? value.is_forbidden) ?? false;
+  if (!metrics.length && !error && !isForbidden) return undefined;
+
+  return {
+    metrics,
+    lastUpdated: numberField(value.usage_updated_at ?? quota?.last_updated),
+    error,
+    isForbidden,
+  };
+}
+
+function parseGeminiQuota(value: JsonObject): AccountQuota | undefined {
+  const raw = isObject(value.gemini_usage_raw) ? value.gemini_usage_raw : undefined;
+  const models = Array.isArray(raw?.models) ? raw.models : Array.isArray(value.models) ? value.models : [];
+  const metrics: QuotaMetric[] = [];
+
+  for (const item of models) {
+    if (!isObject(item)) continue;
+    const remainingPercent = percentField(item.percentage ?? item.remainingPercent ?? item.remaining_percent);
+    const name = stringField(item.display_name) ?? stringField(item.displayName) ?? stringField(item.name);
+    if (!name && remainingPercent === undefined) continue;
+    metrics.push({
+      key: `gemini-${metrics.length}`,
+      label: name ?? `MODEL ${metrics.length + 1}`,
+      remainingPercent,
+      resetAt: stringField(item.reset_time) ?? stringField(item.resetTime),
+      state: quotaState(remainingPercent),
+    });
+  }
+
+  const totalPercentUsed = percentField(raw?.totalPercentUsed ?? raw?.total_percent_used ?? value.totalPercentUsed);
+  if (!metrics.length && totalPercentUsed !== undefined) {
+    const remainingPercent = 100 - totalPercentUsed;
+    metrics.push({
+      key: "gemini-total",
+      label: "TOTAL",
+      remainingPercent,
+      state: quotaState(remainingPercent),
+    });
+  }
+
+  const error = stringField(value.quota_query_last_error);
+  if (!metrics.length && !error) return undefined;
+
+  return {
+    metrics,
+    lastUpdated: numberField(value.usage_updated_at),
+    error,
+  };
+}
+
+function deriveStatus(value: JsonObject, tokenMeta: ManagedAccount["tokenMeta"], quota?: AccountQuota): AccountStatus {
+  const now = Math.floor(Date.now() / 1000);
+  const rawStatus = stringField(value.status)?.toLowerCase();
+  const statusReason =
+    stringField(value.status_reason) ??
+    stringField(value.reauth_reason) ??
+    quota?.error;
+
+  if (boolField(value.requires_reauth) || rawStatus === "unavailable" || rawStatus === "disabled" || quota?.isForbidden) {
+    return {
+      state: "unavailable",
+      label: "不可用",
+      reason: statusReason ?? "账号需要重新授权或访问被拒绝",
+      updatedAt: numberField(value.usage_updated_at),
+    };
+  }
+
+  if (!tokenMeta.hasAccessToken) {
+    return { state: "unavailable", label: "不可用", reason: "缺少 access token" };
+  }
+
+  if (tokenMeta.expiresAt && tokenMeta.expiresAt <= now) {
+    return { state: "unavailable", label: "已过期", reason: "本地 token 已过期" };
+  }
+
+  if (quota?.metrics.some((metric) => metric.remainingPercent === 0)) {
+    return { state: "unavailable", label: "额度耗尽", reason: "至少一个额度窗口剩余 0%" };
+  }
+
+  if (quota?.error) {
+    return { state: "warning", label: "查询失败", reason: quota.error, updatedAt: quota.lastUpdated };
+  }
+
+  if ((tokenMeta.expiresAt && tokenMeta.expiresAt - now < 3600) || !tokenMeta.hasRefreshToken) {
+    return {
+      state: "warning",
+      label: "需关注",
+      reason: tokenMeta.expiresAt && tokenMeta.expiresAt - now < 3600 ? "token 即将过期" : "缺少 refresh token",
+    };
+  }
+
+  if (rawStatus && !["active", "available", "ok"].includes(rawStatus)) {
+    return { state: "warning", label: rawStatus, reason: statusReason };
+  }
+
+  return { state: "available", label: "可用", updatedAt: quota?.lastUpdated };
 }
 
 function asItems(parsed: unknown): unknown[] {
@@ -158,26 +350,48 @@ function parseCodex(value: unknown, source: ImportSource): ManagedAccount | null
     stringField(value.auth_file_plan_type) ??
     stringField(openaiAuth?.chatgpt_plan_type) ??
     (apiKey ? "API Key" : undefined);
+  const planType =
+    stringField(value.plan_type) ??
+    stringField(value.planType) ??
+    stringField(openaiAuth?.chatgpt_plan_type);
+  const authFilePlanType =
+    stringField(value.auth_file_plan_type) ??
+    stringField(value.authFilePlanType);
+  const subscriptionActiveUntil =
+    timestampField(value.subscription_active_until) ??
+    timestampField(value.subscriptionActiveUntil) ??
+    timestampField(value.subscription_until);
+  const accountName = stringField(value.account_name) ?? stringField(value.accountName) ?? stringField(value.name);
+  const organizationId = stringField(value.organization_id) ?? stringField(value.organizationId);
   const discriminator = accountId ?? userId ?? accessToken ?? apiKey ?? email;
   const now = Math.floor(Date.now() / 1000);
+  const tokenMeta = {
+    hasAccessToken: Boolean(accessToken || apiKey),
+    hasRefreshToken: Boolean(refreshToken),
+    hasIdToken: Boolean(idToken),
+    expiresAt: numberField(jwt?.exp),
+  };
+  const quota = parseCodexQuota(value);
 
   return {
     id: stringField(value.id) ?? accountIdFor("codex", email, discriminator),
     provider: "codex",
     email: email.toLowerCase(),
-    displayName: stringField(value.account_name) ?? stringField(value.name),
+    displayName: accountName,
+    accountName,
+    organizationId,
     plan,
+    planType,
+    authFilePlanType,
+    subscriptionActiveUntil,
     accountId,
     userId,
     source,
-    tokenMeta: {
-      hasAccessToken: Boolean(accessToken || apiKey),
-      hasRefreshToken: Boolean(refreshToken),
-      hasIdToken: Boolean(idToken),
-      expiresAt: numberField(jwt?.exp),
-    },
+    tokenMeta,
+    status: deriveStatus(value, tokenMeta, quota),
+    quota,
     createdAt: numberField(value.created_at) ?? now,
-    updatedAt: now,
+    updatedAt: numberField(value.last_used) ?? numberField(value.updated_at) ?? now,
   };
 }
 
@@ -212,6 +426,7 @@ function parseGemini(value: unknown, source: ImportSource): ManagedAccount | nul
   if (!email) return null;
 
   const authId = stringField(value.auth_id) ?? stringField(value.authId) ?? stringField(jwt?.sub);
+  const planType = stringField(value.selected_auth_type) ?? stringField(value.selectedAuthType);
   const expiresAt =
     numberField(value.expiry_date) ??
     numberField(value.expiryDate) ??
@@ -219,6 +434,13 @@ function parseGemini(value: unknown, source: ImportSource): ManagedAccount | nul
     numberField(token?.expiresAt) ??
     numberField(jwt?.exp);
   const now = Math.floor(Date.now() / 1000);
+  const tokenMeta = {
+    hasAccessToken: Boolean(accessToken),
+    hasRefreshToken: Boolean(refreshToken),
+    hasIdToken: Boolean(idToken),
+    expiresAt,
+  };
+  const quota = parseGeminiQuota(value);
 
   return {
     id: stringField(value.id) ?? accountIdFor("gemini", email, authId ?? accessToken ?? email),
@@ -226,17 +448,16 @@ function parseGemini(value: unknown, source: ImportSource): ManagedAccount | nul
     email: email.toLowerCase(),
     displayName: stringField(value.name),
     plan: stringField(value.plan_name) ?? stringField(value.planName) ?? stringField(value.tier_name),
+    planType,
+    subscriptionActiveUntil: expiresAt,
     accountId: authId,
     userId: authId,
     source,
-    tokenMeta: {
-      hasAccessToken: Boolean(accessToken),
-      hasRefreshToken: Boolean(refreshToken),
-      hasIdToken: Boolean(idToken),
-      expiresAt,
-    },
+    tokenMeta,
+    status: deriveStatus(value, tokenMeta, quota),
+    quota,
     createdAt: numberField(value.created_at) ?? now,
-    updatedAt: now,
+    updatedAt: numberField(value.last_used) ?? numberField(value.updated_at) ?? now,
   };
 }
 
