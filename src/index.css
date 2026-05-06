@@ -1,0 +1,100 @@
+:root {
+  --surface: #f8fafc;
+  --surface-soft: #f1f5f9;
+  --panel: rgba(255, 255, 255, 0.74);
+  --control: #ffffff;
+  --control-hover: #f1f5f9;
+  --row-hover: rgba(241, 245, 249, 0.78);
+  --line: rgba(15, 23, 42, 0.08);
+  --line-soft: rgba(15, 23, 42, 0.06);
+  --text: #334155;
+  --text-strong: #0f172a;
+  --text-soft: #64748b;
+  --badge: rgba(16, 185, 129, 0.1);
+  --accent: #10b981;
+  --accent-ink: #053f31;
+  --card-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.1);
+  color: var(--text);
+  background: var(--surface);
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #0b0c10;
+    --surface-soft: #161a22;
+    --panel: rgba(17, 21, 28, 0.86);
+    --control: #11151c;
+    --control-hover: #161a22;
+    --row-hover: rgba(22, 26, 34, 0.86);
+    --line: rgba(255, 255, 255, 0.12);
+    --line-soft: rgba(255, 255, 255, 0.08);
+    --text: #dbe4ee;
+    --text-strong: #f8fafc;
+    --text-soft: #94a3b8;
+    --badge: rgba(16, 185, 129, 0.13);
+    --accent: #10b981;
+    --accent-ink: #031b15;
+    --card-shadow: 0 20px 50px -20px rgba(0, 0, 0, 0.9);
+  }
+
+  .failure-list {
+    background: #2a1d18;
+    border-color: #713f2a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image:
+    radial-gradient(circle at 50% -20%, rgba(16, 185, 129, 0.1), transparent 70%),
+    radial-gradient(circle at 0% 0%, rgba(6, 182, 212, 0.05), transparent 40%);
+}
+
+@media (prefers-color-scheme: dark) {
+  body::before {
+    background-image:
+      radial-gradient(circle at 50% -20%, rgba(16, 185, 129, 0.18), transparent 70%),
+      radial-gradient(circle at 0% 0%, rgba(6, 182, 212, 0.1), transparent 40%);
+  }
+}
+
+input,
+textarea,
+button {
+  letter-spacing: 0;
+}
+
+input,
+textarea,
+[contenteditable="true"] {
+  user-select: text;
+  -webkit-user-select: text;
+}
