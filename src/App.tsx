@@ -1,19 +1,18 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import clsx from "clsx";
 import {
   BadgeCheck,
+  Bot,
   ChevronRight,
   Clipboard,
   Cloud,
-  Database,
   ExternalLink,
   FileJson,
   Fingerprint,
   FolderDown,
-  KeyRound,
   Laptop,
   LockKeyhole,
   Plus,
@@ -28,6 +27,22 @@ import logoUrl from "./assets/logo.svg";
 import { parseAuthJson, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 
 type ImportMode = "paste" | "file" | "local" | "oauth";
+type ViewMode = "list" | "card";
+type OAuthProvider = "codex" | "gemini";
+
+const viewModeStorageKey = "super-ai.account-view-mode";
+
+type BackendImportResult = {
+  imported: ManagedAccount[];
+  failed: ImportFailure[];
+};
+
+type OAuthStartResult = {
+  login_id: string;
+  provider: OAuthProvider;
+  command: string;
+  message: string;
+};
 
 const seedAccounts: ManagedAccount[] = [
   {
@@ -93,12 +108,12 @@ const modeConfig: Record<
   oauth: {
     icon: Cloud,
     title: "OAuth 授权",
-    desc: "通过本地 callback 完成授权；Codex 与 Gemini 将分别走官方 OAuth。",
+    desc: "通过本地 Callback 完成授权；Codex 与 Gemini 将分别走官方 OAuth。",
   },
 };
 
 function providerLabel(provider: Provider) {
-  return provider === "codex" ? "Codex" : "Gemini";
+  return provider === "codex" ? "Codex" : "Gemini Cli";
 }
 
 function providerClass(provider: Provider) {
@@ -119,15 +134,27 @@ function mergeAccounts(current: ManagedAccount[], next: ManagedAccount[]) {
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+function readStoredViewMode(): ViewMode {
+  try {
+    const stored = window.localStorage.getItem(viewModeStorageKey);
+    return stored === "card" || stored === "list" ? stored : "list";
+  } catch {
+    return "list";
+  }
+}
+
 function App() {
   const [accounts, setAccounts] = useState<ManagedAccount[]>(seedAccounts);
-  const [activeProvider, setActiveProvider] = useState<Provider | "all">("all");
+  const [activeProvider, setActiveProvider] = useState<Provider>("codex");
   const [mode, setMode] = useState<ImportMode>("paste");
-  const [viewMode, setViewMode] = useState<"list" | "card">("list");
+  const [viewMode, setViewMode] = useState<ViewMode>(() => readStoredViewMode());
   const [pasteValue, setPasteValue] = useState("");
   const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("原型已就绪：粘贴 JSON 或选择文件即可测试解析。");
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isBusy, setIsBusy] = useState(false);
+  const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const appWindow = useMemo(() => {
     try {
@@ -137,10 +164,18 @@ function App() {
     }
   }, []);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(viewModeStorageKey, viewMode);
+    } catch {
+      // Ignore storage failures; the view still works for the current session.
+    }
+  }, [viewMode]);
+
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return accounts.filter((account) => {
-      if (activeProvider !== "all" && account.provider !== activeProvider) return false;
+      if (account.provider !== activeProvider) return false;
       if (!normalizedQuery) return true;
       return [account.email, account.displayName, account.plan, account.accountId]
         .filter(Boolean)
@@ -150,45 +185,130 @@ function App() {
 
   const counts = useMemo(
     () => ({
-      all: accounts.length,
       codex: accounts.filter((account) => account.provider === "codex").length,
       gemini: accounts.filter((account) => account.provider === "gemini").length,
     }),
     [accounts],
   );
 
-  const importContent = (content: string, label: string, source: "paste" | "file") => {
-    const result = parseAuthJson(content, source, label);
-    if (result.imported.length > 0) {
-      setAccounts((current) => mergeAccounts(current, result.imported));
-      setNotice(`导入成功：${result.imported.length} 个账号已加入本地列表。`);
+  const applyImportResult = (result: BackendImportResult, successText: string, emptyText: string) => {
+    const importedForCurrentProvider = result.imported.filter((account) => account.provider === activeProvider);
+    const skippedCount = result.imported.length - importedForCurrentProvider.length;
+    if (result.imported.length > 0 && importedForCurrentProvider.length > 0) {
+      if (importedForCurrentProvider.length > 0) {
+        setAccounts((current) => mergeAccounts(current, importedForCurrentProvider));
+      }
+      const baseNotice = successText.replace("{count}", String(importedForCurrentProvider.length));
+      setNotice(skippedCount > 0 ? `${baseNotice}（已跳过 ${skippedCount} 个非当前平台账号）` : baseNotice);
+    } else if (result.imported.length > 0 && importedForCurrentProvider.length === 0) {
+      setNotice(`没有导入 ${providerLabel(activeProvider)} 账号（已识别到 ${skippedCount} 个其他平台账号并跳过）。`);
     } else {
-      setNotice("没有导入账号，检查 JSON 是否包含 Codex/Gemini 凭证字段。");
+      setNotice(emptyText);
     }
     setFailures(result.failed);
   };
 
-  const handlePasteImport = () => {
-    importContent(pasteValue, "粘贴内容", "paste");
+  const parseWithBackend = async (content: string, label: string) => {
+    try {
+      const result = await invoke<BackendImportResult>("import_accounts_from_json", {
+        jsonContent: content,
+        label,
+      });
+      return result;
+    } catch {
+      return parseAuthJson(content, "paste", label);
+    }
+  };
+
+  const handlePasteImport = async () => {
+    setIsBusy(true);
+    try {
+      const result = await parseWithBackend(pasteValue, "粘贴内容");
+      applyImportResult(result, "导入成功：{count} 个账号已加入本地列表。", "没有导入账号，检查 JSON 是否包含 Codex/Gemini 凭证字段。");
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const handleFileImport = async (files: FileList | null) => {
     if (!files?.length) return;
+    setIsBusy(true);
     const allFailures: ImportFailure[] = [];
     const allImported: ManagedAccount[] = [];
-    for (const file of Array.from(files)) {
-      const content = await file.text();
-      const result = parseAuthJson(content, "file", file.name);
-      allImported.push(...result.imported);
-      allFailures.push(...result.failed);
+    try {
+      for (const file of Array.from(files)) {
+        const content = await file.text();
+        const result = await parseWithBackend(content, file.name);
+        allImported.push(...result.imported);
+        allFailures.push(...result.failed);
+      }
+      if (allImported.length > 0) {
+        applyImportResult(
+          { imported: allImported, failed: allFailures },
+          "文件导入完成：新增或更新 {count} 个账号。",
+          "文件读取完成，但没有识别到可导入账号。",
+        );
+      } else {
+        setNotice("文件读取完成，但没有识别到可导入账号。");
+        setFailures(allFailures);
+      }
+    } finally {
+      setIsBusy(false);
     }
-    if (allImported.length > 0) {
-      setAccounts((current) => mergeAccounts(current, allImported));
-      setNotice(`文件导入完成：新增或更新 ${allImported.length} 个账号。`);
-    } else {
-      setNotice("文件读取完成，但没有识别到可导入账号。");
+  };
+
+  const handleLocalImport = async (provider: OAuthProvider) => {
+    setIsBusy(true);
+    try {
+      const command = provider === "codex" ? "import_codex_from_local" : "import_gemini_from_local";
+      const result = await invoke<BackendImportResult>(command);
+      applyImportResult(
+        result,
+        `读取本机 ${providerLabel(provider)} 成功：{count} 个账号已加入列表。`,
+        `未从本机读取到 ${providerLabel(provider)} 账号。`,
+      );
+    } catch (error) {
+      setNotice(`读取本机 ${providerLabel(provider)} 失败：${String(error)}`);
+    } finally {
+      setIsBusy(false);
     }
-    setFailures(allFailures);
+  };
+
+  const handleOAuthStart = async (provider: OAuthProvider) => {
+    setIsBusy(true);
+    try {
+      const command = provider === "codex" ? "start_codex_oauth" : "start_gemini_oauth";
+      const result = await invoke<OAuthStartResult>(command);
+      setPendingOAuth((current) => ({ ...current, [provider]: result.login_id }));
+      setNotice(result.message);
+    } catch (error) {
+      setNotice(`${providerLabel(provider)} OAuth 启动失败：${String(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleOAuthComplete = async (provider: OAuthProvider) => {
+    const loginId = pendingOAuth[provider];
+    if (!loginId) {
+      setNotice(`请先启动 ${providerLabel(provider)} OAuth。`);
+      return;
+    }
+    setIsBusy(true);
+    try {
+      const command = provider === "codex" ? "complete_codex_oauth" : "complete_gemini_oauth";
+      const result = await invoke<BackendImportResult>(command, { loginId });
+      applyImportResult(
+        result,
+        `${providerLabel(provider)} OAuth 完成：导入 {count} 个账号。`,
+        `${providerLabel(provider)} OAuth 已完成，但未读取到账号。`,
+      );
+      setPendingOAuth((current) => ({ ...current, [provider]: undefined }));
+    } catch (error) {
+      setNotice(`${providerLabel(provider)} OAuth 完成失败：${String(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const selectedMode = modeConfig[mode];
@@ -208,7 +328,7 @@ function App() {
   };
   const handleAddAccount = () => {
     setMode("paste");
-    setNotice("请选择一种导入方式：粘贴 auth.json、导入 JSON 文件、读取本机账号或 OAuth 授权。");
+    setIsImportModalOpen(true);
   };
   const handleSettings = () => {
     setNotice("设置页稍后接入：这里会放主题、隐私模式、本地路径和 OAuth 参数。");
@@ -225,6 +345,7 @@ function App() {
   return (
     <main className="shell">
       <div className="global-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
+      <div className="top-edge-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
       <aside className="sidebar">
         <div className="window-strip drag-surface" data-tauri-drag-region onMouseDown={startWindowDrag} />
         <div className="brand">
@@ -238,19 +359,14 @@ function App() {
         </div>
 
         <nav className="nav-list" aria-label="Providers">
-          <button className={clsx(activeProvider === "all" && "active")} onClick={() => setActiveProvider("all")}>
-            <Database size={17} />
-            <span>全部账号</span>
-            <b>{counts.all}</b>
-          </button>
-          <button className={clsx(activeProvider === "codex" && "active")} onClick={() => setActiveProvider("codex")}>
-            <KeyRound size={17} />
+            <button className={clsx(activeProvider === "codex" && "active")} onClick={() => setActiveProvider("codex")}>
+            <Bot size={17} />
             <span>Codex</span>
             <b>{counts.codex}</b>
           </button>
           <button className={clsx(activeProvider === "gemini" && "active")} onClick={() => setActiveProvider("gemini")}>
             <Fingerprint size={17} />
-            <span>Gemini</span>
+            <span>Gemini Cli</span>
             <b>{counts.gemini}</b>
           </button>
         </nav>
@@ -274,7 +390,7 @@ function App() {
       <section className="workspace">
         <header className="topbar" data-tauri-drag-region onMouseDown={startWindowDrag}>
           <div className="title-drag drag-surface" data-tauri-drag-region onMouseDown={startWindowDrag}>
-            <p className="eyebrow">Account control center</p>
+            <p className="eyebrow">Account Control Center</p>
             <h1>Super AI 账号管理</h1>
           </div>
           <div className="topbar-actions">
@@ -305,7 +421,9 @@ function App() {
             <div className="panel-head">
               <div>
                 <h2>账号</h2>
-                <p>{filteredAccounts.length} 个匹配项</p>
+                <p>
+                  {providerLabel(activeProvider)} · {filteredAccounts.length} 个匹配项
+                </p>
               </div>
               <div className="segmented">
                 <button className={clsx(viewMode === "list" && "active")} onClick={() => setViewMode("list")}>
@@ -320,8 +438,10 @@ function App() {
             <div className={clsx("account-list", viewMode === "card" && "card-mode")}>
               {filteredAccounts.map((account) => (
                 <article className="account-row" key={account.id}>
-                  <div className={clsx("provider-dot", providerClass(account.provider))}>
-                    {account.provider === "codex" ? <KeyRound size={18} /> : <Fingerprint size={18} />}
+                  <div className="account-provider">
+                    <div className={clsx("provider-dot", providerClass(account.provider))}>
+                      {account.provider === "codex" ? <Bot size={18} /> : <Fingerprint size={18} />}
+                    </div>
                   </div>
                   <div className="account-main">
                     <div className="account-title">
@@ -330,29 +450,35 @@ function App() {
                       {account.tokenMeta.hasRefreshToken && (
                         <span className="pill muted">
                           <BadgeCheck size={13} />
-                          refresh
+                          Refresh
                         </span>
                       )}
                     </div>
                     <p>{account.email}</p>
                   </div>
                   <div className="account-meta">
-                    <span>{account.plan || "Unknown plan"}</span>
-                    <small>{formatRelative(account.updatedAt)}</small>
+                    <div>
+                      <span>{account.plan || "Unknown Plan"}</span>
+                      <small>{formatRelative(account.updatedAt)}</small>
+                    </div>
                   </div>
-                  <button className="icon-button" aria-label="Open account" onClick={() => handleAccountOpen(account)}>
+                  <button className="icon-button" aria-label="Open Account" onClick={() => handleAccountOpen(account)}>
                     <ChevronRight size={18} />
                   </button>
                 </article>
               ))}
             </div>
           </div>
+        </section>
+      </section>
 
-          <aside className="import-panel">
+      {isImportModalOpen && (
+        <div className="modal-overlay" onMouseDown={() => setIsImportModalOpen(false)}>
+          <aside className="import-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
             <div className="panel-head">
               <div>
                 <h2>导入</h2>
-                <p>四种入口先并起来</p>
+                <p>选择导入方式添加账号</p>
               </div>
             </div>
 
@@ -386,9 +512,9 @@ function App() {
                     spellCheck={false}
                     placeholder={'{\n  "tokens": {\n    "id_token": "eyJ...",\n    "access_token": "eyJ...",\n    "refresh_token": "rt_..."\n  }\n}'}
                   />
-                  <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim()}>
+                  <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim() || isBusy}>
                     <Clipboard size={17} />
-                    解析并导入
+                    {isBusy ? "处理中..." : "解析并导入"}
                   </button>
                 </>
               )}
@@ -403,7 +529,7 @@ function App() {
                     hidden
                     onChange={(event) => handleFileImport(event.target.files)}
                   />
-                  <button className="drop-zone" onClick={() => fileInputRef.current?.click()}>
+                  <button className="drop-zone" onClick={() => fileInputRef.current?.click()} disabled={isBusy}>
                     <Upload size={22} />
                     <strong>选择 JSON 文件</strong>
                     <span>支持 auth.json、oauth_creds.json、导出数组</span>
@@ -412,10 +538,17 @@ function App() {
               )}
 
               {mode === "local" && (
-                <div className="coming-card">
-                  <FolderDown size={24} />
-                  <strong>下一步接入 Tauri 后端</strong>
-                  <p>读取 ~/.codex/auth.json、~/.gemini/oauth_creds.json，并在 macOS/Windows 做路径兼容。</p>
+                <div className="oauth-flow">
+                  <div>
+                    <span>1</span>
+                    <p>
+                      读取本机 {providerLabel(activeProvider)} 账号配置
+                    </p>
+                  </div>
+                  <button className="wide" onClick={() => handleLocalImport(activeProvider)} disabled={isBusy}>
+                    <FolderDown size={17} />
+                    读取 {providerLabel(activeProvider)} 本机账号
+                  </button>
                 </div>
               )}
 
@@ -423,19 +556,17 @@ function App() {
                 <div className="oauth-flow">
                   <div>
                     <span>1</span>
-                    <p>启动本地 callback 监听</p>
+                    <p>
+                      启动 {providerLabel(activeProvider)} 终端 OAuth 登录
+                    </p>
                   </div>
-                  <div>
-                    <span>2</span>
-                    <p>打开 Codex 或 Gemini 授权页</p>
-                  </div>
-                  <div>
-                    <span>3</span>
-                    <p>交换 token 并保存账号</p>
-                  </div>
-                  <button className="wide">
+                  <button className="wide" onClick={() => handleOAuthStart(activeProvider)} disabled={isBusy}>
                     <LockKeyhole size={17} />
-                    等待 Rust 后端接入
+                    启动 {providerLabel(activeProvider)} OAuth
+                  </button>
+                  <button className="wide" onClick={() => handleOAuthComplete(activeProvider)} disabled={isBusy}>
+                    <BadgeCheck size={17} />
+                    完成 {providerLabel(activeProvider)} 导入
                   </button>
                 </div>
               )}
@@ -452,8 +583,8 @@ function App() {
               </div>
             )}
           </aside>
-        </section>
-      </section>
+        </div>
+      )}
     </main>
   );
 }

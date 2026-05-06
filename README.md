@@ -16,14 +16,14 @@
 ## 安装依赖
 
 ```bash
-cd /Users/xusanye/Desktop/ai_manage/ai-auth-studio
+cd /Users/xusanye/Documents/web/rearend/super_ai
 npm install
 ```
 
 ## 桌面 APP 开发启动
 
 ```bash
-cd /Users/xusanye/Desktop/ai_manage/ai-auth-studio
+cd /Users/xusanye/Documents/web/rearend/super_ai
 npm run dev
 ```
 
@@ -38,7 +38,7 @@ npm run dev
 ## 网页预览
 
 ```bash
-cd /Users/xusanye/Desktop/ai_manage/ai-auth-studio
+cd /Users/xusanye/Documents/web/rearend/super_ai
 npm run web:dev -- --host 127.0.0.1
 ```
 
@@ -53,14 +53,14 @@ http://127.0.0.1:5173/
 ## 生产构建
 
 ```bash
-cd /Users/xusanye/Desktop/ai_manage/ai-auth-studio
+cd /Users/xusanye/Documents/web/rearend/super_ai
 npm run build
 ```
 
 构建产物目录：
 
 ```text
-/Users/xusanye/Desktop/ai_manage/ai-auth-studio/dist
+/Users/xusanye/Documents/web/rearend/super_ai/dist
 ```
 
 这个命令只构建前端静态文件，不生成桌面安装包。
@@ -68,7 +68,7 @@ npm run build
 ## 桌面 APP 构建
 
 ```bash
-cd /Users/xusanye/Desktop/ai_manage/ai-auth-studio
+cd /Users/xusanye/Documents/web/rearend/super_ai
 npm run tauri:build
 ```
 
@@ -77,7 +77,7 @@ npm run tauri:build
 构建产物：
 
 ```text
-/Users/xusanye/Desktop/ai_manage/ai-auth-studio/src-tauri/target/release/bundle/macos/Super AI.app
+/Users/xusanye/Documents/web/rearend/super_ai/src-tauri/target/release/bundle/macos/Super AI.app
 ```
 
 如需单独打 DMG：
@@ -89,14 +89,14 @@ npm run tauri:build:dmg
 ## 本地预览生产包
 
 ```bash
-cd /Users/xusanye/Desktop/ai_manage/ai-auth-studio
+cd /Users/xusanye/Documents/web/rearend/super_ai
 npm run preview -- --host 127.0.0.1
 ```
 
 ## 代码检查
 
 ```bash
-cd /Users/xusanye/Desktop/ai_manage/ai-auth-studio
+cd /Users/xusanye/Documents/web/rearend/super_ai
 npm run lint
 ```
 
