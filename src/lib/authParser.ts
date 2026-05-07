@@ -260,27 +260,19 @@ function deriveStatus(value: JsonObject, tokenMeta: ManagedAccount["tokenMeta"],
   }
 
   if (tokenMeta.expiresAt && tokenMeta.expiresAt <= now) {
-    return { state: "unavailable", label: "已过期", reason: "本地 token 已过期" };
+    return { state: "unavailable", label: "不可用", reason: "本地 token 已过期" };
   }
 
   if (quota?.metrics.some((metric) => metric.remainingPercent === 0)) {
-    return { state: "unavailable", label: "额度耗尽", reason: "至少一个额度窗口剩余 0%" };
+    return { state: "unavailable", label: "不可用", reason: "至少一个额度窗口剩余 0%" };
   }
 
   if (quota?.error) {
-    return { state: "warning", label: "查询失败", reason: quota.error, updatedAt: quota.lastUpdated };
-  }
-
-  if ((tokenMeta.expiresAt && tokenMeta.expiresAt - now < 3600) || !tokenMeta.hasRefreshToken) {
-    return {
-      state: "warning",
-      label: "需关注",
-      reason: tokenMeta.expiresAt && tokenMeta.expiresAt - now < 3600 ? "token 即将过期" : "缺少 refresh token",
-    };
+    return { state: "unavailable", label: "不可用", reason: quota.error, updatedAt: quota.lastUpdated };
   }
 
   if (rawStatus && !["active", "available", "ok"].includes(rawStatus)) {
-    return { state: "warning", label: rawStatus, reason: statusReason };
+    return { state: "unavailable", label: "不可用", reason: statusReason ?? rawStatus };
   }
 
   return { state: "available", label: "可用", updatedAt: quota?.lastUpdated };

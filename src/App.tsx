@@ -1,30 +1,35 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import clsx from "clsx";
 import {
-  AlertTriangle,
   BadgeCheck,
   Bot,
+  CalendarDays,
+  CirclePlay,
   Clipboard,
   Cloud,
-  Clock3,
-  Download,
+  EyeOff,
   ExternalLink,
+  FileDown,
   FileJson,
   Fingerprint,
   FolderDown,
   Laptop,
   LockKeyhole,
+  Monitor,
+  Moon,
   Plus,
-  Power,
-  RefreshCw,
+  RefreshCcw,
+  RotateCw,
+  Rocket,
   Search,
   Settings,
-  ShieldCheck,
-  Trash2,
+  Sun,
+  Trash,
   Upload,
+  X,
 } from "lucide-react";
 import "./App.css";
 import logoUrl from "./assets/logo.svg";
@@ -32,12 +37,23 @@ import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccou
 
 type ImportMode = "paste" | "file" | "local" | "oauth";
 type OAuthProvider = "codex" | "gemini";
+type ThemeMode = "system" | "light" | "dark";
 
-const autoRefreshIntervalSeconds = 300;
+const themeOptions: Array<{ key: ThemeMode; label: string; icon: typeof Monitor }> = [
+  { key: "system", label: "跟随系统", icon: Monitor },
+  { key: "light", label: "浅色", icon: Sun },
+  { key: "dark", label: "深色", icon: Moon },
+];
 
 type BackendImportResult = {
   imported: ManagedAccount[];
   failed: ImportFailure[];
+};
+
+type AppSettings = {
+  theme: ThemeMode;
+  autoLaunch: boolean;
+  maskSensitive: boolean;
 };
 
 type OAuthStartResult = {
@@ -47,96 +63,8 @@ type OAuthStartResult = {
   message: string;
 };
 
-const seedAccounts: ManagedAccount[] = [
-  {
-    id: "codex_preview",
-    provider: "codex",
-    email: "personal@example.com",
-    displayName: "Personal Codex",
-    plan: "Plus",
-    accountId: "acct_preview",
-    userId: "user_preview",
-    source: "local",
-    tokenMeta: {
-      hasAccessToken: true,
-      hasRefreshToken: true,
-      hasIdToken: true,
-      expiresAt: Math.floor(Date.now() / 1000) + 3600 * 24,
-    },
-    accountName: "Personal Codex",
-    planType: "plus",
-    subscriptionActiveUntil: Math.floor(Date.now() / 1000) + 3600 * 24 * 30,
-    status: {
-      state: "available",
-      label: "可用",
-      updatedAt: Math.floor(Date.now() / 1000) - 900,
-    },
-    quota: {
-      metrics: [
-        {
-          key: "codex-5h",
-          label: "5H",
-          remainingPercent: 68,
-          resetAt: Math.floor(Date.now() / 1000) + 3600 * 2,
-          state: "available",
-        },
-        {
-          key: "codex-weekly",
-          label: "WEEKLY",
-          remainingPercent: 24,
-          resetAt: Math.floor(Date.now() / 1000) + 3600 * 28,
-          state: "warning",
-        },
-      ],
-      lastUpdated: Math.floor(Date.now() / 1000) - 900,
-    },
-    createdAt: Math.floor(Date.now() / 1000) - 3600 * 48,
-    updatedAt: Math.floor(Date.now() / 1000) - 900,
-  },
-  {
-    id: "gemini_preview",
-    provider: "gemini",
-    email: "work@example.com",
-    displayName: "Workspace Gemini",
-    plan: "Gemini Code Assist",
-    accountId: "google_preview",
-    userId: "google_preview",
-    source: "oauth",
-    tokenMeta: {
-      hasAccessToken: true,
-      hasRefreshToken: true,
-      hasIdToken: false,
-    },
-    accountName: "Workspace Gemini",
-    status: {
-      state: "unavailable",
-      label: "不可用",
-      reason: "最近一次额度查询返回 403",
-      updatedAt: Math.floor(Date.now() / 1000) - 420,
-    },
-    quota: {
-      metrics: [
-        {
-          key: "gemini-pro",
-          label: "PRO",
-          remainingPercent: 0,
-          detail: "403",
-          state: "unavailable",
-        },
-        {
-          key: "gemini-flash",
-          label: "FLASH",
-          remainingPercent: 42,
-          state: "available",
-        },
-      ],
-      error: "最近一次额度查询返回 403",
-      lastUpdated: Math.floor(Date.now() / 1000) - 420,
-    },
-    createdAt: Math.floor(Date.now() / 1000) - 3600 * 12,
-    updatedAt: Math.floor(Date.now() / 1000) - 420,
-  },
-];
+type SwitchAccountResult = ManagedAccount[];
+type Notice = { tone: "success" | "error" | "info"; text: string };
 
 const modeConfig: Record<
   ImportMode,
@@ -148,13 +76,13 @@ const modeConfig: Record<
 > = {
   paste: {
     icon: Clipboard,
-    title: "粘贴 auth.json",
-    desc: "适合从 Codex auth.json、Gemini oauth_creds.json 或导出数组快速导入。",
+    title: "粘贴凭证",
+    desc: "适合从 Codex auth.json、Gemini oauth_creds.json 或导出数组快速添加。",
   },
   file: {
     icon: FileJson,
-    title: "导入 JSON 文件",
-    desc: "支持单文件、多文件，后续桌面版会接入系统文件选择器。",
+    title: "选择 JSON 文件",
+    desc: "支持 auth.json、oauth_creds.json 和导出数组。",
   },
   local: {
     icon: Laptop,
@@ -168,12 +96,10 @@ const modeConfig: Record<
   },
 };
 
+const importModeOrder: ImportMode[] = ["paste", "local", "file", "oauth"];
+
 function providerLabel(provider: Provider) {
   return provider === "codex" ? "Codex" : "Gemini Cli";
-}
-
-function providerClass(provider: Provider) {
-  return provider === "codex" ? "codex" : "gemini";
 }
 
 function formatRelative(timestamp: number) {
@@ -192,31 +118,48 @@ function formatDateTime(timestamp?: number | string) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function formatReset(resetAt?: number | string) {
+function formatResetTime(resetAt?: number | string) {
   if (resetAt === undefined) return undefined;
   if (typeof resetAt === "string") return resetAt;
+  const dateTime = formatDateTime(resetAt);
+  if (!dateTime) return undefined;
+  const exact = dateTime.slice(5).replace("-", "/");
   const diff = resetAt - Math.floor(Date.now() / 1000);
-  if (diff <= 0) return "已重置";
-  if (diff < 3600) return `${Math.ceil(diff / 60)}m`;
-  if (diff < 86400) return `${Math.ceil(diff / 3600)}h`;
-  return `${Math.ceil(diff / 86400)}d`;
-}
-
-function formatCountdown(seconds: number) {
-  const total = Math.max(0, Math.floor(seconds));
-  const minutes = Math.floor(total / 60);
+  if (diff <= 0) return exact;
+  const minutes = Math.floor(diff / 60);
   const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  const remainingSeconds = total % 60;
-  if (hours > 0) return `${hours}:${String(remainingMinutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
-  return `${String(remainingMinutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+  const days = Math.floor(hours / 24);
+  const relative =
+    days > 0
+      ? `${days}d ${hours % 24}h`
+      : hours > 0
+        ? `${hours}h ${minutes % 60}m`
+        : `${Math.max(1, minutes)}m`;
+  return `${relative} (${exact})`;
 }
 
 function stateLabel(state: AccountState) {
   if (state === "available") return "可用";
-  if (state === "warning") return "需关注";
-  if (state === "unavailable") return "不可用";
-  return "未知";
+  return "不可用";
+}
+
+function isCurrentAccount(account: ManagedAccount) {
+  return account.status?.state === "available" && account.status.label === "当前";
+}
+
+function sortAccountsForView(items: ManagedAccount[]) {
+  const providerRank: Record<Provider, number> = { codex: 0, gemini: 1 };
+  return [...items].sort((a, b) => {
+    const providerDelta = providerRank[a.provider] - providerRank[b.provider];
+    if (providerDelta !== 0) return providerDelta;
+    const emailDelta = a.email.localeCompare(b.email, undefined, { sensitivity: "base" });
+    if (emailDelta !== 0) return emailDelta;
+    const aName = a.accountName || a.displayName || a.accountId || a.id;
+    const bName = b.accountName || b.displayName || b.accountId || b.id;
+    const nameDelta = aName.localeCompare(bName, undefined, { sensitivity: "base" });
+    if (nameDelta !== 0) return nameDelta;
+    return a.id.localeCompare(b.id);
+  });
 }
 
 function normalizePlanKey(value?: string) {
@@ -248,45 +191,48 @@ function resolveCodexPlanBadge(account: ManagedAccount) {
 function resolveValidityUntil(account: ManagedAccount) {
   if (typeof account.subscriptionActiveUntil === "number") return account.subscriptionActiveUntil;
   if (typeof account.subscriptionActiveUntil === "string") {
-    const parsed = Date.parse(account.subscriptionActiveUntil);
-    if (!Number.isNaN(parsed)) return Math.floor(parsed / 1000);
     const numeric = Number(account.subscriptionActiveUntil);
     if (Number.isFinite(numeric)) return numeric > 1e12 ? Math.floor(numeric / 1000) : numeric;
+    const parsed = Date.parse(account.subscriptionActiveUntil);
+    if (!Number.isNaN(parsed)) return Math.floor(parsed / 1000);
   }
-  return account.tokenMeta.expiresAt;
+  return undefined;
 }
 
 function formatValidityText(account: ManagedAccount) {
+  if ((account.status ?? fallbackStatus(account)).state === "unavailable") {
+    return { label: "有效期", detail: "--", title: account.status?.reason };
+  }
   const until = resolveValidityUntil(account);
-  if (until === undefined) return { label: "有效期", detail: "未读到有效期信息" };
+  if (until === undefined || until <= 0) return { label: "有效期", detail: "未知" };
   const now = Math.floor(Date.now() / 1000);
   const remaining = until - now;
   if (remaining <= 0) {
-    return { label: "有效期", detail: formatDateTime(until) ?? "已过期", expired: true };
+    return { label: "有效期", detail: "已过期", expired: true, title: formatDateTime(until) };
   }
+  const days = Math.ceil(remaining / 86400);
+  const hours = Math.ceil(remaining / 3600);
   return {
     label: "有效期",
-    detail: formatDateTime(until) ?? "可用",
+    detail: days >= 1 ? `${days}天` : `${hours}小时`,
+    title: formatDateTime(until),
   };
 }
 
 function fallbackStatus(account: ManagedAccount) {
   const now = Math.floor(Date.now() / 1000);
   if (!account.tokenMeta.hasAccessToken) return { state: "unavailable" as const, label: "不可用", reason: "缺少 access token" };
-  if (account.tokenMeta.expiresAt && account.tokenMeta.expiresAt <= now) {
-    return { state: "unavailable" as const, label: "已过期", reason: "本地 token 已过期" };
+  if (account.tokenMeta.expiresAt && account.tokenMeta.expiresAt <= now && !account.tokenMeta.hasRefreshToken) {
+    return { state: "unavailable" as const, label: "不可用", reason: "本地 token 已过期" };
   }
-  if (!account.tokenMeta.hasRefreshToken) return { state: "warning" as const, label: "需关注", reason: "缺少 refresh token" };
   return { state: "available" as const, label: "可用" };
 }
 
-function AccountStatusBadge({ account }: { account: ManagedAccount }) {
+function AccountStateCorner({ account }: { account: ManagedAccount }) {
   const status = account.status ?? fallbackStatus(account);
-  const Icon = status.state === "available" ? ShieldCheck : AlertTriangle;
   return (
-    <span className={clsx("status-badge", status.state)} title={status.reason ?? stateLabel(status.state)}>
-      <Icon size={15} />
-      {status.label}
+    <span className={clsx("state-corner", status.state, isCurrentAccount(account) && "current")} title={status.reason ?? stateLabel(status.state)}>
+      {stateLabel(status.state)}
     </span>
   );
 }
@@ -297,35 +243,33 @@ function AccountPlanBadge({ account }: { account: ManagedAccount }) {
 }
 
 function QuotaMeters({ account }: { account: ManagedAccount }) {
-  const metrics = account.quota?.metrics ?? [];
-  if (account.quota?.error && metrics.length === 0) {
-    return (
-      <div className="quota-empty warning">
-        <AlertTriangle size={15} />
-        <span>额度查询失败</span>
-      </div>
-    );
-  }
-
-  if (metrics.length === 0) {
-    return <div className="quota-empty">暂无配额数据</div>;
-  }
+  const isUnavailable = account.status?.state === "unavailable";
+  const metrics =
+    account.quota?.metrics?.length
+      ? account.quota.metrics
+      : [
+          { key: "codex-5h", label: "5H", remainingPercent: 0 },
+          { key: "codex-weekly", label: "WEEKLY", remainingPercent: 0 },
+        ];
 
   return (
     <div className="quota-meters">
       {metrics.slice(0, 3).map((metric) => {
-        const remaining = metric.remainingPercent;
-        const state = metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available");
+        const remaining = isUnavailable ? 0 : metric.remainingPercent;
+        const state = isUnavailable ? "unavailable" : (metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available"));
+        const resetText = isUnavailable ? "--" : (formatResetTime(metric.resetAt) ?? "--");
         return (
           <div className="quota-meter" key={metric.key} title={metric.detail ?? account.quota?.error ?? metric.label}>
             <div className="quota-meter-head">
               <span>{metric.label}</span>
-              <strong>{remaining === undefined ? "N/A" : `${remaining}%`}</strong>
+              <div className="quota-meter-value">
+                <strong>{remaining === undefined ? "N/A" : `${remaining}%`}</strong>
+              </div>
             </div>
             <div className={clsx("quota-track", state)}>
               <i style={{ width: `${remaining ?? 0}%` }} />
             </div>
-            <small>{formatReset(metric.resetAt) ?? metric.detail ?? (state === "unavailable" ? "不可用" : "可用")}</small>
+            <time className="quota-meter-reset">{resetText}</time>
           </div>
         );
       })}
@@ -336,43 +280,57 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
 function ValidityMeter({ account }: { account: ManagedAccount }) {
   const validity = formatValidityText(account);
   return validity.detail ? (
-    <div className={clsx("validity-line", validity.expired && "expired")}>
-      <span>{validity.label}</span>
-      <strong>{validity.detail}</strong>
+    <div className={clsx("validity-line", validity.expired && "expired")} title={validity.title}>
+      <CalendarDays size={15} strokeWidth={1.9} />
+      <span>
+        {validity.label} <strong>{validity.detail}</strong>
+      </span>
+      {validity.title && <time>{validity.title}</time>}
     </div>
   ) : (
     <div className="validity-line">
-      <span>{validity.label}</span>
-      <strong>未读到有效期信息</strong>
+      <span>{validity.label} 未知</span>
     </div>
   );
-}
-
-function serializeAccount(account: ManagedAccount) {
-  return JSON.stringify(account, null, 2);
 }
 
 function mergeAccounts(current: ManagedAccount[], next: ManagedAccount[]) {
   const map = new Map(current.map((account) => [account.id, account]));
   for (const account of next) map.set(account.id, account);
-  return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+  return sortAccountsForView([...map.values()]);
 }
 
 function App() {
-  const [accounts, setAccounts] = useState<ManagedAccount[]>(seedAccounts);
+  const [accounts, setAccounts] = useState<ManagedAccount[]>([]);
   const [activeProvider, setActiveProvider] = useState<Provider>("codex");
   const [mode, setMode] = useState<ImportMode>("paste");
   const [pasteValue, setPasteValue] = useState("");
   const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
-  const [notice, setNotice] = useState("原型已就绪：粘贴 JSON 或选择文件即可测试解析。");
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
   const [isBusy, setIsBusy] = useState(false);
-  const [isBatchDetecting, setIsBatchDetecting] = useState(false);
-  const [lastBatchDetectAt, setLastBatchDetectAt] = useState<number>(() => Math.floor(Date.now() / 1000));
-  const [autoRefreshRemaining, setAutoRefreshRemaining] = useState(autoRefreshIntervalSeconds);
+  const [isFileImporting, setIsFileImporting] = useState(false);
+  const [refreshingAccountIds, setRefreshingAccountIds] = useState<Set<string>>(() => new Set());
+  const [refreshingProvider, setRefreshingProvider] = useState<Provider | null>(null);
   const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
+  const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [settings, setSettings] = useState<AppSettings>({
+    theme: "system",
+    autoLaunch: false,
+    maskSensitive: false,
+  });
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const accountListRef = useRef<HTMLDivElement | null>(null);
+  const oauthPollTimers = useRef<Partial<Record<OAuthProvider, number>>>({});
+  const noticeTimer = useRef<number | null>(null);
+  const [accountScrollbar, setAccountScrollbar] = useState({
+    visible: false,
+    top: 0,
+    height: 0,
+  });
   const appWindow = useMemo(() => {
     try {
       return getCurrentWindow();
@@ -383,13 +341,13 @@ function App() {
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
-    return accounts.filter((account) => {
+    return sortAccountsForView(accounts.filter((account) => {
       if (account.provider !== activeProvider) return false;
       if (!normalizedQuery) return true;
       return [account.email, account.displayName, account.plan, account.accountId]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(normalizedQuery));
-    });
+    }));
   }, [accounts, activeProvider, query]);
 
   const counts = useMemo(
@@ -400,19 +358,82 @@ function App() {
     [accounts],
   );
 
-  const applyImportResult = (result: BackendImportResult, successText: string, emptyText: string) => {
-    const importedForCurrentProvider = result.imported.filter((account) => account.provider === activeProvider);
-    const skippedCount = result.imported.length - importedForCurrentProvider.length;
-    if (result.imported.length > 0 && importedForCurrentProvider.length > 0) {
-      if (importedForCurrentProvider.length > 0) {
-        setAccounts((current) => mergeAccounts(current, importedForCurrentProvider));
+  const updateAccountScrollbar = useCallback(() => {
+    const element = accountListRef.current;
+    if (!element) {
+      setAccountScrollbar({ visible: false, top: 0, height: 0 });
+      return;
+    }
+    const { clientHeight, scrollHeight, scrollTop } = element;
+    const visible = scrollHeight > clientHeight + 1;
+    if (!visible) {
+      setAccountScrollbar({ visible: false, top: 0, height: 0 });
+      return;
+    }
+    const trackInset = 8;
+    const trackHeight = Math.max(0, clientHeight - trackInset * 2);
+    const height = Math.max(54, Math.round((clientHeight / scrollHeight) * trackHeight));
+    const maxScrollTop = Math.max(1, scrollHeight - clientHeight);
+    const maxThumbTop = Math.max(0, trackHeight - height);
+    const top = trackInset + Math.round((scrollTop / maxScrollTop) * maxThumbTop);
+    setAccountScrollbar((current) => {
+      if (current.visible === visible && current.top === top && current.height === height) return current;
+      return { visible, top, height };
+    });
+  }, []);
+
+  useEffect(() => {
+    updateAccountScrollbar();
+    const element = accountListRef.current;
+    const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(updateAccountScrollbar);
+    if (element) resizeObserver?.observe(element);
+    window.addEventListener("resize", updateAccountScrollbar);
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updateAccountScrollbar);
+    };
+  }, [filteredAccounts.length, activeProvider, query, updateAccountScrollbar]);
+
+  const showNotice = (tone: Notice["tone"], text: string) => {
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    setNotice({ tone, text });
+    noticeTimer.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeTimer.current = null;
+    }, 3000);
+  };
+
+  const reloadAccountsSoon = (delay = 1800) => {
+    window.setTimeout(() => {
+      void invoke<ManagedAccount[]>("list_accounts")
+        .then((storedAccounts) => setAccounts(storedAccounts))
+        .catch(() => undefined);
+    }, delay);
+  };
+
+  const clearOAuthPoll = (provider: OAuthProvider) => {
+    const timer = oauthPollTimers.current[provider];
+    if (timer) window.clearTimeout(timer);
+    delete oauthPollTimers.current[provider];
+  };
+
+  const applyImportResult = (
+    result: BackendImportResult,
+    options: { closeModal?: boolean; successText?: string } = {},
+  ) => {
+    if (result.imported.length > 0) {
+      setAccounts((current) => mergeAccounts(current, result.imported));
+      void invoke("upsert_accounts", { accounts: result.imported }).catch(() => undefined);
+      if (options.closeModal ?? true) {
+        setIsImportModalOpen(false);
+        setPasteValue("");
       }
-      const baseNotice = successText.replace("{count}", String(importedForCurrentProvider.length));
-      setNotice(skippedCount > 0 ? `${baseNotice}（已跳过 ${skippedCount} 个非当前平台账号）` : baseNotice);
-    } else if (result.imported.length > 0 && importedForCurrentProvider.length === 0) {
-      setNotice(`没有导入 ${providerLabel(activeProvider)} 账号（已识别到 ${skippedCount} 个其他平台账号并跳过）。`);
+      showNotice("success", options.successText ?? `已添加 ${result.imported.length} 个账号`);
+      reloadAccountsSoon();
+    } else if (result.failed.length > 0) {
+      showNotice("error", result.failed[0]?.reason ?? "未添加账号");
     } else {
-      setNotice(emptyText);
+      showNotice("info", "没有发现可添加的账号");
     }
     setFailures(result.failed);
   };
@@ -433,7 +454,7 @@ function App() {
     setIsBusy(true);
     try {
       const result = await parseWithBackend(pasteValue, "粘贴内容");
-      applyImportResult(result, "导入成功：{count} 个账号已加入本地列表。", "没有导入账号，检查 JSON 是否包含 Codex/Gemini 凭证字段。");
+      applyImportResult(result);
     } finally {
       setIsBusy(false);
     }
@@ -442,6 +463,7 @@ function App() {
   const handleFileImport = async (files: FileList | null) => {
     if (!files?.length) return;
     setIsBusy(true);
+    setIsFileImporting(true);
     const allFailures: ImportFailure[] = [];
     const allImported: ManagedAccount[] = [];
     try {
@@ -454,33 +476,72 @@ function App() {
       if (allImported.length > 0) {
         applyImportResult(
           { imported: allImported, failed: allFailures },
-          "文件导入完成：新增或更新 {count} 个账号。",
-          "文件读取完成，但没有识别到可导入账号。",
         );
       } else {
-        setNotice("文件读取完成，但没有识别到可导入账号。");
         setFailures(allFailures);
+        showNotice("error", allFailures[0]?.reason ?? "没有发现可添加的账号");
       }
     } finally {
+      setIsFileImporting(false);
       setIsBusy(false);
     }
   };
 
   const handleLocalImport = async (provider: OAuthProvider) => {
     setIsBusy(true);
+    setFailures([]);
     try {
       const command = provider === "codex" ? "import_codex_from_local" : "import_gemini_from_local";
       const result = await invoke<BackendImportResult>(command);
       applyImportResult(
         result,
-        `读取本机 ${providerLabel(provider)} 成功：{count} 个账号已加入列表。`,
-        `未从本机读取到 ${providerLabel(provider)} 账号。`,
       );
     } catch (error) {
-      setNotice(`读取本机 ${providerLabel(provider)} 失败：${String(error)}`);
+      setFailures([]);
+      showNotice("error", `读取本机 ${providerLabel(provider)} 失败：${String(error)}`);
     } finally {
       setIsBusy(false);
     }
+  };
+
+  const completeOAuth = async (
+    provider: OAuthProvider,
+    loginId: string,
+    options: { silent?: boolean } = {},
+  ) => {
+    const command = provider === "codex" ? "complete_codex_oauth" : "complete_gemini_oauth";
+    try {
+      const result = await invoke<BackendImportResult>(command, { loginId });
+      if (result.imported.length === 0) {
+        if (!options.silent) applyImportResult(result, { closeModal: false });
+        return false;
+      }
+      applyImportResult(
+        result,
+        { successText: `${providerLabel(provider)} OAuth 登录成功，已添加 ${result.imported.length} 个账号` },
+      );
+      setPendingOAuth((current) => ({ ...current, [provider]: undefined }));
+      clearOAuthPoll(provider);
+      return true;
+    } catch (error) {
+      if (!options.silent) {
+        showNotice("error", `${providerLabel(provider)} OAuth 完成失败：${String(error)}`);
+      }
+      return false;
+    }
+  };
+
+  const scheduleOAuthPoll = (provider: OAuthProvider, loginId: string, attempt = 0) => {
+    clearOAuthPoll(provider);
+    if (attempt >= 90) {
+      showNotice("info", `${providerLabel(provider)} OAuth 仍在等待完成，可点击“完成添加”重试。`);
+      return;
+    }
+    oauthPollTimers.current[provider] = window.setTimeout(() => {
+      void completeOAuth(provider, loginId, { silent: true }).then((isComplete) => {
+        if (!isComplete) scheduleOAuthPoll(provider, loginId, attempt + 1);
+      });
+    }, 2000);
   };
 
   const handleOAuthStart = async (provider: OAuthProvider) => {
@@ -489,9 +550,10 @@ function App() {
       const command = provider === "codex" ? "start_codex_oauth" : "start_gemini_oauth";
       const result = await invoke<OAuthStartResult>(command);
       setPendingOAuth((current) => ({ ...current, [provider]: result.login_id }));
-      setNotice(result.message);
+      scheduleOAuthPoll(provider, result.login_id);
+      showNotice("info", result.message);
     } catch (error) {
-      setNotice(`${providerLabel(provider)} OAuth 启动失败：${String(error)}`);
+      showNotice("error", `${providerLabel(provider)} OAuth 启动失败：${String(error)}`);
     } finally {
       setIsBusy(false);
     }
@@ -500,21 +562,12 @@ function App() {
   const handleOAuthComplete = async (provider: OAuthProvider) => {
     const loginId = pendingOAuth[provider];
     if (!loginId) {
-      setNotice(`请先启动 ${providerLabel(provider)} OAuth。`);
+      showNotice("info", `请先启动 ${providerLabel(provider)} OAuth。`);
       return;
     }
     setIsBusy(true);
     try {
-      const command = provider === "codex" ? "complete_codex_oauth" : "complete_gemini_oauth";
-      const result = await invoke<BackendImportResult>(command, { loginId });
-      applyImportResult(
-        result,
-        `${providerLabel(provider)} OAuth 完成：导入 {count} 个账号。`,
-        `${providerLabel(provider)} OAuth 已完成，但未读取到账号。`,
-      );
-      setPendingOAuth((current) => ({ ...current, [provider]: undefined }));
-    } catch (error) {
-      setNotice(`${providerLabel(provider)} OAuth 完成失败：${String(error)}`);
+      await completeOAuth(provider, loginId);
     } finally {
       setIsBusy(false);
     }
@@ -522,65 +575,92 @@ function App() {
 
   const selectedMode = modeConfig[mode];
   const ModeIcon = selectedMode.icon;
+  const isActiveProviderOAuthPending = Boolean(pendingOAuth[activeProvider]);
   const startWindowDrag = (event: React.MouseEvent<HTMLElement>) => {
     if (event.target instanceof HTMLElement && event.target.closest("button, input, textarea, select, a, label")) return;
     if (event.button !== 0) return;
     event.preventDefault();
     void invoke("start_window_drag").catch(() => {
       void appWindow?.startDragging().catch(() => {
-        setNotice("窗口拖拽未启动：请拖动窗口顶部空白区域。");
+        console.info("窗口拖拽未启动：请拖动窗口顶部空白区域。");
       });
     });
+  };
+  const handleModalBackdropMouseDown = (
+    event: React.MouseEvent<HTMLDivElement>,
+    close: () => void,
+  ) => {
+    if (event.target !== event.currentTarget) return;
+    close();
   };
   const handleAddAccount = () => {
     setMode("paste");
     setIsImportModalOpen(true);
   };
   const handleSettings = () => {
-    setNotice("设置页稍后接入：这里会放主题、隐私模式、本地路径和 OAuth 参数。");
+    setIsSettingsOpen(true);
   };
-  const updateAccount = (accountId: string, updater: (account: ManagedAccount) => ManagedAccount) => {
-    setAccounts((current) => current.map((account) => (account.id === accountId ? updater(account) : account)));
+  const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
+    setSettings((current) => ({ ...current, [key]: value }));
   };
-  const handleToggleAccount = (account: ManagedAccount) => {
-    const now = Math.floor(Date.now() / 1000);
-    const nextStatus =
-      account.status?.state === "unavailable"
-        ? { state: "available" as const, label: "可用", updatedAt: now }
-        : { state: "unavailable" as const, label: "不可用", reason: "已在本地停用", updatedAt: now };
-    updateAccount(account.id, (current) => ({
-      ...current,
-      status: nextStatus,
-      updatedAt: now,
-    }));
-    setNotice(`${providerLabel(account.provider)} 账号 ${account.email} 已${nextStatus.state === "available" ? "启用" : "停用"}。`);
+  const handleToggleAccount = async (account: ManagedAccount) => {
+    if (isCurrentAccount(account)) return;
+    setIsBusy(true);
+    try {
+      const providerAccounts = await invoke<SwitchAccountResult>("switch_account", { accountId: account.id });
+      setAccounts((current) =>
+        sortAccountsForView(current.map((item) => providerAccounts.find((changed) => changed.id === item.id) ?? item)),
+      );
+      showNotice("success", `已启用 ${account.email}`);
+    } catch (error) {
+      showNotice("error", `启用账号失败：${String(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
-  const handleRefreshAccount = (account: ManagedAccount) => {
-    const now = Math.floor(Date.now() / 1000);
-    updateAccount(account.id, (current) => ({
-      ...current,
-      updatedAt: now,
-      status: current.status
-        ? {
-            ...current.status,
-            updatedAt: now,
-          }
-        : {
-            state: "available",
-            label: "可用",
-            updatedAt: now,
-          },
-      quota: current.quota
-        ? {
-            ...current.quota,
-            lastUpdated: now,
-          }
-        : current.quota,
-    }));
-    setNotice(`已刷新 ${providerLabel(account.provider)} 账号：${account.email}`);
+
+  const handleRefreshAccount = async (account: ManagedAccount) => {
+    setIsBusy(true);
+    setRefreshingAccountIds((current) => new Set(current).add(account.id));
+    try {
+      const refreshed = await invoke<ManagedAccount>("refresh_account", { accountId: account.id });
+      setAccounts((current) => sortAccountsForView(current.map((item) => (item.id === refreshed.id ? refreshed : item))));
+      showNotice("success", `已刷新 ${refreshed.email}`);
+    } catch (error) {
+      showNotice("error", `刷新账号失败：${String(error)}`);
+    } finally {
+      setRefreshingAccountIds((current) => {
+        const next = new Set(current);
+        next.delete(account.id);
+        return next;
+      });
+      setIsBusy(false);
+    }
+  };
+  const handleRefreshVisibleAccounts = async () => {
+    setIsBusy(true);
+    setRefreshingProvider(activeProvider);
+    try {
+      const refreshedAccounts = await invoke<ManagedAccount[]>("refresh_provider_accounts", { provider: activeProvider });
+      setAccounts((current) =>
+        sortAccountsForView(current.map((item) => refreshedAccounts.find((changed) => changed.id === item.id) ?? item)),
+      );
+      showNotice("success", `已刷新 ${providerLabel(activeProvider)} 账号`);
+    } catch (error) {
+      showNotice("error", `刷新 ${providerLabel(activeProvider)} 失败：${String(error)}`);
+    } finally {
+      setRefreshingProvider(null);
+      setIsBusy(false);
+    }
   };
   const handleExportAccount = async (account: ManagedAccount) => {
-    const payload = serializeAccount(account);
+    let payload: string;
+    try {
+      payload = await invoke<string>("export_account", { accountId: account.id });
+    } catch (error) {
+      showNotice("error", `导出账号失败：${String(error)}`);
+      return;
+    }
     const blob = new Blob([payload], { type: "application/json;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -588,73 +668,73 @@ function App() {
     a.download = `${account.provider}-${account.email.replace(/[^a-z0-9._-]+/gi, "_")}.json`;
     a.click();
     URL.revokeObjectURL(url);
-    setNotice(`已导出 ${providerLabel(account.provider)} 账号：${account.email}`);
+    showNotice("success", `已导出 ${account.email}`);
   };
   const handleDeleteAccount = (account: ManagedAccount) => {
-    const confirmed = window.confirm(`删除 ${account.email}？这会从当前列表移除本地预览。`);
-    if (!confirmed) return;
-    setAccounts((current) => current.filter((item) => item.id !== account.id));
-    setNotice(`已删除 ${providerLabel(account.provider)} 账号：${account.email}`);
+    setPendingDeleteAccount(account);
+  };
+
+  const confirmDeleteAccount = async () => {
+    if (!pendingDeleteAccount) return;
+    const account = pendingDeleteAccount;
+    setIsBusy(true);
+    try {
+      const nextAccounts = await invoke<ManagedAccount[]>("delete_account", { accountId: account.id });
+      setAccounts(nextAccounts);
+      setPendingDeleteAccount(null);
+      showNotice("success", `已删除 ${account.email}`);
+    } catch (error) {
+      showNotice("error", `删除账号失败：${String(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
   const handleOpenStore = (event: React.MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault();
-    setNotice("正在打开 Super Store AI 权益页面...");
     void openUrl("https://ai.talentisan.cn/");
   };
 
-  const handleBatchDetect = async (reason: "startup" | "manual" | "timer" = "manual") => {
-    const now = Math.floor(Date.now() / 1000);
-    setIsBatchDetecting(true);
-    await new Promise((resolve) => window.setTimeout(resolve, 150));
-    let accountCount = 0;
-    setAccounts((current) => {
-      accountCount = current.length;
-      return current
-        .map((account): ManagedAccount => ({
-          ...account,
-          status: account.status
-            ? { ...account.status, updatedAt: now }
-            : {
-                state: account.tokenMeta.hasAccessToken ? "available" : "unavailable",
-                label: account.tokenMeta.hasAccessToken ? "可用" : "不可用",
-                reason: account.tokenMeta.hasAccessToken ? undefined : "缺少 access token",
-                updatedAt: now,
-              },
-          quota: account.quota ? { ...account.quota, lastUpdated: now } : account.quota,
-          updatedAt: now,
-        }))
-        .sort((a, b) => b.updatedAt - a.updatedAt);
-    });
-    setLastBatchDetectAt(now);
-    setAutoRefreshRemaining(autoRefreshIntervalSeconds);
-    setIsBatchDetecting(false);
-    const prefix =
-      reason === "startup" ? "已启动批量检测" : reason === "timer" ? "定时批量检测完成" : "已完成批量检测";
-    setNotice(`${prefix}：当前管理 ${accountCount || accounts.length} 个账号。`);
-  };
-
   useEffect(() => {
-    const startupTimer = window.setTimeout(() => {
-      void handleBatchDetect("startup");
-    }, 0);
-    const timer = window.setInterval(() => {
-      setAutoRefreshRemaining((current) => {
-        if (current <= 1) {
-          void handleBatchDetect("timer");
-          return autoRefreshIntervalSeconds;
+    void invoke<ManagedAccount[]>("list_accounts")
+      .then((storedAccounts) => {
+        setAccounts(storedAccounts);
+      })
+      .catch(() => undefined);
+
+    void invoke<AppSettings | null>("load_settings")
+      .then((storedSettings) => {
+        if (storedSettings) {
+          setSettings(storedSettings);
         }
-        return current - 1;
-      });
-    }, 1000);
+      })
+      .catch(() => undefined)
+      .finally(() => setIsSettingsLoaded(true));
+
     return () => {
-      window.clearTimeout(startupTimer);
-      window.clearInterval(timer);
+      Object.values(oauthPollTimers.current).forEach((timer) => {
+        if (timer) window.clearTimeout(timer);
+      });
+      oauthPollTimers.current = {};
+      if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    if (!isSettingsLoaded) return;
+    void invoke("save_settings", { settings }).catch(() => undefined);
+  }, [isSettingsLoaded, settings]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (settings.theme === "system") {
+      delete root.dataset.theme;
+    } else {
+      root.dataset.theme = settings.theme;
+    }
+  }, [settings.theme]);
+
   return (
-    <main className="shell">
+    <main className={clsx("shell", settings.maskSensitive && "privacy-mask")}>
       <div className="global-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
       <div className="top-edge-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
       <aside className="sidebar">
@@ -699,128 +779,124 @@ function App() {
       </aside>
 
       <section className="workspace">
-        <header className="topbar" data-tauri-drag-region onMouseDown={startWindowDrag}>
-          <div className="title-drag drag-surface" data-tauri-drag-region onMouseDown={startWindowDrag}>
-            <p className="eyebrow">Account Control Center</p>
-            <h1>Super AI 账号管理</h1>
-          </div>
-          <div className="topbar-actions">
-            <label className="search">
-              <Search size={18} />
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮箱、计划或账号 ID" />
-            </label>
-            <button className="primary" onClick={handleAddAccount}>
-              <Plus size={18} />
-              添加账号
-            </button>
-          </div>
-        </header>
-
-        <section className="status-strip">
-          <div className="status-copy">
-            <ShieldCheck size={20} />
-            <span>{notice}</span>
-          </div>
-          <div className="status-actions">
-            <span className="countdown-pill" title={formatDateTime(lastBatchDetectAt)}>
-              <Clock3 size={15} />
-              自动检测 {formatCountdown(autoRefreshRemaining)}
-            </span>
-            <button onClick={() => void handleBatchDetect("manual")} disabled={isBatchDetecting}>
-              <RefreshCw size={18} />
-              {isBatchDetecting ? "检测中..." : "立即检测"}
-            </button>
-          </div>
-        </section>
-
         <section className="content-grid">
           <div className="accounts-panel">
-            <div className="panel-head">
-              <div>
-                <h2>账号列表</h2>
-                <p>
+            <div className="accounts-toolbar">
+              <div className="toolbar-meta">
                   {providerLabel(activeProvider)} · {filteredAccounts.length} 个匹配项
-                </p>
+              </div>
+              <div className="panel-actions">
+                <label className="search">
+                  <Search size={18} />
+                  <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮箱、计划或账号 ID" />
+                </label>
+                <button className="primary" onClick={handleAddAccount}>
+                  <Plus size={18} />
+                  添加账号
+                </button>
+                <button className="secondary refresh-all" onClick={handleRefreshVisibleAccounts} disabled={isBusy}>
+                  <RotateCw size={18} className={clsx(refreshingProvider === activeProvider && "spin")} />
+                  刷新账号
+                </button>
               </div>
             </div>
-
-            <div className="account-list card-mode">
-              {filteredAccounts.map((account) => (
-                <article className={clsx("account-row", account.status?.state === "unavailable" && "disabled")} key={account.id}>
-                  <div className="account-provider">
-                    <div className={clsx("provider-dot", providerClass(account.provider))}>
-                      {account.provider === "codex" ? <Bot size={24} /> : <Fingerprint size={24} />}
-                    </div>
+            <div className="account-scroll-shell">
+              <div className="account-list card-mode" ref={accountListRef} onScroll={updateAccountScrollbar}>
+                {filteredAccounts.length === 0 && (
+                  <div className="empty-state">
+                    <FileJson size={54} strokeWidth={1.35} />
+                    <strong>暂无账号</strong>
                   </div>
-                  <div className="account-main">
-                    <div className="account-title">
-                      <strong>{account.displayName || account.email}</strong>
-                      <AccountPlanBadge account={account} />
-                      <AccountStatusBadge account={account} />
-                      {account.tokenMeta.hasRefreshToken && (
-                        <span className="pill muted">
-                          <BadgeCheck size={15} />
-                          Refresh
+                )}
+                {filteredAccounts.map((account) => (
+                  <article className={clsx("account-row", account.status?.state === "unavailable" && "disabled", isCurrentAccount(account) && "current")} key={account.id}>
+                    <AccountStateCorner account={account} />
+                    <div className="account-main">
+                      <div className="account-title">
+                        <strong>{account.displayName || account.email}</strong>
+                        <AccountPlanBadge account={account} />
+                      </div>
+                      <div className="account-subtitle">
+                        <span>
+                          <b>邮箱</b>
+                          {account.email}
                         </span>
-                      )}
+                        {account.accountId && (
+                          <span>
+                            <b>账号 ID</b>
+                            {account.accountId}
+                          </span>
+                        )}
+                        {account.organizationId && (
+                          <span>
+                            <b>组织</b>
+                            {account.organizationId}
+                          </span>
+                        )}
+                      </div>
                     </div>
-                    <div className="account-subtitle">
-                      <span>用户名：{account.accountName || account.displayName || account.userId || account.email.split("@")[0]}</span>
-                      <span>邮箱：{account.email}</span>
-                      {account.organizationId && <span>组织：{account.organizationId}</span>}
+                    <QuotaMeters account={account} />
+                    <ValidityMeter account={account} />
+                    <div className="account-footer">
+                      <time className="account-stamp">{account.status?.state === "unavailable" ? "--" : formatRelative(account.updatedAt)}</time>
+                      <div className="account-actions">
+                      <button
+                        className="icon-button"
+                        aria-label={isCurrentAccount(account) ? "停用当前账号" : "设为当前账号"}
+                        title={isCurrentAccount(account) ? "停用" : "设为当前"}
+                        onClick={() => handleToggleAccount(account)}
+                      >
+                        <CirclePlay size={15} strokeWidth={1.75} />
+                      </button>
+                      <button className="icon-button" aria-label="刷新账号" title="刷新" onClick={() => handleRefreshAccount(account)} disabled={refreshingAccountIds.has(account.id)}>
+                        <RefreshCcw size={15} strokeWidth={1.75} className={clsx(refreshingAccountIds.has(account.id) && "spin")} />
+                      </button>
+                      <button className="icon-button" aria-label="导出账号" title="导出" onClick={() => void handleExportAccount(account)}>
+                        <FileDown size={15} strokeWidth={1.75} />
+                      </button>
+                      <button className="icon-button danger" aria-label="删除账号" title="删除" onClick={() => handleDeleteAccount(account)}>
+                        <Trash size={15} strokeWidth={1.75} />
+                      </button>
+                      </div>
                     </div>
-                  </div>
-                  <div className="account-meta">
-                    <div>
-                      <span>最后检测</span>
-                      <small>{formatRelative(account.updatedAt)}</small>
-                    </div>
-                  </div>
-                  <ValidityMeter account={account} />
-                  <QuotaMeters account={account} />
-                  <div className="account-actions">
-                    <button
-                      className="icon-button"
-                      aria-label={account.status?.state === "unavailable" ? "启用账号" : "停用账号"}
-                      title={account.status?.state === "unavailable" ? "启用" : "停用"}
-                      onClick={() => handleToggleAccount(account)}
-                    >
-                      <Power size={20} />
-                    </button>
-                    <button className="icon-button" aria-label="刷新账号" title="刷新" onClick={() => handleRefreshAccount(account)}>
-                      <RefreshCw size={20} />
-                    </button>
-                    <button className="icon-button" aria-label="导出账号" title="导出" onClick={() => void handleExportAccount(account)}>
-                      <Download size={20} />
-                    </button>
-                    <button className="icon-button danger" aria-label="删除账号" title="删除" onClick={() => handleDeleteAccount(account)}>
-                      <Trash2 size={20} />
-                    </button>
-                  </div>
-                </article>
-              ))}
+                  </article>
+                ))}
+              </div>
+              <div className={clsx("account-scrollbar", accountScrollbar.visible && "visible")} aria-hidden="true">
+                <i style={{ height: accountScrollbar.height, transform: `translateY(${accountScrollbar.top}px)` }} />
+              </div>
             </div>
           </div>
         </section>
       </section>
 
+      {notice && (
+        <div className={clsx("toast", notice.tone)}>
+          <span>{notice.text}</span>
+          <button onClick={() => setNotice(null)} aria-label="关闭提示">×</button>
+        </div>
+      )}
+
       {isImportModalOpen && (
-        <div className="modal-overlay" onMouseDown={() => setIsImportModalOpen(false)}>
+        <div className="modal-overlay">
           <aside className="import-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="panel-head">
+            <div className="panel-head drag-surface" data-tauri-drag-region onMouseDown={startWindowDrag}>
               <div>
-                <h2>导入</h2>
-                <p>选择导入方式添加账号</p>
+                <h2>添加账号</h2>
+                <p>选择添加方式</p>
               </div>
+              <button className="modal-close-button" onClick={() => setIsImportModalOpen(false)} aria-label="关闭添加账号">
+                <X size={22} strokeWidth={2.2} />
+              </button>
             </div>
 
             <div className="mode-grid">
-              {(Object.keys(modeConfig) as ImportMode[]).map((key) => {
+              {importModeOrder.map((key) => {
                 const item = modeConfig[key];
                 const Icon = item.icon;
                 return (
                   <button key={key} className={clsx("mode-button", mode === key && "active")} onClick={() => setMode(key)}>
-                    <Icon size={20} />
+                    <Icon size={16} />
                     <span>{item.title}</span>
                   </button>
                 );
@@ -846,7 +922,7 @@ function App() {
                   />
                   <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim() || isBusy}>
                     <Clipboard size={20} />
-                    {isBusy ? "处理中..." : "解析并导入"}
+                    {isBusy ? "处理中..." : "解析并添加"}
                   </button>
                 </>
               )}
@@ -861,10 +937,10 @@ function App() {
                     hidden
                     onChange={(event) => handleFileImport(event.target.files)}
                   />
-                  <button className="drop-zone" onClick={() => fileInputRef.current?.click()} disabled={isBusy}>
-                    <Upload size={28} />
-                    <strong>选择 JSON 文件</strong>
-                    <span>支持 auth.json、oauth_creds.json、导出数组</span>
+                  <button className={clsx("drop-zone", isFileImporting && "loading")} onClick={() => fileInputRef.current?.click()} disabled={isBusy}>
+                    <Upload size={28} className={clsx(isFileImporting && "spin")} />
+                    <strong>{isFileImporting ? "正在导入 JSON..." : "选择 JSON 文件"}</strong>
+                    <span>{isFileImporting ? "正在解析并刷新账号信息" : "支持 auth.json、oauth_creds.json、导出数组"}</span>
                   </button>
                 </>
               )}
@@ -877,7 +953,7 @@ function App() {
                       读取本机 {providerLabel(activeProvider)} 账号配置
                     </p>
                   </div>
-                  <button className="wide" onClick={() => handleLocalImport(activeProvider)} disabled={isBusy}>
+                  <button className="wide primary" onClick={() => handleLocalImport(activeProvider)} disabled={isBusy}>
                     <FolderDown size={20} />
                     读取 {providerLabel(activeProvider)} 本机账号
                   </button>
@@ -889,16 +965,16 @@ function App() {
                   <div>
                     <span>1</span>
                     <p>
-                      启动 {providerLabel(activeProvider)} 终端 OAuth 登录
+                      启动 {providerLabel(activeProvider)} OAuth 登录
                     </p>
                   </div>
-                  <button className="wide" onClick={() => handleOAuthStart(activeProvider)} disabled={isBusy}>
+                  <button className="wide primary" onClick={() => handleOAuthStart(activeProvider)} disabled={isBusy || isActiveProviderOAuthPending}>
                     <LockKeyhole size={20} />
-                    启动 {providerLabel(activeProvider)} OAuth
+                    {isActiveProviderOAuthPending ? "等待授权完成..." : `启动 ${providerLabel(activeProvider)} OAuth`}
                   </button>
-                  <button className="wide" onClick={() => handleOAuthComplete(activeProvider)} disabled={isBusy}>
+                  <button className="wide" onClick={() => handleOAuthComplete(activeProvider)} disabled={isBusy || !isActiveProviderOAuthPending}>
                     <BadgeCheck size={20} />
-                    完成 {providerLabel(activeProvider)} 导入
+                    我已完成授权，立即添加
                   </button>
                 </div>
               )}
@@ -906,7 +982,7 @@ function App() {
 
             {failures.length > 0 && (
               <div className="failure-list">
-                <strong>未导入项</strong>
+                <strong>未添加项</strong>
                 {failures.slice(0, 4).map((failure) => (
                   <p key={`${failure.label}:${failure.reason}`}>
                     {failure.label}: {failure.reason}
@@ -914,6 +990,107 @@ function App() {
                 ))}
               </div>
             )}
+          </aside>
+        </div>
+      )}
+
+      {isSettingsOpen && (
+        <div className="modal-overlay" onMouseDown={(event) => handleModalBackdropMouseDown(event, () => setIsSettingsOpen(false))}>
+          <aside className="settings-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="panel-head drag-surface" data-tauri-drag-region onMouseDown={startWindowDrag}>
+              <div>
+                <h2>设置</h2>
+                <p>外观、启动和本地隐私</p>
+              </div>
+            </div>
+
+            <div className="settings-body">
+              <section className="setting-block">
+                <div className="setting-copy">
+                  <Settings size={18} />
+                  <div>
+                    <strong>主题</strong>
+                    <p>选择桌面窗口的显示方式</p>
+                  </div>
+                </div>
+                <div className="theme-segmented" role="group" aria-label="主题">
+                  {themeOptions.map((option) => {
+                    const Icon = option.icon;
+                    return (
+                      <button
+                        key={option.key}
+                        className={clsx(settings.theme === option.key && "active")}
+                        onClick={() => updateSetting("theme", option.key)}
+                      >
+                        <Icon size={16} />
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+
+              <section className="setting-row">
+                <div className="setting-copy">
+                  <Rocket size={18} />
+                  <div>
+                    <strong>开机自启</strong>
+                    <p>登录系统后自动启动 Super AI</p>
+                  </div>
+                </div>
+                <button
+                  className={clsx("switch", settings.autoLaunch && "active")}
+                  role="switch"
+                  aria-checked={settings.autoLaunch}
+                  onClick={() => updateSetting("autoLaunch", !settings.autoLaunch)}
+                >
+                  <i />
+                </button>
+              </section>
+
+              <section className="setting-row">
+                <div className="setting-copy">
+                  <EyeOff size={18} />
+                  <div>
+                    <strong>隐私遮罩</strong>
+                    <p>隐藏卡片里的邮箱和账号 ID，适合录屏或截图</p>
+                  </div>
+                </div>
+                <button
+                  className={clsx("switch", settings.maskSensitive && "active")}
+                  role="switch"
+                  aria-checked={settings.maskSensitive}
+                  onClick={() => updateSetting("maskSensitive", !settings.maskSensitive)}
+                >
+                  <i />
+                </button>
+              </section>
+
+              <p className="setting-note">开机自启会在接入 Tauri 后端后写入系统登录项；当前面板已保留配置入口。</p>
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {pendingDeleteAccount && (
+        <div className="modal-overlay" onMouseDown={(event) => handleModalBackdropMouseDown(event, () => setPendingDeleteAccount(null))}>
+          <aside className="confirm-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="confirm-icon danger">
+              <Trash size={22} />
+            </div>
+            <div className="confirm-copy">
+              <h2>删除账号</h2>
+              <p>{pendingDeleteAccount.email}</p>
+              <span>只会从 Super AI 的账号库移除，不会删除本机 Codex/Gemini 当前配置。</span>
+            </div>
+            <div className="confirm-actions">
+              <button className="secondary" onClick={() => setPendingDeleteAccount(null)} disabled={isBusy}>
+                取消
+              </button>
+              <button className="danger-button" onClick={() => void confirmDeleteAccount()} disabled={isBusy}>
+                {isBusy ? "删除中..." : "删除"}
+              </button>
+            </div>
           </aside>
         </div>
       )}
