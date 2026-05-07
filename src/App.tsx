@@ -802,7 +802,7 @@ function App() {
           </div>
           <div>
             <strong>Super AI</strong>
-            <span>Codex / Gemini</span>
+            <span>账号管理工具</span>
           </div>
         </div>
 
