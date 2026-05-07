@@ -13,6 +13,8 @@ use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{LogicalSize, Manager};
+#[cfg(desktop)]
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tiny_http::{Header, Response, Server, StatusCode};
 use url::Url;
 
@@ -152,6 +154,16 @@ struct AppSettings {
 
 fn default_theme() -> String {
     "system".to_string()
+}
+
+fn default_app_settings() -> AppSettings {
+    AppSettings {
+        theme: default_theme(),
+        auto_launch: false,
+        mask_sensitive: false,
+        show_startup_check: true,
+        auto_detect: true,
+    }
 }
 
 fn default_true() -> bool {
@@ -2675,6 +2687,56 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
     serde_json::to_string_pretty(&value).map_err(|error| format!("序列化导出内容失败: {error}"))
 }
 
+fn system_auto_launch_enabled(app: &tauri::AppHandle) -> Result<Option<bool>, String> {
+    #[cfg(desktop)]
+    {
+        return app
+            .autolaunch()
+            .is_enabled()
+            .map(Some)
+            .map_err(|error| format!("读取系统开机自启状态失败: {error}"));
+    }
+
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        Ok(None)
+    }
+}
+
+fn apply_system_auto_launch(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        let manager = app.autolaunch();
+        let result = if enabled {
+            manager.enable()
+        } else {
+            manager.disable()
+        };
+        result.map_err(|error| {
+            if enabled {
+                format!("启用系统开机自启失败: {error}")
+            } else {
+                format!("关闭系统开机自启失败: {error}")
+            }
+        })?;
+        let actual = manager
+            .is_enabled()
+            .map_err(|error| format!("校验系统开机自启状态失败: {error}"))?;
+        if actual != enabled {
+            return Err("系统开机自启状态未按预期写入".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        let _ = enabled;
+        Ok(())
+    }
+}
+
 #[tauri::command]
 fn load_settings(app: tauri::AppHandle) -> Result<Option<AppSettings>, String> {
     let conn = open_app_db(&app)?;
@@ -2684,16 +2746,29 @@ fn load_settings(app: tauri::AppHandle) -> Result<Option<AppSettings>, String> {
         |row| row.get::<_, String>(0),
     );
     match result {
-        Ok(value_json) => serde_json::from_str::<AppSettings>(&value_json)
-            .map(Some)
-            .map_err(|error| format!("解析设置失败: {error}")),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Ok(value_json) => {
+            let mut settings = serde_json::from_str::<AppSettings>(&value_json)
+                .map_err(|error| format!("解析设置失败: {error}"))?;
+            if let Some(enabled) = system_auto_launch_enabled(&app)? {
+                settings.auto_launch = enabled;
+            }
+            Ok(Some(settings))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            if let Some(enabled) = system_auto_launch_enabled(&app)? {
+                let mut settings = default_app_settings();
+                settings.auto_launch = enabled;
+                return Ok(Some(settings));
+            }
+            Ok(None)
+        }
         Err(error) => Err(format!("读取设置失败: {error}")),
     }
 }
 
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
+    apply_system_auto_launch(&app, settings.auto_launch)?;
     let conn = open_app_db(&app)?;
     let value_json =
         serde_json::to_string(&settings).map_err(|error| format!("序列化设置失败: {error}"))?;
@@ -2969,6 +3044,10 @@ async fn complete_gemini_oauth(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(Vec::<&str>::new()),
+        ))
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             start_window_drag,
@@ -2991,9 +3070,10 @@ pub fn run() {
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                let min_size = LogicalSize::new(1180.0, 760.0);
                 let app_size = LogicalSize::new(1240.0, 820.0);
-                window.set_min_size(Some(min_size))?;
+                window.set_resizable(false)?;
+                window.set_min_size(Some(app_size))?;
+                window.set_max_size(Some(app_size))?;
                 window.set_size(app_size)?;
             }
 

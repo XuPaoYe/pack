@@ -158,6 +158,24 @@ button:disabled {
   box-shadow: 0 2px 4px rgba(15, 23, 42, 0.05);
 }
 
+.provider-nav-icon {
+  width: 20px;
+  height: 20px;
+  justify-self: center;
+  color: var(--text-soft);
+}
+
+.nav-list button.active .provider-nav-icon,
+.nav-list button:hover .provider-nav-icon {
+  color: currentColor;
+}
+
+.provider-nav-icon.gemini {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+}
+
 .nav-list b {
   min-width: 24px;
   height: 22px;
@@ -603,6 +621,9 @@ h2 {
 }
 
 .account-list.card-mode:has(.empty-state) {
+  height: 100%;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(320px, 1fr);
   align-content: stretch;
 }
 
@@ -700,7 +721,8 @@ h2 {
 
 .empty-state {
   grid-column: 1 / -1;
-  min-height: 100%;
+  min-height: 320px;
+  height: 100%;
   display: grid;
   place-items: center;
   align-content: center;
@@ -951,8 +973,9 @@ h2 {
 }
 
 .account-title strong {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: calc(100% - 62px);
   color: var(--text-strong);
   font-size: 14px;
   font-weight: 700;
@@ -1055,6 +1078,12 @@ h2 {
   color: #7e22ce;
 }
 
+.pill.plan.ultra {
+  background: rgba(236, 72, 153, 0.1);
+  border-color: rgba(236, 72, 153, 0.2);
+  color: #be185d;
+}
+
 .pill.plan.free {
   background: rgba(148, 163, 184, 0.1);
   border-color: rgba(148, 163, 184, 0.18);
@@ -1066,6 +1095,7 @@ h2 {
   .pill.plan.team { color: #60a5fa; }
   .pill.plan.enterprise { color: #818cf8; }
   .pill.plan.pro { color: #c084fc; }
+  .pill.plan.ultra { color: #f472b6; }
   .pill.plan.free { color: #94a3b8; }
 }
 
@@ -1517,7 +1547,8 @@ h2 {
 
 .import-panel.modal-content,
 .settings-panel.modal-content,
-.logs-panel.modal-content {
+.logs-panel.modal-content,
+.export-panel.modal-content {
   width: 100%;
   max-width: 540px;
   border: 1px solid var(--modal-line);
@@ -1533,7 +1564,8 @@ h2 {
 }
 
 .settings-panel,
-.logs-panel {
+.logs-panel,
+.export-panel {
   display: grid;
   align-content: start;
   background: var(--modal-panel);
@@ -1839,6 +1871,32 @@ h2 {
 
 .log-note {
   margin: 0 2px;
+}
+
+.export-body {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+.export-json {
+  height: min(420px, calc(100vh - 220px));
+  min-height: 260px;
+  cursor: text;
+}
+
+.export-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.export-actions button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 86px;
 }
 
 .privacy-mask .account-title strong,

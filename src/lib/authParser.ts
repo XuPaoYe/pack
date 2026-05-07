@@ -1,3 +1,5 @@
+import { normalizeUnixSeconds, nowUnixSeconds } from "./time";
+
 export type Provider = "codex" | "gemini";
 
 export type ImportSource = "paste" | "file" | "local" | "oauth";
@@ -85,13 +87,7 @@ function numberField(value: unknown): number | undefined {
 }
 
 function timestampField(value: unknown): number | undefined {
-  const numeric = numberField(value);
-  if (numeric !== undefined) return numeric;
-  if (typeof value === "string") {
-    const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) return Math.floor(parsed / 1000);
-  }
-  return undefined;
+  return typeof value === "number" || typeof value === "string" ? normalizeUnixSeconds(value) : undefined;
 }
 
 function boolField(value: unknown): boolean | undefined {
@@ -239,7 +235,7 @@ function parseGeminiQuota(value: JsonObject): AccountQuota | undefined {
 }
 
 function deriveStatus(value: JsonObject, tokenMeta: ManagedAccount["tokenMeta"], quota?: AccountQuota): AccountStatus {
-  const now = Math.floor(Date.now() / 1000);
+  const now = nowUnixSeconds();
   const rawStatus = stringField(value.status)?.toLowerCase();
   const statusReason =
     stringField(value.status_reason) ??
@@ -259,7 +255,8 @@ function deriveStatus(value: JsonObject, tokenMeta: ManagedAccount["tokenMeta"],
     return { state: "unavailable", label: "不可用", reason: "缺少 access token" };
   }
 
-  if (tokenMeta.expiresAt && tokenMeta.expiresAt <= now) {
+  const expiresAt = normalizeUnixSeconds(tokenMeta.expiresAt);
+  if (expiresAt && expiresAt <= now) {
     return { state: "unavailable", label: "不可用", reason: "本地 token 已过期" };
   }
 
@@ -356,7 +353,7 @@ function parseCodex(value: unknown, source: ImportSource): ManagedAccount | null
   const accountName = stringField(value.account_name) ?? stringField(value.accountName) ?? stringField(value.name);
   const organizationId = stringField(value.organization_id) ?? stringField(value.organizationId);
   const discriminator = accountId ?? userId ?? accessToken ?? apiKey ?? email;
-  const now = Math.floor(Date.now() / 1000);
+  const now = nowUnixSeconds();
   const tokenMeta = {
     hasAccessToken: Boolean(accessToken || apiKey),
     hasRefreshToken: Boolean(refreshToken),
@@ -425,7 +422,7 @@ function parseGemini(value: unknown, source: ImportSource): ManagedAccount | nul
     numberField(token?.expires_at) ??
     numberField(token?.expiresAt) ??
     numberField(jwt?.exp);
-  const now = Math.floor(Date.now() / 1000);
+  const now = nowUnixSeconds();
   const tokenMeta = {
     hasAccessToken: Boolean(accessToken),
     hasRefreshToken: Boolean(refreshToken),

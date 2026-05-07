@@ -5,19 +5,17 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import clsx from "clsx";
 import {
   BadgeCheck,
-  Bot,
   CalendarDays,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
-  CirclePlay,
   Clipboard,
+  Copy,
   Cloud,
+  Download,
   EyeOff,
   ExternalLink,
-  FileDown,
   FileJson,
-  Fingerprint,
   FolderDown,
   Laptop,
   LockKeyhole,
@@ -25,20 +23,25 @@ import {
   Moon,
   Plus,
   Info,
-  RefreshCcw,
+  RefreshCw,
   RotateCw,
   Rocket,
   ScrollText,
   Search,
+  SearchX,
   Settings,
   Sun,
-  Trash,
+  Trash2,
   Upload,
   X,
 } from "lucide-react";
 import "./App.css";
 import logoUrl from "./assets/logo.svg";
+import { CodexIcon } from "./components/icons/CodexIcon";
+import { GeminiIcon } from "./components/icons/GeminiIcon";
+import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/accountPresentation";
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
+import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
 type ImportMode = "paste" | "file" | "local" | "oauth";
 type OAuthProvider = "codex" | "gemini";
@@ -72,6 +75,7 @@ type SwitchAccountResult = ManagedAccount[];
 type NoticeTone = "success" | "error" | "info";
 type Notice = { tone: NoticeTone; text: string };
 type AppLogEntry = { id: string; tone: NoticeTone; text: string; createdAt: number };
+type ExportPreview = { account: ManagedAccount; payload: string };
 
 const NOTICE_TIMEOUT_MS = 7000;
 const APP_LOG_STORAGE_KEY = "super-ai:app-logs";
@@ -166,42 +170,6 @@ function createLogId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function formatRelative(timestamp: number) {
-  const diff = Math.max(0, Math.floor(Date.now() / 1000) - timestamp);
-  if (diff < 60) return "刚刚";
-  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
-  return `${Math.floor(diff / 86400)} 天前`;
-}
-
-function formatDateTime(timestamp?: number | string) {
-  if (timestamp === undefined) return undefined;
-  const date = typeof timestamp === "number" ? new Date(timestamp * 1000) : new Date(timestamp);
-  if (Number.isNaN(date.getTime())) return undefined;
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-}
-
-function formatResetTime(resetAt?: number | string) {
-  if (resetAt === undefined) return undefined;
-  if (typeof resetAt === "string") return resetAt;
-  const dateTime = formatDateTime(resetAt);
-  if (!dateTime) return undefined;
-  const exact = dateTime.slice(5).replace("-", "/");
-  const diff = resetAt - Math.floor(Date.now() / 1000);
-  if (diff <= 0) return exact;
-  const minutes = Math.floor(diff / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  const relative =
-    days > 0
-      ? `${days}d ${hours % 24}h`
-      : hours > 0
-        ? `${hours}h ${minutes % 60}m`
-        : `${Math.max(1, minutes)}m`;
-  return `${relative} (${exact})`;
-}
-
 function stateLabel(state: AccountState) {
   if (state === "available") return "可用";
   return "不可用";
@@ -221,72 +189,6 @@ function sortAccountsForView(items: ManagedAccount[]) {
   });
 }
 
-function normalizePlanKey(value?: string) {
-  return (value || "").trim().toLowerCase();
-}
-
-function resolveCodexPlanBadge(account: ManagedAccount) {
-  const raw = normalizePlanKey(account.planType || account.plan);
-  const authFile = normalizePlanKey(account.authFilePlanType);
-  if (!raw) {
-    return { label: account.plan || "未知", tone: "unknown" };
-  }
-  if (raw.includes("enterprise")) return { label: "Enterprise", tone: "enterprise" };
-  if (raw.includes("team") || raw.includes("business") || raw.includes("edu")) return { label: "Team", tone: "team" };
-  if (raw.includes("plus")) return { label: "Plus", tone: "plus" };
-  if (raw.includes("pro")) {
-    if (authFile.includes("5x") || authFile.includes("prolite") || authFile.includes("pro-lite") || authFile.includes("pro-5x")) {
-      return { label: "Pro 5x", tone: "pro" };
-    }
-    if (authFile.includes("20x") || authFile.includes("promax") || authFile.includes("pro-max") || authFile.includes("pro-20x")) {
-      return { label: "Pro 20x", tone: "pro" };
-    }
-    return { label: "Pro 20x", tone: "pro" };
-  }
-  if (raw.includes("free")) return { label: "Free", tone: "free" };
-  return { label: account.plan || raw, tone: "unknown" };
-}
-
-function resolveValidityUntil(account: ManagedAccount) {
-  if (typeof account.subscriptionActiveUntil === "number") return account.subscriptionActiveUntil;
-  if (typeof account.subscriptionActiveUntil === "string") {
-    const numeric = Number(account.subscriptionActiveUntil);
-    if (Number.isFinite(numeric)) return numeric > 1e12 ? Math.floor(numeric / 1000) : numeric;
-    const parsed = Date.parse(account.subscriptionActiveUntil);
-    if (!Number.isNaN(parsed)) return Math.floor(parsed / 1000);
-  }
-  return undefined;
-}
-
-function formatValidityText(account: ManagedAccount) {
-  if ((account.status ?? fallbackStatus(account)).state === "unavailable") {
-    return { label: "有效期", detail: "--", title: account.status?.reason };
-  }
-  const until = resolveValidityUntil(account);
-  if (until === undefined || until <= 0) return { label: "有效期", detail: "--" };
-  const now = Math.floor(Date.now() / 1000);
-  const remaining = until - now;
-  if (remaining <= 0) {
-    return { label: "有效期", detail: "已过期", expired: true, title: formatDateTime(until) };
-  }
-  const days = Math.ceil(remaining / 86400);
-  const hours = Math.ceil(remaining / 3600);
-  return {
-    label: "有效期",
-    detail: days >= 1 ? `${days}天` : `${hours}小时`,
-    title: formatDateTime(until),
-  };
-}
-
-function fallbackStatus(account: ManagedAccount) {
-  const now = Math.floor(Date.now() / 1000);
-  if (!account.tokenMeta.hasAccessToken) return { state: "unavailable" as const, label: "不可用", reason: "缺少 access token" };
-  if (account.tokenMeta.expiresAt && account.tokenMeta.expiresAt <= now && !account.tokenMeta.hasRefreshToken) {
-    return { state: "unavailable" as const, label: "不可用", reason: "本地 token 已过期" };
-  }
-  return { state: "available" as const, label: "可用" };
-}
-
 function AccountStateCorner({ account }: { account: ManagedAccount }) {
   const status = account.status ?? fallbackStatus(account);
   const isCurrent = isCurrentAccount(account);
@@ -298,7 +200,7 @@ function AccountStateCorner({ account }: { account: ManagedAccount }) {
 }
 
 function AccountPlanBadge({ account }: { account: ManagedAccount }) {
-  const badge = resolveCodexPlanBadge(account);
+  const badge = resolvePlanBadge(account);
   return <span className={clsx("pill", "plan", badge.tone)}>{badge.label}</span>;
 }
 
@@ -420,6 +322,7 @@ function App() {
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
+  const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [isFileImporting, setIsFileImporting] = useState(false);
@@ -806,6 +709,7 @@ function App() {
   };
   const handleToggleAccount = async (account: ManagedAccount) => {
     if (isCurrentAccount(account)) return;
+    if ((account.status ?? fallbackStatus(account)).state === "unavailable") return;
     setIsBusy(true);
     try {
       const providerAccounts = await invoke<SwitchAccountResult>("switch_account", { accountId: account.id });
@@ -863,14 +767,25 @@ function App() {
       showNotice("error", `导出账号失败：${String(error)}`);
       return;
     }
-    const blob = new Blob([payload], { type: "application/json;charset=utf-8" });
+    setExportPreview({ account, payload });
+  };
+  const downloadExportPreview = (preview: ExportPreview) => {
+    const blob = new Blob([preview.payload], { type: "application/json;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${account.provider}-${account.email.replace(/[^a-z0-9._-]+/gi, "_")}.json`;
+    a.download = `${preview.account.provider}-${preview.account.email.replace(/[^a-z0-9._-]+/gi, "_")}.json`;
     a.click();
     URL.revokeObjectURL(url);
-    showNotice("success", `已导出 ${account.email}`);
+    showNotice("success", `已下载 ${preview.account.email}`);
+  };
+  const copyExportPreview = async (preview: ExportPreview) => {
+    try {
+      await navigator.clipboard.writeText(preview.payload);
+      showNotice("success", "账号 JSON 已复制");
+    } catch (error) {
+      showNotice("error", `复制失败：${String(error)}`);
+    }
   };
   const handleDeleteAccount = (account: ManagedAccount) => {
     setPendingDeleteAccount(account);
@@ -923,8 +838,10 @@ function App() {
 
   useEffect(() => {
     if (!isSettingsLoaded) return;
-    void invoke("save_settings", { settings }).catch(() => undefined);
-  }, [isSettingsLoaded, settings]);
+    void invoke("save_settings", { settings }).catch((error) => {
+      showNotice("error", `保存设置失败：${String(error)}`);
+    });
+  }, [isSettingsLoaded, settings, showNotice]);
 
   useEffect(() => {
     persistAppLogs(appLogs);
@@ -941,7 +858,7 @@ function App() {
 
   return (
     <main
-      className={clsx("shell", settings.maskSensitive && "privacy-mask", (isImportModalOpen || isSettingsOpen || isLogsOpen || pendingDeleteAccount) && "modal-active")}
+      className={clsx("shell", settings.maskSensitive && "privacy-mask", (isImportModalOpen || isSettingsOpen || isLogsOpen || exportPreview || pendingDeleteAccount) && "modal-active")}
       onMouseDownCapture={handleShellTopDrag}
     >
       <div className="global-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
@@ -959,13 +876,13 @@ function App() {
         </div>
 
         <nav className="nav-list" aria-label="Providers">
-            <button className={clsx(activeProvider === "codex" && "active")} onClick={() => handleProviderChange("codex")}>
-            <Bot size={20} />
+          <button className={clsx(activeProvider === "codex" && "active")} onClick={() => handleProviderChange("codex")}>
+            <CodexIcon className="provider-nav-icon codex" />
             <span>Codex</span>
             <b>{counts.codex}</b>
           </button>
           <button className={clsx(activeProvider === "gemini" && "active")} onClick={() => handleProviderChange("gemini")}>
-            <Fingerprint size={20} />
+            <GeminiIcon className="provider-nav-icon gemini" />
             <span>Gemini Cli</span>
             <b>{counts.gemini}</b>
           </button>
@@ -1018,7 +935,7 @@ function App() {
                 <div className="account-list card-mode">
                   {filteredAccounts.length === 0 && (
                     <div className="empty-state">
-                      <FileJson size={54} strokeWidth={1.35} />
+                      <SearchX size={48} strokeWidth={1.55} />
                       <strong>暂无账号</strong>
                     </div>
                   )}
@@ -1059,17 +976,18 @@ function App() {
                           aria-label={isCurrentAccount(account) ? "停用当前账号" : "设为当前账号"}
                           title={isCurrentAccount(account) ? "停用" : "设为当前"}
                           onClick={() => handleToggleAccount(account)}
+                          disabled={(account.status ?? fallbackStatus(account)).state === "unavailable"}
                         >
-                          <CirclePlay size={15} strokeWidth={1.75} />
+                          <BadgeCheck size={15} strokeWidth={1.75} />
                         </button>
                         <button className="icon-button" aria-label="刷新账号" title="刷新" onClick={() => handleRefreshAccount(account)} disabled={refreshingAccountIds.has(account.id)}>
-                          <RefreshCcw size={15} strokeWidth={1.75} className={clsx(refreshingAccountIds.has(account.id) && "spin")} />
+                          <RefreshCw size={15} strokeWidth={1.75} className={clsx(refreshingAccountIds.has(account.id) && "spin")} />
                         </button>
                         <button className="icon-button" aria-label="导出账号" title="导出" onClick={() => void handleExportAccount(account)}>
-                          <FileDown size={15} strokeWidth={1.75} />
+                          <Download size={15} strokeWidth={1.75} />
                         </button>
                         <button className="icon-button danger" aria-label="删除账号" title="删除" onClick={() => handleDeleteAccount(account)}>
-                          <Trash size={15} strokeWidth={1.75} />
+                          <Trash2 size={15} strokeWidth={1.75} />
                         </button>
                         </div>
                       </div>
@@ -1320,11 +1238,35 @@ function App() {
         </AppModal>
       )}
 
+      {exportPreview && (
+        <AppModal
+          title="导出账号"
+          description={exportPreview.account.email}
+          closeLabel="关闭导出账号"
+          className="export-panel"
+          onClose={() => setExportPreview(null)}
+        >
+          <div className="export-body">
+            <textarea className="export-json" value={exportPreview.payload} readOnly spellCheck={false} />
+            <div className="export-actions">
+              <button className="secondary" onClick={() => void copyExportPreview(exportPreview)}>
+                <Copy size={16} />
+                复制
+              </button>
+              <button className="primary" onClick={() => downloadExportPreview(exportPreview)}>
+                <Download size={16} />
+                下载
+              </button>
+            </div>
+          </div>
+        </AppModal>
+      )}
+
       {pendingDeleteAccount && (
         <div className="modal-overlay" onMouseDown={(event) => handleModalBackdropMouseDown(event, () => setPendingDeleteAccount(null))}>
           <aside className="confirm-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
             <div className="confirm-icon danger">
-              <Trash size={22} />
+              <Trash2 size={22} />
             </div>
             <div className="confirm-copy">
               <h2>删除账号</h2>
