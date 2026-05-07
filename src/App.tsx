@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -108,7 +108,7 @@ const modeConfig: Record<
   },
 };
 
-const importModeOrder: ImportMode[] = ["paste", "local", "file", "oauth"];
+const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
 
 function providerLabel(provider: Provider) {
   return provider === "codex" ? "Codex" : "Gemini Cli";
@@ -324,6 +324,39 @@ function NoticeToast({ notice, onClose }: { notice: Notice; onClose: () => void 
         {notice.text}
       </span>
       <button onClick={onClose} aria-label="关闭提示">×</button>
+    </div>
+  );
+}
+
+function AppModal({
+  title,
+  description,
+  closeLabel,
+  className,
+  onClose,
+  children,
+}: {
+  title: string;
+  description: string;
+  closeLabel: string;
+  className?: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="modal-overlay">
+      <aside className={clsx("app-modal", className, "modal-content")} onMouseDown={(event) => event.stopPropagation()}>
+        <div className="panel-head">
+          <div>
+            <h2>{title}</h2>
+            <p>{description}</p>
+          </div>
+          <button className="modal-close-button" onClick={onClose} aria-label={closeLabel}>
+            <X size={22} strokeWidth={2.2} />
+          </button>
+        </div>
+        {children}
+      </aside>
     </div>
   );
 }
@@ -936,18 +969,13 @@ function App() {
       )}
 
       {isImportModalOpen && (
-        <div className="modal-overlay">
-          <aside className="import-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="panel-head">
-              <div>
-                <h2>添加账号</h2>
-                <p>选择添加方式</p>
-              </div>
-              <button className="modal-close-button" onClick={() => setIsImportModalOpen(false)} aria-label="关闭添加账号">
-                <X size={22} strokeWidth={2.2} />
-              </button>
-            </div>
-
+        <AppModal
+          title="添加账号"
+          description="选择添加方式"
+          closeLabel="关闭添加账号"
+          className="import-panel"
+          onClose={() => setIsImportModalOpen(false)}
+        >
             <div className="mode-grid">
               {importModeOrder.map((key) => {
                 const item = modeConfig[key];
@@ -1048,20 +1076,17 @@ function App() {
                 ))}
               </div>
             )}
-          </aside>
-        </div>
+        </AppModal>
       )}
 
       {isSettingsOpen && (
-        <div className="modal-overlay" onMouseDown={(event) => handleModalBackdropMouseDown(event, () => setIsSettingsOpen(false))}>
-          <aside className="settings-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="panel-head">
-              <div>
-                <h2>设置</h2>
-                <p>外观、启动和本地隐私</p>
-              </div>
-            </div>
-
+        <AppModal
+          title="设置"
+          description="外观、启动和本地隐私"
+          closeLabel="关闭设置"
+          className="settings-panel"
+          onClose={() => setIsSettingsOpen(false)}
+        >
             <div className="settings-body">
               <section className="setting-block">
                 <div className="setting-copy">
@@ -1126,8 +1151,7 @@ function App() {
 
               <p className="setting-note">开机自启会在接入 Tauri 后端后写入系统登录项；当前面板已保留配置入口。</p>
             </div>
-          </aside>
-        </div>
+        </AppModal>
       )}
 
       {pendingDeleteAccount && (
