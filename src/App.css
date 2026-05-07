@@ -244,41 +244,26 @@ button:disabled {
   gap: 16px;
 }
 
-.workspace,
-.import-panel.modal-content,
-.settings-panel.modal-content,
-.account-list.card-mode {
+:where(.workspace, .modal-content, textarea) {
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text-soft) 18%, transparent) transparent;
 }
 
-.workspace::-webkit-scrollbar,
-.import-panel.modal-content::-webkit-scrollbar,
-.settings-panel.modal-content::-webkit-scrollbar,
-.account-list.card-mode::-webkit-scrollbar {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar {
   width: 11px;
   height: 11px;
 }
 
-.workspace::-webkit-scrollbar-track,
-.import-panel.modal-content::-webkit-scrollbar-track,
-.settings-panel.modal-content::-webkit-scrollbar-track,
-.account-list.card-mode::-webkit-scrollbar-track {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.workspace::-webkit-scrollbar-track-piece,
-.import-panel.modal-content::-webkit-scrollbar-track-piece,
-.settings-panel.modal-content::-webkit-scrollbar-track-piece,
-.account-list.card-mode::-webkit-scrollbar-track-piece {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-track-piece {
   margin: 8px 0;
   background: transparent;
 }
 
-.workspace::-webkit-scrollbar-thumb,
-.import-panel.modal-content::-webkit-scrollbar-thumb,
-.settings-panel.modal-content::-webkit-scrollbar-thumb,
-.account-list.card-mode::-webkit-scrollbar-thumb {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-thumb {
   min-height: 46px;
   border: 4px solid transparent;
   border-radius: 999px;
@@ -289,26 +274,17 @@ button:disabled {
     border-color 0.18s ease;
 }
 
-.workspace::-webkit-scrollbar-thumb:hover,
-.import-panel.modal-content::-webkit-scrollbar-thumb:hover,
-.settings-panel.modal-content::-webkit-scrollbar-thumb:hover,
-.account-list.card-mode::-webkit-scrollbar-thumb:hover {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-thumb:hover {
   border-width: 3px;
   background: color-mix(in srgb, var(--text-soft) 30%, transparent);
 }
 
-.workspace::-webkit-scrollbar-thumb:active,
-.import-panel.modal-content::-webkit-scrollbar-thumb:active,
-.settings-panel.modal-content::-webkit-scrollbar-thumb:active,
-.account-list.card-mode::-webkit-scrollbar-thumb:active {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-thumb:active {
   border-width: 3px;
   background: color-mix(in srgb, var(--text-soft) 44%, transparent);
 }
 
-.workspace::-webkit-scrollbar-corner,
-.import-panel.modal-content::-webkit-scrollbar-corner,
-.settings-panel.modal-content::-webkit-scrollbar-corner,
-.account-list.card-mode::-webkit-scrollbar-corner {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-corner {
   background: transparent;
 }
 
@@ -1799,6 +1775,7 @@ textarea {
   height: 200px;
   min-height: 200px;
   box-sizing: border-box;
+  scrollbar-gutter: stable;
   resize: none;
   border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line));
   border-radius: 12px;

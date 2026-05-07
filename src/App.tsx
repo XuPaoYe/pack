@@ -164,6 +164,8 @@ function sortAccountsForView(items: ManagedAccount[]) {
   return [...items].sort((a, b) => {
     const providerDelta = providerRank[a.provider] - providerRank[b.provider];
     if (providerDelta !== 0) return providerDelta;
+    const currentDelta = Number(isCurrentAccount(b)) - Number(isCurrentAccount(a));
+    if (currentDelta !== 0) return currentDelta;
     const emailDelta = a.email.localeCompare(b.email, undefined, { sensitivity: "base" });
     if (emailDelta !== 0) return emailDelta;
     const aName = a.accountName || a.displayName || a.accountId || a.id;
@@ -242,9 +244,10 @@ function fallbackStatus(account: ManagedAccount) {
 
 function AccountStateCorner({ account }: { account: ManagedAccount }) {
   const status = account.status ?? fallbackStatus(account);
+  const isCurrent = isCurrentAccount(account);
   return (
-    <span className={clsx("state-corner", status.state, isCurrentAccount(account) && "current")} title={status.reason ?? stateLabel(status.state)}>
-      {stateLabel(status.state)}
+    <span className={clsx("state-corner", status.state, isCurrent && "current")} title={isCurrent ? "当前启用账号" : (status.reason ?? stateLabel(status.state))}>
+      {isCurrent ? "启用" : stateLabel(status.state)}
     </span>
   );
 }
@@ -301,7 +304,7 @@ function ValidityMeter({ account }: { account: ManagedAccount }) {
     </div>
   ) : (
     <div className="validity-line">
-      <span>{validity.label} 未知</span>
+      <span>{validity.label} --</span>
     </div>
   );
 }
@@ -478,6 +481,34 @@ function App() {
     }, delay);
   };
 
+  const refreshImportedAccountStatus = (importedAccounts: ManagedAccount[]) => {
+    const accountIds = Array.from(new Set(importedAccounts.map((account) => account.id)));
+    if (accountIds.length === 0) return;
+
+    void (async () => {
+      setRefreshingAccountIds((current) => {
+        const next = new Set(current);
+        accountIds.forEach((accountId) => next.add(accountId));
+        return next;
+      });
+      for (const accountId of accountIds) {
+        try {
+          const refreshed = await invoke<ManagedAccount>("refresh_account", { accountId });
+          setAccounts((current) => sortAccountsForView(current.map((item) => (item.id === refreshed.id ? refreshed : item))));
+        } catch {
+          reloadAccountsSoon(1200);
+        } finally {
+          setRefreshingAccountIds((current) => {
+            const next = new Set(current);
+            next.delete(accountId);
+            return next;
+          });
+        }
+      }
+      reloadAccountsSoon(500);
+    })();
+  };
+
   const clearOAuthPoll = (provider: OAuthProvider) => {
     const timer = oauthPollTimers.current[provider];
     if (timer) window.clearTimeout(timer);
@@ -490,13 +521,14 @@ function App() {
   ) => {
     if (result.imported.length > 0) {
       setAccounts((current) => mergeAccounts(current, result.imported));
-      void invoke("upsert_accounts", { accounts: result.imported }).catch(() => undefined);
+      void invoke("upsert_accounts", { accounts: result.imported })
+        .catch(() => undefined)
+        .finally(() => refreshImportedAccountStatus(result.imported));
       if (options.closeModal ?? true) {
         setIsImportModalOpen(false);
         setPasteValue("");
       }
       showNotice("success", options.successText ?? `已添加 ${result.imported.length} 个账号`);
-      reloadAccountsSoon();
     } else if (result.failed.length > 0) {
       showNotice("error", result.failed[0]?.reason ?? "未添加账号");
     } else {

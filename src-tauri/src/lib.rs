@@ -264,6 +264,22 @@ fn read_accounts_from_conn(conn: &Connection) -> Result<Vec<ManagedAccount>, Str
     Ok(accounts)
 }
 
+fn is_current_status(status: &Option<AccountStatus>) -> bool {
+    status
+        .as_ref()
+        .map(|status| status.state == "available" && status.label == "当前")
+        .unwrap_or(false)
+}
+
+fn mark_account_current(account: &mut ManagedAccount) {
+    account.status = Some(AccountStatus {
+        state: "available".to_string(),
+        label: "当前".to_string(),
+        reason: None,
+        updated_at: Some(now_ts()),
+    });
+}
+
 fn persist_local_import_as_current(
     app: &tauri::AppHandle,
     result: &mut ImportResult,
@@ -295,8 +311,16 @@ fn load_account_from_db(conn: &Connection, account_id: &str) -> Result<ManagedAc
 }
 
 fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), String> {
+    let mut account_to_write = account.clone();
+    if !is_current_status(&account_to_write.status) {
+        if let Ok(existing) = load_account_from_db(conn, &account.id) {
+            if existing.provider == account.provider && is_current_status(&existing.status) {
+                mark_account_current(&mut account_to_write);
+            }
+        }
+    }
     let account_json =
-        serde_json::to_string(account).map_err(|error| format!("序列化账号失败: {error}"))?;
+        serde_json::to_string(&account_to_write).map_err(|error| format!("序列化账号失败: {error}"))?;
     conn.execute(
         r#"
       INSERT INTO accounts (
@@ -310,13 +334,13 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
         updated_at = excluded.updated_at
       "#,
         params![
-            account.id,
-            account.provider,
-            account.email,
-            account.display_name,
+            account_to_write.id,
+            account_to_write.provider,
+            account_to_write.email,
+            account_to_write.display_name,
             account_json,
-            account.created_at,
-            account.updated_at
+            account_to_write.created_at,
+            account_to_write.updated_at
         ],
     )
     .map_err(|error| format!("写入账号 SQLite 失败: {error}"))?;
@@ -1601,6 +1625,7 @@ async fn refresh_account(app: tauri::AppHandle, accountId: String) -> Result<Man
         let conn = open_app_db(&app)?;
         load_account_from_db(&conn, &accountId)?
     };
+    let was_current = is_current_status(&account.status);
 
     match account.provider.as_str() {
         "codex" => {
@@ -1612,6 +1637,9 @@ async fn refresh_account(app: tauri::AppHandle, accountId: String) -> Result<Man
             account.updated_at = now_ts();
         }
         other => return Err(format!("不支持的账号类型: {other}")),
+    }
+    if was_current {
+        mark_account_current(&mut account);
     }
 
     let conn = open_app_db(&app)?;
@@ -1633,12 +1661,16 @@ async fn refresh_provider_accounts(
     };
 
     for account in &mut accounts {
+        let was_current = is_current_status(&account.status);
         if account.provider == "codex" {
             if let Err(error) = refresh_codex_account_remote(account).await {
                 mark_account_unavailable(account, error);
             }
         } else {
             account.updated_at = now_ts();
+        }
+        if was_current {
+            mark_account_current(account);
         }
     }
 
