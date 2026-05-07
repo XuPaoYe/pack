@@ -7,6 +7,7 @@ import {
   BadgeCheck,
   Bot,
   CalendarDays,
+  CircleAlert,
   CirclePlay,
   Clipboard,
   Cloud,
@@ -21,9 +22,11 @@ import {
   Monitor,
   Moon,
   Plus,
+  Info,
   RefreshCcw,
   RotateCw,
   Rocket,
+  ScrollText,
   Search,
   Settings,
   Sun,
@@ -64,7 +67,16 @@ type OAuthStartResult = {
 };
 
 type SwitchAccountResult = ManagedAccount[];
-type Notice = { tone: "success" | "error" | "info"; text: string };
+type NoticeTone = "success" | "error" | "info";
+type Notice = { tone: NoticeTone; text: string };
+
+const NOTICE_TIMEOUT_MS = 7000;
+
+const noticeToneConfig: Record<NoticeTone, { icon: typeof Info; label: string }> = {
+  success: { icon: BadgeCheck, label: "成功" },
+  error: { icon: CircleAlert, label: "错误" },
+  info: { icon: Info, label: "提示" },
+};
 
 const modeConfig: Record<
   ImportMode,
@@ -259,9 +271,10 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
         const state = isUnavailable ? "unavailable" : (metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available"));
         const resetText = isUnavailable ? "--" : (formatResetTime(metric.resetAt) ?? "--");
         return (
-          <div className="quota-meter" key={metric.key} title={metric.detail ?? account.quota?.error ?? metric.label}>
+          <div className={clsx("quota-meter", state)} key={metric.key} title={metric.detail ?? account.quota?.error ?? metric.label}>
             <div className="quota-meter-head">
               <span>{metric.label}</span>
+              <time className="quota-meter-reset">{resetText}</time>
               <div className="quota-meter-value">
                 <strong>{remaining === undefined ? "N/A" : `${remaining}%`}</strong>
               </div>
@@ -269,7 +282,6 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
             <div className={clsx("quota-track", state)}>
               <i style={{ width: `${remaining ?? 0}%` }} />
             </div>
-            <time className="quota-meter-reset">{resetText}</time>
           </div>
         );
       })}
@@ -298,6 +310,22 @@ function mergeAccounts(current: ManagedAccount[], next: ManagedAccount[]) {
   const map = new Map(current.map((account) => [account.id, account]));
   for (const account of next) map.set(account.id, account);
   return sortAccountsForView([...map.values()]);
+}
+
+function NoticeToast({ notice, onClose }: { notice: Notice; onClose: () => void }) {
+  const config = noticeToneConfig[notice.tone];
+  const Icon = config.icon;
+
+  return (
+    <div className="toast" data-tone={notice.tone} role="status" aria-live="polite">
+      <Icon className="toast-icon" size={16} aria-hidden="true" />
+      <span className="toast-text">
+        <b>{config.label}</b>
+        {notice.text}
+      </span>
+      <button onClick={onClose} aria-label="关闭提示">×</button>
+    </div>
+  );
 }
 
 function App() {
@@ -394,14 +422,20 @@ function App() {
     };
   }, [filteredAccounts.length, activeProvider, query, updateAccountScrollbar]);
 
-  const showNotice = (tone: Notice["tone"], text: string) => {
+  const closeNotice = useCallback(() => {
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = null;
+    setNotice(null);
+  }, []);
+
+  const showNotice = useCallback((tone: NoticeTone, text: string) => {
     if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
     setNotice({ tone, text });
     noticeTimer.current = window.setTimeout(() => {
       setNotice(null);
       noticeTimer.current = null;
-    }, 3000);
-  };
+    }, NOTICE_TIMEOUT_MS);
+  }, []);
 
   const reloadAccountsSoon = (delay = 1800) => {
     window.setTimeout(() => {
@@ -617,6 +651,9 @@ function App() {
   const handleSettings = () => {
     setIsSettingsOpen(true);
   };
+  const handleLogs = () => {
+    showNotice("info", "日志功能待接入。");
+  };
   const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
     setSettings((current) => ({ ...current, [key]: value }));
   };
@@ -790,11 +827,15 @@ function App() {
             </div>
             <ExternalLink size={18} />
           </a>
+          <div className="sidebar-divider" />
+          <button onClick={handleLogs}>
+            <ScrollText size={18} />
+            日志
+          </button>
           <button onClick={handleSettings}>
             <Settings size={18} />
             设置
           </button>
-          <p>所有凭证只在本机处理。桌面版会把敏感读写放进 Rust 后端。</p>
         </div>
       </aside>
 
@@ -843,7 +884,7 @@ function App() {
                         </span>
                         {account.accountId && (
                           <span>
-                            <b>账号 ID</b>
+                            <b>账号</b>
                             {account.accountId}
                           </span>
                         )}
@@ -891,10 +932,7 @@ function App() {
       </section>
 
       {notice && (
-        <div className={clsx("toast", notice.tone)}>
-          <span>{notice.text}</span>
-          <button onClick={() => setNotice(null)} aria-label="关闭提示">×</button>
-        </div>
+        <NoticeToast notice={notice} onClose={closeNotice} />
       )}
 
       {isImportModalOpen && (

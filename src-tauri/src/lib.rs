@@ -1053,10 +1053,17 @@ fn mark_account_unavailable(account: &mut ManagedAccount, reason: String) {
 
 async fn refresh_imported_accounts(accounts: &mut [ManagedAccount]) {
     for account in accounts {
-        if account.provider == "codex" {
-            if let Err(error) = refresh_codex_account_remote(account).await {
-                mark_account_unavailable(account, error);
+        match account.provider.as_str() {
+            "codex" => {
+                if let Err(error) = refresh_codex_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
             }
+            "gemini" => {
+                account.status = Some(fallback_status_refreshed(account));
+                account.updated_at = now_ts();
+            }
+            _ => {}
         }
     }
 }
@@ -1791,6 +1798,7 @@ fn import_gemini_from_local(app: tauri::AppHandle) -> Result<ImportResult, Strin
 
     let mut result = parse_auth_json_content(&oauth_value.to_string(), "local", "Gemini 本机账号");
     persist_local_import_as_current(&app, &mut result)?;
+    refresh_imported_accounts_in_background(app, result.imported.clone());
     Ok(result)
 }
 
