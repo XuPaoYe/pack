@@ -1,17 +1,20 @@
-use base64::Engine;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rand::Rng;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{LogicalSize, Manager};
+use tiny_http::{Header, Response, Server, StatusCode};
+use url::Url;
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -19,9 +22,28 @@ use std::os::windows::process::CommandExt;
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const GEMINI_KEYCHAIN_SERVICE: &str = "gemini-cli-oauth";
 const GEMINI_KEYCHAIN_ACCOUNT: &str = "main-account";
-const CODEX_ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
+const CODEX_ACCOUNT_CHECK_URL: &str =
+    "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_API_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_OAUTH_AUTH_URL: &str = "https://auth.openai.com/oauth/authorize";
+const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_OAUTH_SCOPES: &str =
+    "openid profile email offline_access api.connectors.read api.connectors.invoke";
+const CODEX_OAUTH_CALLBACK_PORT: u16 = 1455;
+const OAUTH_TIMEOUT_SECONDS: i64 = 300;
+const GEMINI_OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GEMINI_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
+const GEMINI_OAUTH_CLIENT_ID: &str =
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const GEMINI_OAUTH_CLIENT_SECRET: &str = "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";
+const GEMINI_OAUTH_CALLBACK_PATH: &str = "/oauth2callback";
+const GEMINI_CODE_ASSIST_LOAD_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+const GEMINI_CODE_ASSIST_QUOTA_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -109,6 +131,8 @@ struct OAuthStartResult {
     provider: String,
     command: String,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +161,31 @@ fn default_true() -> bool {
 #[derive(Debug, Clone)]
 struct OAuthPending {
     provider: String,
+    redirect_uri: String,
+    state: String,
+    code_verifier: Option<String>,
+    port: u16,
+    expires_at: i64,
+    code: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthTokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    id_token: Option<String>,
+    token_type: Option<String>,
+    scope: Option<String>,
+    expires_in: Option<i64>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleUserInfoResponse {
+    id: Option<String>,
+    email: Option<String>,
+    name: Option<String>,
 }
 
 static OAUTH_PENDING: LazyLock<Mutex<HashMap<String, OAuthPending>>> =
@@ -147,6 +196,68 @@ fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn now_ts_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn random_urlsafe_token(byte_len: usize) -> String {
+    let mut rng = rand::thread_rng();
+    let bytes = (0..byte_len).map(|_| rng.gen::<u8>()).collect::<Vec<_>>();
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn code_challenge(code_verifier: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(code_verifier.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn open_oauth_url(url: &str) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("打开 OAuth 授权页失败: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("打开 OAuth 授权页失败: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("打开 OAuth 授权页失败: {e}"))?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err("当前系统暂不支持自动打开 OAuth 授权页".to_string())
 }
 
 fn app_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -345,8 +456,8 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
             }
         }
     }
-    let account_json =
-        serde_json::to_string(&account_to_write).map_err(|error| format!("序列化账号失败: {error}"))?;
+    let account_json = serde_json::to_string(&account_to_write)
+        .map_err(|error| format!("序列化账号失败: {error}"))?;
     conn.execute(
         r#"
       INSERT INTO accounts (
@@ -428,6 +539,13 @@ fn bool_field(value: Option<&Value>) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+fn normalize_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn percent_field(value: Option<&Value>) -> Option<i64> {
@@ -544,7 +662,65 @@ fn parse_gemini_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuo
         .and_then(|r| r.get("models"))
         .and_then(Value::as_array)
         .or_else(|| obj.get("models").and_then(Value::as_array));
+    let buckets = raw.and_then(|r| r.get("buckets")).and_then(Value::as_array);
     let mut metrics = Vec::new();
+
+    if let Some(buckets) = buckets {
+        let mut picked: HashMap<String, QuotaMetric> = HashMap::new();
+        for item in buckets {
+            let Some(bucket) = item.as_object() else {
+                continue;
+            };
+            let Some(model_id) = string_field(bucket.get("modelId"))
+                .or_else(|| string_field(bucket.get("model_id")))
+            else {
+                continue;
+            };
+            let remaining_fraction = match bucket
+                .get("remainingFraction")
+                .or_else(|| bucket.get("remaining_fraction"))
+            {
+                Some(Value::Number(num)) => num.as_f64(),
+                Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+                _ => None,
+            };
+            let Some(remaining_fraction) = remaining_fraction else {
+                continue;
+            };
+            let remaining = (remaining_fraction * 100.0).round().clamp(0.0, 100.0) as i64;
+            let lower = model_id.to_ascii_lowercase();
+            let (key, label) = if lower.contains("pro") {
+                ("gemini-pro".to_string(), "PRO".to_string())
+            } else if lower.contains("flash") {
+                ("gemini-flash".to_string(), "FLASH".to_string())
+            } else {
+                (
+                    format!("gemini-{}", metrics.len() + picked.len()),
+                    model_id.clone(),
+                )
+            };
+            let metric = QuotaMetric {
+                key: key.clone(),
+                label,
+                remaining_percent: Some(remaining),
+                reset_at: bucket
+                    .get("resetTime")
+                    .or_else(|| bucket.get("reset_time"))
+                    .cloned(),
+                detail: Some(format!("{model_id} 剩余 {remaining}%")),
+                state: Some(quota_state(Some(remaining))),
+            };
+            match picked.get(&key) {
+                Some(existing) if existing.remaining_percent.unwrap_or(101) <= remaining => {}
+                _ => {
+                    picked.insert(key, metric);
+                }
+            }
+        }
+        let mut values = picked.into_values().collect::<Vec<_>>();
+        values.sort_by(|left, right| left.key.cmp(&right.key));
+        metrics.extend(values);
+    }
 
     if let Some(models) = models {
         for item in models {
@@ -638,7 +814,9 @@ fn derive_status(
         };
     }
 
-    if token_meta.expires_at.is_some_and(|expires_at| expires_at <= now)
+    if token_meta
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
         && !token_meta.has_refresh_token
     {
         return AccountStatus {
@@ -742,7 +920,11 @@ fn parse_codex_account(value: &Value, source: &str) -> Option<ManagedAccount> {
         .or_else(|| auth.and_then(|a| string_field(a.get("chatgpt_user_id"))))
         .or_else(|| auth.and_then(|a| string_field(a.get("user_id"))));
     if api_key.is_none() {
-        let token_account_id = string_field(tokens.and_then(|t| t.get("account_id")).or_else(|| obj.get("account_id")))?;
+        let token_account_id = string_field(
+            tokens
+                .and_then(|t| t.get("account_id"))
+                .or_else(|| obj.get("account_id")),
+        )?;
         let jwt_account_id = auth.and_then(|a| string_field(a.get("chatgpt_account_id")))?;
         if token_account_id != jwt_account_id {
             return None;
@@ -758,7 +940,10 @@ fn parse_codex_account(value: &Value, source: &str) -> Option<ManagedAccount> {
         .get("subscription_active_until")
         .or_else(|| obj.get("subscriptionActiveUntil"))
         .cloned()
-        .or_else(|| auth.and_then(|a| a.get("chatgpt_subscription_active_until")).cloned());
+        .or_else(|| {
+            auth.and_then(|a| a.get("chatgpt_subscription_active_until"))
+                .cloned()
+        });
     let organization_id = auth.and_then(|a| {
         string_field(a.get("organization_id"))
             .or_else(|| string_field(a.get("chatgpt_organization_id")))
@@ -783,12 +968,8 @@ fn parse_codex_account(value: &Value, source: &str) -> Option<ManagedAccount> {
     let status = derive_status(obj, &token_meta, quota.as_ref());
 
     Some(ManagedAccount {
-        id: string_field(obj.get("id")).unwrap_or_else(|| {
-            format!(
-                "codex_{}",
-                stable_hash(&discriminator)
-            )
-        }),
+        id: string_field(obj.get("id"))
+            .unwrap_or_else(|| format!("codex_{}", stable_hash(&discriminator))),
         provider: "codex".to_string(),
         email: email.to_lowercase(),
         display_name: string_field(obj.get("account_name"))
@@ -891,7 +1072,11 @@ fn parse_gemini_account(value: &Value, source: &str) -> Option<ManagedAccount> {
 fn codex_access_token(account: &ManagedAccount) -> Option<String> {
     let payload = account.auth_payload.as_ref()?.as_object()?;
     let tokens = payload.get("tokens").and_then(Value::as_object);
-    string_field(tokens.and_then(|t| t.get("access_token")).or_else(|| payload.get("access_token")))
+    string_field(
+        tokens
+            .and_then(|t| t.get("access_token"))
+            .or_else(|| payload.get("access_token")),
+    )
 }
 
 fn codex_subscription_until_from_payload(account: &ManagedAccount) -> Option<Value> {
@@ -902,7 +1087,11 @@ fn codex_subscription_until_from_payload(account: &ManagedAccount) -> Option<Val
         .cloned()
         .or_else(|| {
             let tokens = payload.get("tokens").and_then(Value::as_object);
-            let id_token = string_field(tokens.and_then(|t| t.get("id_token")).or_else(|| payload.get("id_token")))?;
+            let id_token = string_field(
+                tokens
+                    .and_then(|t| t.get("id_token"))
+                    .or_else(|| payload.get("id_token")),
+            )?;
             let jwt = parse_jwt_payload(&id_token)?;
             jwt.get("https://api.openai.com/auth")
                 .and_then(Value::as_object)
@@ -911,7 +1100,10 @@ fn codex_subscription_until_from_payload(account: &ManagedAccount) -> Option<Val
         })
 }
 
-fn parse_codex_account_profile(payload: &Value, account: &ManagedAccount) -> (Option<String>, Option<String>) {
+fn parse_codex_account_profile(
+    payload: &Value,
+    account: &ManagedAccount,
+) -> (Option<String>, Option<String>) {
     let Some(accounts) = payload.get("accounts").and_then(Value::as_object) else {
         return (None, None);
     };
@@ -950,18 +1142,31 @@ fn parse_codex_account_profile(payload: &Value, account: &ManagedAccount) -> (Op
     )
 }
 
-fn usage_window_metric(key: &str, fallback_label: &str, window: Option<&Value>) -> Option<QuotaMetric> {
+fn usage_window_metric(
+    key: &str,
+    fallback_label: &str,
+    window: Option<&Value>,
+) -> Option<QuotaMetric> {
     let window = window?.as_object()?;
-    let used = number_field(window.get("used_percent")).unwrap_or(0).clamp(0, 100);
+    let used = number_field(window.get("used_percent"))
+        .unwrap_or(0)
+        .clamp(0, 100);
     let remaining = 100 - used;
-    let window_minutes = number_field(window.get("limit_window_seconds")).map(|seconds| (seconds + 59) / 60);
+    let window_minutes =
+        number_field(window.get("limit_window_seconds")).map(|seconds| (seconds + 59) / 60);
     let reset_at = number_field(window.get("reset_at")).or_else(|| {
         number_field(window.get("reset_after_seconds")).map(|seconds| now_ts() + seconds)
     });
     Some(QuotaMetric {
         key: key.to_string(),
         label: window_minutes
-            .map(|minutes| if minutes >= 1440 { format!("{}d", minutes / 1440) } else { format!("{}h", (minutes + 59) / 60) })
+            .map(|minutes| {
+                if minutes >= 1440 {
+                    format!("{}d", minutes / 1440)
+                } else {
+                    format!("{}h", (minutes + 59) / 60)
+                }
+            })
             .unwrap_or_else(|| fallback_label.to_string()),
         remaining_percent: Some(remaining),
         reset_at: reset_at.map(|value| Value::Number(value.into())),
@@ -973,10 +1178,18 @@ fn usage_window_metric(key: &str, fallback_label: &str, window: Option<&Value>) 
 fn parse_codex_usage_quota(payload: &Value) -> AccountQuota {
     let rate_limit = payload.get("rate_limit");
     let mut metrics = Vec::new();
-    if let Some(metric) = usage_window_metric("primary", "5h", rate_limit.and_then(|r| r.get("primary_window"))) {
+    if let Some(metric) = usage_window_metric(
+        "primary",
+        "5h",
+        rate_limit.and_then(|r| r.get("primary_window")),
+    ) {
         metrics.push(metric);
     }
-    if let Some(metric) = usage_window_metric("secondary", "Weekly", rate_limit.and_then(|r| r.get("secondary_window"))) {
+    if let Some(metric) = usage_window_metric(
+        "secondary",
+        "Weekly",
+        rate_limit.and_then(|r| r.get("secondary_window")),
+    ) {
         metrics.push(metric);
     }
     AccountQuota {
@@ -991,7 +1204,8 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
     if account.provider != "codex" || account.token_meta.has_access_token == false {
         return Ok(());
     }
-    let access_token = codex_access_token(account).ok_or_else(|| "缺少 access token".to_string())?;
+    let access_token =
+        codex_access_token(account).ok_or_else(|| "缺少 access token".to_string())?;
     if account.subscription_active_until.is_none() {
         account.subscription_active_until = codex_subscription_until_from_payload(account);
     }
@@ -1071,6 +1285,215 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
     Ok(())
 }
 
+fn gemini_payload_string(account: &ManagedAccount, snake: &str, camel: &str) -> Option<String> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    let token = payload.get("token").and_then(Value::as_object);
+    nested_string_field(payload, token, snake, camel)
+}
+
+fn gemini_payload_expiry(account: &ManagedAccount) -> Option<i64> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    let token = payload.get("token").and_then(Value::as_object);
+    number_field(payload.get("expiry_date"))
+        .or_else(|| number_field(payload.get("expiryDate")))
+        .or_else(|| token.and_then(|t| number_field(t.get("expires_at"))))
+        .or_else(|| token.and_then(|t| number_field(t.get("expiresAt"))))
+}
+
+async fn load_gemini_code_assist_status(
+    access_token: &str,
+) -> Result<(Option<String>, Option<String>, Option<String>), String> {
+    let payload = serde_json::json!({
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI"
+        }
+    });
+    let value = post_gemini_code_assist_json(
+        access_token,
+        GEMINI_CODE_ASSIST_LOAD_URL,
+        &payload,
+        "loadCodeAssist",
+    )
+    .await?;
+    let current_tier_id = value
+        .get("currentTier")
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .and_then(|v| normalize_non_empty(Some(v)));
+    let current_tier_name = value
+        .get("currentTier")
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str)
+        .and_then(|v| normalize_non_empty(Some(v)));
+    let paid_tier_id = value
+        .get("paidTier")
+        .and_then(|v| v.get("id"))
+        .and_then(Value::as_str)
+        .and_then(|v| normalize_non_empty(Some(v)));
+    let paid_tier_name = value
+        .get("paidTier")
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str)
+        .and_then(|v| normalize_non_empty(Some(v)));
+    let first_allowed_tier_id = value
+        .get("allowedTiers")
+        .and_then(Value::as_array)
+        .and_then(|tiers| tiers.first())
+        .and_then(|tier| tier.get("id"))
+        .and_then(Value::as_str)
+        .and_then(|v| normalize_non_empty(Some(v)));
+    let project_id = value
+        .get("cloudaicompanionProject")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("cloudaicompanionProject")
+                .and_then(|v| v.get("id"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .get("cloudaicompanionProject")
+                .and_then(|v| v.get("projectId"))
+                .and_then(Value::as_str)
+        })
+        .and_then(|v| normalize_non_empty(Some(v)));
+    Ok((
+        paid_tier_id.or(current_tier_id).or(first_allowed_tier_id),
+        paid_tier_name.or(current_tier_name),
+        project_id,
+    ))
+}
+
+async fn refresh_gemini_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
+    if account.provider != "gemini" {
+        return Ok(());
+    }
+    let mut access_token = gemini_payload_string(account, "access_token", "accessToken")
+        .ok_or_else(|| "缺少 Gemini access_token".to_string())?;
+    let refresh_token = gemini_payload_string(account, "refresh_token", "refreshToken");
+
+    if gemini_payload_expiry(account)
+        .map(|expiry| expiry <= now_ts_ms() + 60_000)
+        .unwrap_or(false)
+    {
+        let refresh_token = refresh_token
+            .clone()
+            .ok_or_else(|| "Gemini refresh_token 不存在，无法刷新 access_token".to_string())?;
+        let refreshed = refresh_gemini_access_token(&refresh_token).await?;
+        access_token = refreshed
+            .access_token
+            .ok_or_else(|| "Gemini token 刷新后 access_token 为空".to_string())?;
+        if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
+            payload.insert(
+                "access_token".to_string(),
+                Value::String(access_token.clone()),
+            );
+            if let Some(id_token) = refreshed.id_token {
+                payload.insert("id_token".to_string(), Value::String(id_token));
+            }
+            if let Some(token_type) = refreshed.token_type {
+                payload.insert("token_type".to_string(), Value::String(token_type));
+            }
+            if let Some(scope) = refreshed.scope {
+                payload.insert("scope".to_string(), Value::String(scope));
+            }
+            if let Some(expires_in) = refreshed.expires_in {
+                let expiry_date = now_ts_ms() + expires_in.saturating_mul(1000);
+                payload.insert("expiry_date".to_string(), Value::Number(expiry_date.into()));
+                account.token_meta.expires_at = Some(expiry_date);
+                account.subscription_active_until = Some(Value::Number(expiry_date.into()));
+            }
+        }
+    }
+
+    if let Some(userinfo) = fetch_google_userinfo(&access_token).await {
+        if let Some(email) = normalize_non_empty(userinfo.email.as_deref()) {
+            account.email = email.to_lowercase();
+        }
+        if account.user_id.is_none() {
+            account.user_id = normalize_non_empty(userinfo.id.as_deref());
+        }
+        if account.account_id.is_none() {
+            account.account_id = account.user_id.clone();
+        }
+        if account.display_name.is_none() {
+            account.display_name = normalize_non_empty(userinfo.name.as_deref());
+        }
+    }
+
+    let mut status = load_gemini_code_assist_status(&access_token).await;
+    if let Err(error) = &status {
+        if error.contains("UNAUTHORIZED") {
+            if let Some(refresh_token) = refresh_token {
+                let refreshed = refresh_gemini_access_token(&refresh_token).await?;
+                access_token = refreshed
+                    .access_token
+                    .ok_or_else(|| "Gemini token 刷新后 access_token 为空".to_string())?;
+                if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut)
+                {
+                    payload.insert(
+                        "access_token".to_string(),
+                        Value::String(access_token.clone()),
+                    );
+                }
+                status = load_gemini_code_assist_status(&access_token).await;
+            }
+        }
+    }
+    let (tier_id, tier_name, project_id) = status?;
+    if let Some(tier_id) = tier_id.clone() {
+        account.plan_type = Some(tier_id);
+    }
+    account.plan = tier_name.or(tier_id);
+
+    if let Some(project_id) = project_id {
+        match post_gemini_code_assist_json(
+            &access_token,
+            GEMINI_CODE_ASSIST_QUOTA_URL,
+            &serde_json::json!({ "project": project_id }),
+            "retrieveUserQuota",
+        )
+        .await
+        {
+            Ok(quota) => {
+                if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut)
+                {
+                    payload.insert("gemini_usage_raw".to_string(), quota.clone());
+                    payload.insert(
+                        "usage_updated_at".to_string(),
+                        Value::Number(now_ts().into()),
+                    );
+                }
+                let empty = serde_json::Map::new();
+                let payload = account
+                    .auth_payload
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .unwrap_or(&empty);
+                account.quota = parse_gemini_quota(payload);
+            }
+            Err(error) => {
+                account.quota = Some(AccountQuota {
+                    metrics: vec![],
+                    last_updated: Some(now_ts()),
+                    error: Some(error.clone()),
+                    is_forbidden: Some(
+                        error.to_ascii_lowercase().contains("403")
+                            || error.to_ascii_lowercase().contains("forbidden"),
+                    ),
+                });
+            }
+        }
+    }
+
+    account.updated_at = now_ts();
+    account.status = Some(fallback_status_refreshed(account));
+    Ok(())
+}
+
 fn fallback_status_refreshed(account: &ManagedAccount) -> AccountStatus {
     let empty = serde_json::Map::new();
     let obj = account
@@ -1078,11 +1501,7 @@ fn fallback_status_refreshed(account: &ManagedAccount) -> AccountStatus {
         .as_ref()
         .and_then(Value::as_object)
         .unwrap_or(&empty);
-    derive_status(
-        obj,
-        &account.token_meta,
-        account.quota.as_ref(),
-    )
+    derive_status(obj, &account.token_meta, account.quota.as_ref())
 }
 
 fn mark_account_unavailable(account: &mut ManagedAccount, reason: String) {
@@ -1111,8 +1530,9 @@ async fn refresh_imported_accounts(accounts: &mut [ManagedAccount]) {
                 }
             }
             "gemini" => {
-                account.status = Some(fallback_status_refreshed(account));
-                account.updated_at = now_ts();
+                if let Err(error) = refresh_gemini_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
             }
             _ => {}
         }
@@ -1285,7 +1705,10 @@ fn build_codex_auth_payload(account: &ManagedAccount) -> Result<Value, String> {
     }
 
     let mut result = serde_json::Map::new();
-    result.insert("auth_mode".to_string(), Value::String("chatgpt".to_string()));
+    result.insert(
+        "auth_mode".to_string(),
+        Value::String("chatgpt".to_string()),
+    );
     result.insert("OPENAI_API_KEY".to_string(), Value::Null);
     result.insert("tokens".to_string(), Value::Object(token_map));
     result.insert(
@@ -1355,8 +1778,8 @@ fn build_gemini_oauth_payload(account: &ManagedAccount) -> Result<Value, String>
         .ok_or_else(|| "Gemini 账号缺少 access_token".to_string())?;
     let refresh_token = nested_string_field(payload, token, "refresh_token", "refreshToken");
     let id_token = nested_string_field(payload, token, "id_token", "idToken");
-    let token_type =
-        nested_string_field(payload, token, "token_type", "tokenType").unwrap_or_else(|| "Bearer".to_string());
+    let token_type = nested_string_field(payload, token, "token_type", "tokenType")
+        .unwrap_or_else(|| "Bearer".to_string());
     let scope = nested_string_field(payload, token, "scope", "scope");
     let expiry_date = payload
         .get("expiry_date")
@@ -1403,11 +1826,12 @@ fn write_gemini_active_account(email: &str) -> Result<(), String> {
         .map(ToOwned::to_owned)
     {
         if !active.eq_ignore_ascii_case(email) {
-            let old = obj
-                .entry("old")
-                .or_insert_with(|| Value::Array(Vec::new()));
+            let old = obj.entry("old").or_insert_with(|| Value::Array(Vec::new()));
             if let Some(arr) = old.as_array_mut() {
-                if !arr.iter().any(|item| item.as_str() == Some(active.as_str())) {
+                if !arr
+                    .iter()
+                    .any(|item| item.as_str() == Some(active.as_str()))
+                {
                     arr.push(Value::String(active));
                 }
                 arr.retain(|item| {
@@ -1563,13 +1987,22 @@ fn read_gemini_keychain() -> Result<Option<Value>, String> {
     };
     let mut oauth = serde_json::Map::new();
     if let Some(access_token) = token.get("accessToken").and_then(Value::as_str) {
-        oauth.insert("access_token".to_string(), Value::String(access_token.to_string()));
+        oauth.insert(
+            "access_token".to_string(),
+            Value::String(access_token.to_string()),
+        );
     }
     if let Some(refresh_token) = token.get("refreshToken").and_then(Value::as_str) {
-        oauth.insert("refresh_token".to_string(), Value::String(refresh_token.to_string()));
+        oauth.insert(
+            "refresh_token".to_string(),
+            Value::String(refresh_token.to_string()),
+        );
     }
     if let Some(token_type) = token.get("tokenType").and_then(Value::as_str) {
-        oauth.insert("token_type".to_string(), Value::String(token_type.to_string()));
+        oauth.insert(
+            "token_type".to_string(),
+            Value::String(token_type.to_string()),
+        );
     }
     if let Some(scope) = token.get("scope").and_then(Value::as_str) {
         oauth.insert("scope".to_string(), Value::String(scope.to_string()));
@@ -1585,48 +2018,534 @@ fn read_gemini_keychain() -> Result<Option<Value>, String> {
     Ok(None)
 }
 
-fn launch_oauth_command(command_text: &str) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
+fn query_map_from_url(
+    path_and_query: &str,
+    port: u16,
+) -> Result<(String, HashMap<String, String>), String> {
+    let parsed = Url::parse(&format!("http://127.0.0.1:{port}{path_and_query}"))
+        .map_err(|error| format!("解析 OAuth 回调失败: {error}"))?;
+    let path = parsed.path().to_string();
+    let params = parsed
+        .query_pairs()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect::<HashMap<_, _>>();
+    Ok((path, params))
+}
+
+fn respond_oauth_success(request: tiny_http::Request) {
+    let html = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorization complete</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #0f0f0f;
+      color: #ececf1;
+      font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(420px, calc(100vw - 40px));
+      padding: 36px 30px 32px;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 14px;
+      background: #171717;
+      box-shadow: 0 24px 80px rgba(0,0,0,.42);
+      text-align: center;
+    }
+    .mark {
+      width: 42px;
+      height: 42px;
+      margin: 0 auto 22px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: #10a37f;
+      color: #04110d;
+      font-size: 22px;
+      font-weight: 800;
+      line-height: 1;
+    }
+    h1 {
+      margin: 0 0 10px;
+      font-size: 22px;
+      line-height: 1.25;
+      font-weight: 650;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 0;
+      color: #b4b4b4;
+      font-size: 14px;
+      line-height: 1.65;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark">✓</div>
+    <h1>授权已完成</h1>
+    <p>Super AI 已收到授权回调。<br>你可以关闭此页面并返回应用。</p>
+  </main>
+</body>
+</html>"#;
+    let mut response = Response::from_string(html);
+    if let Ok(header) = Header::from_bytes("Content-Type", "text/html; charset=utf-8") {
+        response.add_header(header);
+    }
+    let _ = request.respond(response);
+}
+
+fn respond_oauth_redirect(request: tiny_http::Request, location: &str) {
+    let mut response = Response::from_string(String::new()).with_status_code(StatusCode(301));
+    if let Ok(header) = Header::from_bytes("Location", location) {
+        response.add_header(header);
+    }
+    let _ = request.respond(response);
+}
+
+fn notify_oauth_listener_cancel(port: u16) {
+    if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+        use std::io::Write;
+        let _ = stream.write_all(b"GET /cancel HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let _ = stream.flush();
+    }
+}
+
+fn cancel_pending_oauth_for_provider(provider: &str) {
+    let ports = OAUTH_PENDING
+        .lock()
+        .map(|mut pending| {
+            let ids = pending
+                .iter()
+                .filter_map(|(id, item)| (item.provider == provider).then(|| id.clone()))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id).map(|item| item.port))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for port in ports {
+        notify_oauth_listener_cancel(port);
+    }
+}
+
+fn start_oauth_callback_listener(
+    login_id: String,
+    provider: String,
+    port: u16,
+    callback_path: String,
+    success_redirect: Option<String>,
+) {
+    std::thread::spawn(move || {
+        let server = match Server::http(format!("127.0.0.1:{port}")) {
+            Ok(server) => server,
+            Err(_) => return,
+        };
+        let started_at = now_ts();
+        loop {
+            if now_ts() - started_at > OAUTH_TIMEOUT_SECONDS {
+                let _ = OAUTH_PENDING.lock().map(|mut pending| {
+                    pending.remove(&login_id);
+                });
+                break;
+            }
+
+            let still_pending = OAUTH_PENDING
+                .lock()
+                .ok()
+                .and_then(|pending| pending.get(&login_id).map(|item| item.provider == provider))
+                .unwrap_or(false);
+            if !still_pending {
+                break;
+            }
+
+            let request = match server.recv_timeout(Duration::from_millis(500)) {
+                Ok(Some(request)) => request,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
+            let request_url = request.url().to_string();
+            if request_url.starts_with("/cancel") {
+                let _ = request.respond(Response::from_string("cancelled"));
+                let _ = OAUTH_PENDING.lock().map(|mut pending| {
+                    pending.remove(&login_id);
+                });
+                break;
+            }
+
+            let Ok((path, params)) = query_map_from_url(&request_url, port) else {
+                let _ = request.respond(Response::from_string("Bad Request").with_status_code(400));
+                continue;
+            };
+            if path != callback_path {
+                let _ = request.respond(Response::from_string("Not Found").with_status_code(404));
+                continue;
+            }
+            if let Some(error) = params.get("error") {
+                let _ = request.respond(
+                    Response::from_string(format!("OAuth error: {error}")).with_status_code(400),
+                );
+                break;
+            }
+            let code = params
+                .get("code")
+                .and_then(|value| normalize_non_empty(Some(value.as_str())));
+            let state = params
+                .get("state")
+                .and_then(|value| normalize_non_empty(Some(value.as_str())));
+            let Some(code) = code else {
+                let _ =
+                    request.respond(Response::from_string("Missing code").with_status_code(400));
+                continue;
+            };
+
+            let accepted = OAUTH_PENDING
+                .lock()
+                .ok()
+                .and_then(|mut pending| {
+                    let item = pending.get_mut(&login_id)?;
+                    if item.provider != provider || item.state != state.clone().unwrap_or_default()
+                    {
+                        return Some(false);
+                    }
+                    item.code = Some(code);
+                    Some(true)
+                })
+                .unwrap_or(false);
+            if !accepted {
+                let _ =
+                    request.respond(Response::from_string("State mismatch").with_status_code(400));
+                continue;
+            }
+            if let Some(location) = success_redirect.as_deref() {
+                respond_oauth_redirect(request, location);
+            } else {
+                respond_oauth_success(request);
+            }
+            break;
+        }
+    });
+}
+
+fn reserve_callback_port(preferred: Option<u16>) -> Result<u16, String> {
+    let port = preferred.unwrap_or(0);
+    let mut last_error = None;
+    for attempt in 0..6 {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => {
+                let port = listener
+                    .local_addr()
+                    .map_err(|error| format!("读取 OAuth 回调端口失败: {error}"))?
+                    .port();
+                drop(listener);
+                return Ok(port);
+            }
+            Err(error) if error.kind() == ErrorKind::AddrInUse && preferred.is_some() => {
+                last_error = Some(error);
+                if attempt < 5 {
+                    std::thread::sleep(Duration::from_millis(120));
+                    continue;
+                }
+            }
+            Err(error) => return Err(format!("分配 OAuth 回调端口失败: {error}")),
+        }
+    }
+    let detail = last_error
+        .map(|error| format!(" ({error})"))
+        .unwrap_or_default();
+    Err(format!("OAuth 回调端口 {port} 已被占用。Codex OAuth 必须使用固定端口，请先退出正在占用该端口的应用后重试。{detail}"))
+}
+
+fn build_codex_oauth_url(
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> Result<String, String> {
+    let mut url = Url::parse(CODEX_OAUTH_AUTH_URL)
+        .map_err(|error| format!("构建 Codex OAuth URL 失败: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", CODEX_OAUTH_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("scope", CODEX_OAUTH_SCOPES)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("id_token_add_organizations", "true")
+        .append_pair("codex_cli_simplified_flow", "true")
+        .append_pair("state", state)
+        .append_pair("originator", "codex_vscode");
+    Ok(url.to_string())
+}
+
+fn build_gemini_oauth_url(redirect_uri: &str, state: &str) -> Result<String, String> {
+    let mut url = Url::parse(GEMINI_OAUTH_AUTH_URL)
+        .map_err(|error| format!("构建 Gemini OAuth URL 失败: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", GEMINI_OAUTH_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("access_type", "offline")
+        .append_pair(
+            "scope",
+            "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
+        )
+        .append_pair("state", state);
+    Ok(url.to_string())
+}
+
+async fn exchange_codex_oauth_code(
+    code: &str,
+    code_verifier: &str,
+    port: u16,
+) -> Result<Value, String> {
+    let redirect_uri = format!("http://localhost:{port}/auth/callback");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Codex OAuth 客户端失败: {error}"))?;
+    let response = client
+        .post(CODEX_OAUTH_TOKEN_URL)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", CODEX_OAUTH_CLIENT_ID),
+            ("code_verifier", code_verifier),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Codex OAuth token 请求失败: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 Codex OAuth token 响应失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Codex OAuth token 交换失败: status={status}, body_len={}",
+            body.len()
+        ));
+    }
+    let token_response: Value = serde_json::from_str(&body)
+        .map_err(|error| format!("解析 Codex OAuth token 响应失败: {error}"))?;
+    let id_token = string_field(token_response.get("id_token"))
+        .ok_or_else(|| "Codex OAuth 响应缺少 id_token".to_string())?;
+    let access_token = string_field(token_response.get("access_token"))
+        .ok_or_else(|| "Codex OAuth 响应缺少 access_token".to_string())?;
+    let mut tokens = serde_json::Map::new();
+    tokens.insert("id_token".to_string(), Value::String(id_token));
+    tokens.insert("access_token".to_string(), Value::String(access_token));
+    if let Some(refresh_token) = string_field(token_response.get("refresh_token")) {
+        tokens.insert("refresh_token".to_string(), Value::String(refresh_token));
+    }
+    if let Some(jwt) = tokens
+        .get("id_token")
+        .and_then(Value::as_str)
+        .and_then(parse_jwt_payload)
     {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        Command::new(shell)
-            .args(["-lc", command_text])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("启动 OAuth 失败: {e}"))?;
-        return Ok(());
+        if let Some(account_id) = jwt
+            .get("https://api.openai.com/auth")
+            .and_then(Value::as_object)
+            .and_then(|auth| string_field(auth.get("chatgpt_account_id")))
+        {
+            tokens.insert("account_id".to_string(), Value::String(account_id));
+        }
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        Command::new("cmd")
-            .args(["/C", command_text])
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("启动 OAuth 失败: {e}"))?;
-        return Ok(());
-    }
+    Ok(serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": Value::Null,
+        "tokens": Value::Object(tokens),
+        "last_refresh": now_ts().to_string()
+    }))
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        Command::new("sh")
-            .args(["-lc", command_text])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("启动 OAuth 失败: {e}"))?;
-        return Ok(());
+async fn exchange_gemini_oauth_code(code: &str, redirect_uri: &str) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Gemini OAuth 客户端失败: {error}"))?;
+    let response = client
+        .post(GEMINI_OAUTH_TOKEN_URL)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&[
+            ("code", code),
+            ("client_id", GEMINI_OAUTH_CLIENT_ID),
+            ("client_secret", GEMINI_OAUTH_CLIENT_SECRET),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("请求 Google OAuth token 失败: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Google OAuth token 交换失败: status={status}, body_len={}",
+            body.len()
+        ));
     }
+    let payload = response
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|error| format!("解析 Google OAuth token 响应失败: {error}"))?;
+    let access_token = payload.access_token.clone().ok_or_else(|| {
+        format!(
+            "Google OAuth 响应缺少 access_token: error={:?}, desc={:?}",
+            payload.error, payload.error_description
+        )
+    })?;
+    let user_info = fetch_google_userinfo(&access_token).await;
+    let email = normalize_non_empty(user_info.as_ref().and_then(|info| info.email.as_deref()))
+        .or_else(|| {
+            payload
+                .id_token
+                .as_deref()
+                .and_then(|token| parse_jwt_payload(token))
+                .and_then(|jwt| string_field(jwt.get("email")))
+        })
+        .unwrap_or_else(|| "unknown@gmail.com".to_string());
+    let auth_id = normalize_non_empty(user_info.as_ref().and_then(|info| info.id.as_deref()))
+        .or_else(|| {
+            payload
+                .id_token
+                .as_deref()
+                .and_then(|token| parse_jwt_payload(token))
+                .and_then(|jwt| string_field(jwt.get("sub")))
+        });
+    let name = normalize_non_empty(user_info.as_ref().and_then(|info| info.name.as_deref()))
+        .or_else(|| {
+            payload
+                .id_token
+                .as_deref()
+                .and_then(|token| parse_jwt_payload(token))
+                .and_then(|jwt| string_field(jwt.get("name")))
+        });
+    let expiry_date = payload
+        .expires_in
+        .map(|seconds| now_ts_ms() + seconds.saturating_mul(1000));
 
-    #[allow(unreachable_code)]
-    Err("当前系统暂不支持自动启动 OAuth".to_string())
+    let mut result = serde_json::Map::new();
+    result.insert("access_token".to_string(), Value::String(access_token));
+    if let Some(refresh_token) = payload.refresh_token {
+        result.insert("refresh_token".to_string(), Value::String(refresh_token));
+    }
+    if let Some(id_token) = payload.id_token {
+        result.insert("id_token".to_string(), Value::String(id_token));
+    }
+    if let Some(token_type) = payload.token_type {
+        result.insert("token_type".to_string(), Value::String(token_type));
+    }
+    if let Some(scope) = payload.scope {
+        result.insert("scope".to_string(), Value::String(scope));
+    }
+    if let Some(expiry_date) = expiry_date {
+        result.insert("expiry_date".to_string(), Value::Number(expiry_date.into()));
+    }
+    result.insert("email".to_string(), Value::String(email));
+    if let Some(auth_id) = auth_id {
+        result.insert("auth_id".to_string(), Value::String(auth_id));
+    }
+    if let Some(name) = name {
+        result.insert("name".to_string(), Value::String(name));
+    }
+    result.insert(
+        "selected_auth_type".to_string(),
+        Value::String("oauth-personal".to_string()),
+    );
+    Ok(Value::Object(result))
+}
+
+async fn fetch_google_userinfo(access_token: &str) -> Option<GoogleUserInfoResponse> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let response = client
+        .get(GOOGLE_USERINFO_URL)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<GoogleUserInfoResponse>().await.ok()
+}
+
+async fn refresh_gemini_access_token(refresh_token: &str) -> Result<OAuthTokenResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("创建 Gemini token 客户端失败: {error}"))?;
+    let response = client
+        .post(GEMINI_OAUTH_TOKEN_URL)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&[
+            ("client_id", GEMINI_OAUTH_CLIENT_ID),
+            ("client_secret", GEMINI_OAUTH_CLIENT_SECRET),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("刷新 Gemini access_token 请求失败: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "刷新 Gemini access_token 失败: status={status}, body_len={}",
+            body.len()
+        ));
+    }
+    response
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|error| format!("解析 Gemini access_token 刷新响应失败: {error}"))
+}
+
+async fn post_gemini_code_assist_json(
+    access_token: &str,
+    endpoint: &str,
+    payload: &Value,
+    action: &str,
+) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("创建 Gemini API 客户端失败: {error}"))?;
+    let response = client
+        .post(endpoint)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .json(payload)
+        .send()
+        .await
+        .map_err(|error| format!("请求 Gemini {action} 失败: {error}"))?;
+    if response.status().as_u16() == 401 {
+        return Err("UNAUTHORIZED: Gemini access_token 已失效".to_string());
+    }
+    if response.status().is_success() {
+        return response
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("解析 Gemini {action} 响应失败: {error}"));
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(format!(
+        "请求 Gemini {action} 失败: status={status}, body_len={}",
+        body.len()
+    ))
 }
 
 #[tauri::command]
@@ -1648,7 +2567,10 @@ fn upsert_accounts(app: tauri::AppHandle, accounts: Vec<ManagedAccount>) -> Resu
 
 #[tauri::command]
 #[allow(non_snake_case)]
-async fn refresh_account(app: tauri::AppHandle, accountId: String) -> Result<ManagedAccount, String> {
+async fn refresh_account(
+    app: tauri::AppHandle,
+    accountId: String,
+) -> Result<ManagedAccount, String> {
     let mut account = {
         let conn = open_app_db(&app)?;
         load_account_from_db(&conn, &accountId)?
@@ -1662,7 +2584,9 @@ async fn refresh_account(app: tauri::AppHandle, accountId: String) -> Result<Man
             }
         }
         "gemini" => {
-            account.updated_at = now_ts();
+            if let Err(error) = refresh_gemini_account_remote(&mut account).await {
+                mark_account_unavailable(&mut account, error);
+            }
         }
         other => return Err(format!("不支持的账号类型: {other}")),
     }
@@ -1690,12 +2614,18 @@ async fn refresh_provider_accounts(
 
     for account in &mut accounts {
         let was_current = is_current_status(&account.status);
-        if account.provider == "codex" {
-            if let Err(error) = refresh_codex_account_remote(account).await {
-                mark_account_unavailable(account, error);
+        match account.provider.as_str() {
+            "codex" => {
+                if let Err(error) = refresh_codex_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
             }
-        } else {
-            account.updated_at = now_ts();
+            "gemini" => {
+                if let Err(error) = refresh_gemini_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
+            _ => {}
         }
         if was_current {
             mark_account_current(account);
@@ -1832,7 +2762,8 @@ fn import_gemini_from_local(app: tauri::AppHandle) -> Result<ImportResult, Strin
             ));
         }
         let oauth_content = read_to_string(&oauth_path)?;
-        serde_json::from_str(&oauth_content).map_err(|e| format!("解析 oauth_creds.json 失败: {e}"))?
+        serde_json::from_str(&oauth_content)
+            .map_err(|e| format!("解析 oauth_creds.json 失败: {e}"))?
     };
 
     if let Some(obj) = oauth_value.as_object_mut() {
@@ -1864,9 +2795,14 @@ fn import_gemini_from_local(app: tauri::AppHandle) -> Result<ImportResult, Strin
 
 #[tauri::command]
 fn start_codex_oauth() -> Result<OAuthStartResult, String> {
-    let login_id = format!("codex-{}-{}", now_ts(), stable_hash("codex"));
-    let command = "codex login".to_string();
-    launch_oauth_command(&command)?;
+    cancel_pending_oauth_for_provider("codex");
+    let port = reserve_callback_port(Some(CODEX_OAUTH_CALLBACK_PORT))?;
+    let login_id = random_urlsafe_token(24);
+    let state = random_urlsafe_token(24);
+    let code_verifier = random_urlsafe_token(32);
+    let challenge = code_challenge(&code_verifier);
+    let redirect_uri = format!("http://localhost:{port}/auth/callback");
+    let auth_url = build_codex_oauth_url(&redirect_uri, &challenge, &state)?;
     OAUTH_PENDING
         .lock()
         .map_err(|_| "OAuth 状态锁失败".to_string())?
@@ -1874,43 +2810,86 @@ fn start_codex_oauth() -> Result<OAuthStartResult, String> {
             login_id.clone(),
             OAuthPending {
                 provider: "codex".to_string(),
+                redirect_uri,
+                state,
+                code_verifier: Some(code_verifier),
+                port,
+                expires_at: now_ts() + OAUTH_TIMEOUT_SECONDS,
+                code: None,
             },
         );
+    start_oauth_callback_listener(
+        login_id.clone(),
+        "codex".to_string(),
+        port,
+        "/auth/callback".to_string(),
+        None,
+    );
+    open_oauth_url(&auth_url)?;
 
     Ok(OAuthStartResult {
         login_id,
         provider: "codex".to_string(),
-        command,
+        command: auth_url.clone(),
         message: "已启动 Codex OAuth，完成浏览器授权后会自动添加。".to_string(),
+        auth_url: Some(auth_url),
     })
 }
 
 #[tauri::command]
-async fn complete_codex_oauth(app: tauri::AppHandle, login_id: String) -> Result<ImportResult, String> {
-    let is_pending = OAUTH_PENDING
+async fn complete_codex_oauth(
+    app: tauri::AppHandle,
+    login_id: String,
+) -> Result<ImportResult, String> {
+    let pending = OAUTH_PENDING
         .lock()
         .map_err(|_| "OAuth 状态锁失败".to_string())?
         .get(&login_id)
-        .map(|p| p.provider.as_str() == "codex")
-        .unwrap_or(false);
-    if !is_pending {
-        return Err("无效或已过期的 Codex OAuth 会话".to_string());
+        .cloned();
+    let Some(pending) = pending else {
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
+    };
+    if pending.provider != "codex" {
+        return Err("无效的 Codex OAuth 会话".to_string());
     }
-    let result = import_codex_from_local(app)?;
-    if !result.imported.is_empty() {
+    if pending.expires_at <= now_ts() {
         OAUTH_PENDING
             .lock()
             .map_err(|_| "OAuth 状态锁失败".to_string())?
             .remove(&login_id);
+        return Err("Codex OAuth 登录已超时，请重新发起授权".to_string());
     }
+    let Some(code) = pending.code else {
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
+    };
+    let code_verifier = pending
+        .code_verifier
+        .ok_or_else(|| "Codex OAuth 会话缺少 code_verifier".to_string())?;
+    let payload = exchange_codex_oauth_code(&code, &code_verifier, pending.port).await?;
+    let result = parse_auth_json_content(&payload.to_string(), "oauth", "Codex OAuth");
+    upsert_accounts_into_db(&app, &result.imported)?;
+    refresh_imported_accounts_in_background(app, result.imported.clone());
+    OAUTH_PENDING
+        .lock()
+        .map_err(|_| "OAuth 状态锁失败".to_string())?
+        .remove(&login_id);
     Ok(result)
 }
 
 #[tauri::command]
 fn start_gemini_oauth() -> Result<OAuthStartResult, String> {
-    let login_id = format!("gemini-{}-{}", now_ts(), stable_hash("gemini"));
-    let command = "gemini auth login".to_string();
-    launch_oauth_command(&command)?;
+    cancel_pending_oauth_for_provider("gemini");
+    let port = reserve_callback_port(None)?;
+    let login_id = random_urlsafe_token(24);
+    let state = random_urlsafe_token(24);
+    let redirect_uri = format!("http://127.0.0.1:{port}{GEMINI_OAUTH_CALLBACK_PATH}");
+    let auth_url = build_gemini_oauth_url(&redirect_uri, &state)?;
     OAUTH_PENDING
         .lock()
         .map_err(|_| "OAuth 状态锁失败".to_string())?
@@ -1918,35 +2897,72 @@ fn start_gemini_oauth() -> Result<OAuthStartResult, String> {
             login_id.clone(),
             OAuthPending {
                 provider: "gemini".to_string(),
+                redirect_uri,
+                state,
+                code_verifier: None,
+                port,
+                expires_at: now_ts() + OAUTH_TIMEOUT_SECONDS,
+                code: None,
             },
         );
+    start_oauth_callback_listener(
+        login_id.clone(),
+        "gemini".to_string(),
+        port,
+        GEMINI_OAUTH_CALLBACK_PATH.to_string(),
+        Some("https://developers.google.com/gemini-code-assist/auth_success_gemini".to_string()),
+    );
+    open_oauth_url(&auth_url)?;
 
     Ok(OAuthStartResult {
         login_id,
         provider: "gemini".to_string(),
-        command,
+        command: auth_url.clone(),
         message: "已启动 Gemini OAuth，完成浏览器授权后会自动添加。".to_string(),
+        auth_url: Some(auth_url),
     })
 }
 
 #[tauri::command]
-fn complete_gemini_oauth(app: tauri::AppHandle, login_id: String) -> Result<ImportResult, String> {
-    let is_pending = OAUTH_PENDING
+async fn complete_gemini_oauth(
+    app: tauri::AppHandle,
+    login_id: String,
+) -> Result<ImportResult, String> {
+    let pending = OAUTH_PENDING
         .lock()
         .map_err(|_| "OAuth 状态锁失败".to_string())?
         .get(&login_id)
-        .map(|p| p.provider.as_str() == "gemini")
-        .unwrap_or(false);
-    if !is_pending {
-        return Err("无效或已过期的 Gemini OAuth 会话".to_string());
+        .cloned();
+    let Some(pending) = pending else {
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
+    };
+    if pending.provider != "gemini" {
+        return Err("无效的 Gemini OAuth 会话".to_string());
     }
-    let result = import_gemini_from_local(app)?;
-    if !result.imported.is_empty() {
+    if pending.expires_at <= now_ts() {
         OAUTH_PENDING
             .lock()
             .map_err(|_| "OAuth 状态锁失败".to_string())?
             .remove(&login_id);
+        return Err("Gemini OAuth 登录已超时，请重新发起授权".to_string());
     }
+    let Some(code) = pending.code else {
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
+    };
+    let payload = exchange_gemini_oauth_code(&code, &pending.redirect_uri).await?;
+    let result = parse_auth_json_content(&payload.to_string(), "oauth", "Gemini OAuth");
+    upsert_accounts_into_db(&app, &result.imported)?;
+    refresh_imported_accounts_in_background(app, result.imported.clone());
+    OAUTH_PENDING
+        .lock()
+        .map_err(|_| "OAuth 状态锁失败".to_string())?
+        .remove(&login_id);
     Ok(result)
 }
 

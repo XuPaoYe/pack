@@ -69,8 +69,12 @@ type OAuthStartResult = {
 type SwitchAccountResult = ManagedAccount[];
 type NoticeTone = "success" | "error" | "info";
 type Notice = { tone: NoticeTone; text: string };
+type AppLogEntry = { id: string; tone: NoticeTone; text: string; createdAt: number };
 
 const NOTICE_TIMEOUT_MS = 7000;
+const APP_LOG_STORAGE_KEY = "super-ai:app-logs";
+const APP_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+const APP_LOG_LIMIT = 300;
 
 const noticeToneConfig: Record<NoticeTone, { icon: typeof Info; label: string }> = {
   success: { icon: BadgeCheck, label: "成功" },
@@ -99,7 +103,7 @@ const modeConfig: Record<
   local: {
     icon: Laptop,
     title: "读取本机",
-    desc: "读取本地 Codex 里的账号信息",
+    desc: "从本地已登录的会话中导入 Codex 账号",
   },
   oauth: {
     icon: Cloud,
@@ -109,9 +113,54 @@ const modeConfig: Record<
 };
 
 const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
+const defaultImportMode: ImportMode = "oauth";
 
 function providerLabel(provider: Provider) {
   return provider === "codex" ? "Codex" : "Gemini Cli";
+}
+
+function isAppLogEntry(value: unknown): value is AppLogEntry {
+  if (!value || typeof value !== "object") return false;
+  const item = value as Partial<AppLogEntry>;
+  return (
+    typeof item.id === "string" &&
+    typeof item.text === "string" &&
+    typeof item.createdAt === "number" &&
+    (item.tone === "success" || item.tone === "error" || item.tone === "info")
+  );
+}
+
+function pruneAppLogs(logs: AppLogEntry[]) {
+  const cutoff = Date.now() - APP_LOG_RETENTION_MS;
+  return logs
+    .filter((log) => log.createdAt >= cutoff)
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, APP_LOG_LIMIT);
+}
+
+function loadAppLogs() {
+  try {
+    const raw = window.localStorage.getItem(APP_LOG_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return pruneAppLogs(parsed.filter(isAppLogEntry));
+  } catch {
+    return [];
+  }
+}
+
+function persistAppLogs(logs: AppLogEntry[]) {
+  try {
+    window.localStorage.setItem(APP_LOG_STORAGE_KEY, JSON.stringify(pruneAppLogs(logs)));
+  } catch {
+    // Local logging is best effort only.
+  }
+}
+
+function createLogId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 function formatRelative(timestamp: number) {
@@ -160,18 +209,11 @@ function isCurrentAccount(account: ManagedAccount) {
 }
 
 function sortAccountsForView(items: ManagedAccount[]) {
-  const providerRank: Record<Provider, number> = { codex: 0, gemini: 1 };
   return [...items].sort((a, b) => {
-    const providerDelta = providerRank[a.provider] - providerRank[b.provider];
-    if (providerDelta !== 0) return providerDelta;
     const currentDelta = Number(isCurrentAccount(b)) - Number(isCurrentAccount(a));
     if (currentDelta !== 0) return currentDelta;
-    const emailDelta = a.email.localeCompare(b.email, undefined, { sensitivity: "base" });
-    if (emailDelta !== 0) return emailDelta;
-    const aName = a.accountName || a.displayName || a.accountId || a.id;
-    const bName = b.accountName || b.displayName || b.accountId || b.id;
-    const nameDelta = aName.localeCompare(bName, undefined, { sensitivity: "base" });
-    if (nameDelta !== 0) return nameDelta;
+    const createdDelta = b.createdAt - a.createdAt;
+    if (createdDelta !== 0) return createdDelta;
     return a.id.localeCompare(b.id);
   });
 }
@@ -367,12 +409,13 @@ function AppModal({
 function App() {
   const [accounts, setAccounts] = useState<ManagedAccount[]>([]);
   const [activeProvider, setActiveProvider] = useState<Provider>("codex");
-  const [mode, setMode] = useState<ImportMode>("paste");
+  const [mode, setMode] = useState<ImportMode>(defaultImportMode);
   const [pasteValue, setPasteValue] = useState("");
   const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isLogsOpen, setIsLogsOpen] = useState(false);
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [isFileImporting, setIsFileImporting] = useState(false);
@@ -381,6 +424,7 @@ function App() {
   const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
   const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [appLogs, setAppLogs] = useState<AppLogEntry[]>(loadAppLogs);
   const [settings, setSettings] = useState<AppSettings>({
     theme: "system",
     autoLaunch: false,
@@ -464,14 +508,29 @@ function App() {
     setNotice(null);
   }, []);
 
+  const appendAppLog = useCallback((tone: NoticeTone, text: string) => {
+    setAppLogs((current) =>
+      pruneAppLogs([
+        {
+          id: createLogId(),
+          tone,
+          text,
+          createdAt: Date.now(),
+        },
+        ...current,
+      ]),
+    );
+  }, []);
+
   const showNotice = useCallback((tone: NoticeTone, text: string) => {
+    appendAppLog(tone, text);
     if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
     setNotice({ tone, text });
     noticeTimer.current = window.setTimeout(() => {
       setNotice(null);
       noticeTimer.current = null;
     }, NOTICE_TIMEOUT_MS);
-  }, []);
+  }, [appendAppLog]);
 
   const reloadAccountsSoon = (delay = 1800) => {
     window.setTimeout(() => {
@@ -515,6 +574,11 @@ function App() {
     delete oauthPollTimers.current[provider];
   };
 
+  const closeImportModal = () => {
+    setIsImportModalOpen(false);
+    setMode(defaultImportMode);
+  };
+
   const applyImportResult = (
     result: BackendImportResult,
     options: { closeModal?: boolean; successText?: string } = {},
@@ -525,7 +589,7 @@ function App() {
         .catch(() => undefined)
         .finally(() => refreshImportedAccountStatus(result.imported));
       if (options.closeModal ?? true) {
-        setIsImportModalOpen(false);
+        closeImportModal();
         setPasteValue("");
       }
       showNotice("success", options.successText ?? `已添加 ${result.imported.length} 个账号`);
@@ -644,6 +708,7 @@ function App() {
   };
 
   const handleOAuthStart = async (provider: OAuthProvider) => {
+    clearOAuthPoll(provider);
     setIsBusy(true);
     try {
       const command = provider === "codex" ? "start_codex_oauth" : "start_gemini_oauth";
@@ -662,8 +727,14 @@ function App() {
   const ModeIcon = selectedMode.icon;
   const isActiveProviderOAuthPending = Boolean(pendingOAuth[activeProvider]);
   const oauthAccountLabel = activeProvider === "codex" ? "OpenAI" : "Gemini";
+  const localImportDesc =
+    activeProvider === "codex" ? "从本地已登录的会话中导入 Codex 账号" : "从本地已登录的会话中导入 Gemini Cli 账号";
   const selectedModeDesc =
-    mode === "oauth" ? `点击下方按钮，在浏览器中完成 ${oauthAccountLabel} 账号 OAuth 授权。` : selectedMode.desc;
+    mode === "oauth"
+      ? `点击下方按钮，在浏览器中完成 ${oauthAccountLabel} 账号 OAuth 授权。`
+      : mode === "local"
+        ? localImportDesc
+        : selectedMode.desc;
   const isInteractiveDragTarget = (target: EventTarget | null) =>
     target instanceof HTMLElement &&
     Boolean(target.closest("button, input, textarea, select, a, label, [role='button'], [contenteditable='true']"));
@@ -699,14 +770,15 @@ function App() {
     close();
   };
   const handleAddAccount = () => {
-    setMode("paste");
+    setMode(defaultImportMode);
     setIsImportModalOpen(true);
   };
   const handleSettings = () => {
     setIsSettingsOpen(true);
   };
   const handleLogs = () => {
-    showNotice("info", "日志功能待接入。");
+    setAppLogs((current) => pruneAppLogs(current));
+    setIsLogsOpen(true);
   };
   const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
     setSettings((current) => ({ ...current, [key]: value }));
@@ -833,6 +905,10 @@ function App() {
   }, [isSettingsLoaded, settings]);
 
   useEffect(() => {
+    persistAppLogs(appLogs);
+  }, [appLogs]);
+
+  useEffect(() => {
     const root = document.documentElement;
     if (settings.theme === "system") {
       delete root.dataset.theme;
@@ -843,7 +919,7 @@ function App() {
 
   return (
     <main
-      className={clsx("shell", settings.maskSensitive && "privacy-mask", (isImportModalOpen || isSettingsOpen || pendingDeleteAccount) && "modal-active")}
+      className={clsx("shell", settings.maskSensitive && "privacy-mask", (isImportModalOpen || isSettingsOpen || isLogsOpen || pendingDeleteAccount) && "modal-active")}
       onMouseDownCapture={handleShellTopDrag}
     >
       <div className="global-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
@@ -995,7 +1071,7 @@ function App() {
           description="选择添加方式"
           closeLabel="关闭添加账号"
           className="import-panel"
-          onClose={() => setIsImportModalOpen(false)}
+          onClose={closeImportModal}
         >
             <div className="mode-grid">
               {importModeOrder.map((key) => {
@@ -1045,7 +1121,7 @@ function App() {
                     onChange={(event) => handleFileImport(event.target.files)}
                   />
                   <button className={clsx("drop-zone", isFileImporting && "loading")} onClick={() => fileInputRef.current?.click()} disabled={isBusy}>
-                    <Upload size={28} className={clsx(isFileImporting && "spin")} />
+                    <Upload size={28} />
                     <strong>{isFileImporting ? "正在导入 JSON..." : "选择 JSON 文件"}</strong>
                     <span>{isFileImporting ? "正在解析并刷新账号信息" : "支持 auth.json、oauth_creds.json、导出数组"}</span>
                   </button>
@@ -1055,7 +1131,7 @@ function App() {
               {mode === "local" && (
                 <>
                   <button className="drop-zone local-import-button" onClick={() => handleLocalImport(activeProvider)} disabled={isBusy}>
-                    <FolderDown size={28} className={clsx(isBusy && "spin")} />
+                    <FolderDown size={28} />
                     <strong>{isBusy ? "正在读取本机账号..." : `读取 ${providerLabel(activeProvider)} 本机账号`}</strong>
                     <span>{providerLabel(activeProvider)} 本机凭证只在当前设备处理</span>
                   </button>
@@ -1064,10 +1140,10 @@ function App() {
 
               {mode === "oauth" && (
                 <div className="oauth-flow">
-                  <button className={clsx("drop-zone", isActiveProviderOAuthPending && "loading")} onClick={() => handleOAuthStart(activeProvider)} disabled={isBusy || isActiveProviderOAuthPending}>
-                    <LockKeyhole size={28} className={clsx(isActiveProviderOAuthPending && "spin")} />
-                    <strong>在浏览器中打开</strong>
-                    <span>{isActiveProviderOAuthPending ? "等待浏览器授权完成" : `${oauthAccountLabel} OAuth 授权将在浏览器中完成`}</span>
+                  <button className={clsx("drop-zone", isActiveProviderOAuthPending && "oauth-pending")} onClick={() => handleOAuthStart(activeProvider)}>
+                    <LockKeyhole size={28} />
+                    <strong>{isActiveProviderOAuthPending ? "重新打开授权" : "在浏览器中打开"}</strong>
+                    <span>{isActiveProviderOAuthPending ? "浏览器关闭或卡住时可重新发起" : `${oauthAccountLabel} OAuth 授权将在浏览器中完成`}</span>
                   </button>
                 </div>
               )}
@@ -1158,6 +1234,42 @@ function App() {
 
               <p className="setting-note">开机自启会在接入 Tauri 后端后写入系统登录项；当前面板已保留配置入口。</p>
             </div>
+        </AppModal>
+      )}
+
+      {isLogsOpen && (
+        <AppModal
+          title="日志"
+          description="仅保留最近 3 天的本机操作记录"
+          closeLabel="关闭日志"
+          className="logs-panel"
+          onClose={() => setIsLogsOpen(false)}
+        >
+          <div className="logs-body">
+            {appLogs.length === 0 ? (
+              <div className="logs-empty">
+                <ScrollText size={42} strokeWidth={1.4} />
+                <strong>暂无日志</strong>
+                <p>成功、错误和提示信息会自动记录在这里。</p>
+              </div>
+            ) : (
+              <div className="log-list">
+                {appLogs.map((log) => (
+                  <article className="log-row" key={log.id}>
+                    <span className="log-dot" data-tone={log.tone} />
+                    <div>
+                      <div className="log-meta">
+                        <strong>{noticeToneConfig[log.tone].label}</strong>
+                        <time>{formatDateTime(Math.floor(log.createdAt / 1000))}</time>
+                      </div>
+                      <p>{log.text}</p>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+            <p className="log-note">日志只存储在本机，超过 3 天会自动清理。</p>
+          </div>
         </AppModal>
       )}
 
