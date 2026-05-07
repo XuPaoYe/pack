@@ -210,9 +210,6 @@ fn set_account_current_state(
     let mut accounts = read_accounts_from_conn(conn)?;
     let now = now_ts();
     for account in &mut accounts {
-        if account.provider != provider {
-            continue;
-        }
         if account.id == account_id {
             account.status = Some(AccountStatus {
                 state: "available".to_string(),
@@ -227,23 +224,18 @@ fn set_account_current_state(
             .map(|status| status.label.as_str() == "当前")
             .unwrap_or(false)
         {
-            account.status = Some(AccountStatus {
-                state: "available".to_string(),
-                label: "可用".to_string(),
-                reason: None,
-                updated_at: Some(now),
-            });
+            mark_account_available(account);
             account.updated_at = now;
         }
     }
 
-    for account in accounts.iter().filter(|account| account.provider == provider) {
+    for account in &accounts {
         upsert_account(conn, account)?;
     }
 
     Ok(accounts
         .into_iter()
-        .filter(|account| account.provider == provider)
+        .filter(|account| account.provider == provider || account.id == account_id)
         .collect())
 }
 
@@ -280,21 +272,40 @@ fn mark_account_current(account: &mut ManagedAccount) {
     });
 }
 
-fn persist_local_import_as_current(
-    app: &tauri::AppHandle,
-    result: &mut ImportResult,
-) -> Result<(), String> {
-    if result.imported.is_empty() {
+fn mark_account_available(account: &mut ManagedAccount) {
+    account.status = Some(AccountStatus {
+        state: "available".to_string(),
+        label: "可用".to_string(),
+        reason: None,
+        updated_at: Some(now_ts()),
+    });
+}
+
+fn enforce_single_current_account(conn: &Connection) -> Result<(), String> {
+    let mut accounts = read_accounts_from_conn(conn)?;
+    let mut current_ids = accounts
+        .iter()
+        .filter(|account| is_current_status(&account.status))
+        .map(|account| (account.id.clone(), account.updated_at))
+        .collect::<Vec<_>>();
+    if current_ids.len() <= 1 {
         return Ok(());
     }
 
-    let current_id = result.imported[0].id.clone();
-    let provider = result.imported[0].provider.clone();
-    let conn = open_app_db(app)?;
-    for account in &result.imported {
-        upsert_account(&conn, account)?;
+    current_ids.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let keep_id = current_ids[0].0.clone();
+    for account in &mut accounts {
+        if account.id != keep_id && is_current_status(&account.status) {
+            mark_account_available(account);
+            let account_json = serde_json::to_string(account)
+                .map_err(|error| format!("序列化账号失败: {error}"))?;
+            conn.execute(
+                "UPDATE accounts SET account_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![account_json, account.updated_at, account.id],
+            )
+            .map_err(|error| format!("清理当前账号状态失败: {error}"))?;
+        }
     }
-    result.imported = set_account_current_state(&conn, &provider, &current_id)?;
     Ok(())
 }
 
@@ -316,6 +327,21 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
         if let Ok(existing) = load_account_from_db(conn, &account.id) {
             if existing.provider == account.provider && is_current_status(&existing.status) {
                 mark_account_current(&mut account_to_write);
+            }
+        }
+    }
+    if is_current_status(&account_to_write.status) {
+        let mut accounts = read_accounts_from_conn(conn)?;
+        for existing in &mut accounts {
+            if existing.id != account_to_write.id && is_current_status(&existing.status) {
+                mark_account_available(existing);
+                let existing_json = serde_json::to_string(existing)
+                    .map_err(|error| format!("序列化账号失败: {error}"))?;
+                conn.execute(
+                    "UPDATE accounts SET account_json = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![existing_json, existing.updated_at, existing.id],
+                )
+                .map_err(|error| format!("清理当前账号状态失败: {error}"))?;
             }
         }
     }
@@ -361,6 +387,7 @@ fn upsert_accounts_into_db(
     for account in accounts {
         upsert_account(&tx, account)?;
     }
+    enforce_single_current_account(&tx)?;
     tx.commit()
         .map_err(|error| format!("提交 SQLite 事务失败: {error}"))?;
     Ok(())
@@ -1610,6 +1637,7 @@ fn start_window_drag(window: tauri::Window) -> Result<(), String> {
 #[tauri::command]
 fn list_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
+    enforce_single_current_account(&conn)?;
     read_accounts_from_conn(&conn)
 }
 
@@ -1782,7 +1810,7 @@ fn import_codex_from_local(app: tauri::AppHandle) -> Result<ImportResult, String
         }];
         return Ok(result);
     }
-    persist_local_import_as_current(&app, &mut result)?;
+    upsert_accounts_into_db(&app, &result.imported)?;
     refresh_imported_accounts_in_background(app, result.imported.clone());
     Ok(result)
 }
@@ -1828,8 +1856,8 @@ fn import_gemini_from_local(app: tauri::AppHandle) -> Result<ImportResult, Strin
         }
     }
 
-    let mut result = parse_auth_json_content(&oauth_value.to_string(), "local", "Gemini 本机账号");
-    persist_local_import_as_current(&app, &mut result)?;
+    let result = parse_auth_json_content(&oauth_value.to_string(), "local", "Gemini 本机账号");
+    upsert_accounts_into_db(&app, &result.imported)?;
     refresh_imported_accounts_in_background(app, result.imported.clone());
     Ok(result)
 }

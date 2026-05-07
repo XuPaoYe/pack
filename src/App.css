@@ -1836,6 +1836,7 @@ textarea:focus {
   place-items: center;
   align-content: center;
   gap: 10px;
+  min-height: 210px;
 }
 
 .drop-zone svg {

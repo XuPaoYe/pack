@@ -94,12 +94,12 @@ const modeConfig: Record<
   file: {
     icon: FileJson,
     title: "上传Json",
-    desc: "支持 auth.json、oauth_creds.json 和导出数组。",
+    desc: "支持 Auth.json、SuperAI 等多种格式",
   },
   local: {
     icon: Laptop,
     title: "读取本机",
-    desc: "桌面后端读取 ~/.codex/auth.json 与 ~/.gemini，本原型先展示流程。",
+    desc: "读取本地 codex 里的账号信息",
   },
   oauth: {
     icon: Cloud,
@@ -1064,18 +1064,13 @@ function App() {
               )}
 
               {mode === "local" && (
-                <div className="oauth-flow">
-                  <div>
-                    <span>1</span>
-                    <p>
-                      读取本机 {providerLabel(activeProvider)} 账号配置
-                    </p>
-                  </div>
-                  <button className="wide primary" onClick={() => handleLocalImport(activeProvider)} disabled={isBusy}>
-                    <FolderDown size={20} />
-                    读取 {providerLabel(activeProvider)} 本机账号
+                <>
+                  <button className="drop-zone local-import-button" onClick={() => handleLocalImport(activeProvider)} disabled={isBusy}>
+                    <FolderDown size={28} className={clsx(isBusy && "spin")} />
+                    <strong>{isBusy ? "正在读取本机账号..." : `读取 ${providerLabel(activeProvider)} 本机账号`}</strong>
+                    <span>{providerLabel(activeProvider)} 本机凭证只在当前设备处理</span>
                   </button>
-                </div>
+                </>
               )}
 
               {mode === "oauth" && (
