@@ -81,17 +81,17 @@ const modeConfig: Record<
   },
   file: {
     icon: FileJson,
-    title: "选择 JSON 文件",
+    title: "上传Json",
     desc: "支持 auth.json、oauth_creds.json 和导出数组。",
   },
   local: {
     icon: Laptop,
-    title: "读取本机账号",
+    title: "读取本机",
     desc: "桌面后端读取 ~/.codex/auth.json 与 ~/.gemini，本原型先展示流程。",
   },
   oauth: {
     icon: Cloud,
-    title: "OAuth 授权",
+    title: "OAuth授权",
     desc: "通过本地 Callback 完成授权；Codex 与 Gemini 将分别走官方 OAuth。",
   },
 };
@@ -576,15 +576,32 @@ function App() {
   const selectedMode = modeConfig[mode];
   const ModeIcon = selectedMode.icon;
   const isActiveProviderOAuthPending = Boolean(pendingOAuth[activeProvider]);
-  const startWindowDrag = (event: React.MouseEvent<HTMLElement>) => {
-    if (event.target instanceof HTMLElement && event.target.closest("button, input, textarea, select, a, label")) return;
-    if (event.button !== 0) return;
-    event.preventDefault();
+  const isInteractiveDragTarget = (target: EventTarget | null) =>
+    target instanceof HTMLElement &&
+    Boolean(target.closest("button, input, textarea, select, a, label, [role='button'], [contenteditable='true']"));
+
+  const requestWindowDrag = () => {
     void invoke("start_window_drag").catch(() => {
       void appWindow?.startDragging().catch(() => {
         console.info("窗口拖拽未启动：请拖动窗口顶部空白区域。");
       });
     });
+  };
+
+  const startWindowDrag = (event: React.MouseEvent<HTMLElement>) => {
+    if (isInteractiveDragTarget(event.target)) return;
+    if (event.button !== 0) return;
+    event.preventDefault();
+    requestWindowDrag();
+  };
+  const handleShellTopDrag = (event: React.MouseEvent<HTMLElement>) => {
+    if (event.button !== 0 || event.clientY > 70) return;
+    if (event.clientX < 280 && window.innerWidth > 980) return;
+    if (isInteractiveDragTarget(event.target)) return;
+    if (event.target instanceof HTMLElement && event.target.closest(".modal-content")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    requestWindowDrag();
   };
   const handleModalBackdropMouseDown = (
     event: React.MouseEvent<HTMLDivElement>,
@@ -734,9 +751,12 @@ function App() {
   }, [settings.theme]);
 
   return (
-    <main className={clsx("shell", settings.maskSensitive && "privacy-mask")}>
+    <main
+      className={clsx("shell", settings.maskSensitive && "privacy-mask", (isImportModalOpen || isSettingsOpen || pendingDeleteAccount) && "modal-active")}
+      onMouseDownCapture={handleShellTopDrag}
+    >
       <div className="global-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
-      <div className="top-edge-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
+      <div className="top-edge-drag-region" />
       <aside className="sidebar">
         <div className="window-strip drag-surface" data-tauri-drag-region onMouseDown={startWindowDrag} />
         <div className="brand">
@@ -880,7 +900,7 @@ function App() {
       {isImportModalOpen && (
         <div className="modal-overlay">
           <aside className="import-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="panel-head drag-surface" data-tauri-drag-region onMouseDown={startWindowDrag}>
+            <div className="panel-head">
               <div>
                 <h2>添加账号</h2>
                 <p>选择添加方式</p>
@@ -997,7 +1017,7 @@ function App() {
       {isSettingsOpen && (
         <div className="modal-overlay" onMouseDown={(event) => handleModalBackdropMouseDown(event, () => setIsSettingsOpen(false))}>
           <aside className="settings-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="panel-head drag-surface" data-tauri-drag-region onMouseDown={startWindowDrag}>
+            <div className="panel-head">
               <div>
                 <h2>设置</h2>
                 <p>外观、启动和本地隐私</p>
