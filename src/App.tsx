@@ -1231,8 +1231,6 @@ function App() {
                   <i />
                 </button>
               </section>
-
-              <p className="setting-note">开机自启会在接入 Tauri 后端后写入系统登录项；当前面板已保留配置入口。</p>
             </div>
         </AppModal>
       )}
