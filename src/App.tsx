@@ -89,7 +89,7 @@ const modeConfig: Record<
   paste: {
     icon: Clipboard,
     title: "粘贴凭证",
-    desc: "适合从 Codex auth.json、Gemini oauth_creds.json 或导出数组快速添加。",
+    desc: "粘贴 Auth.json 内容或账号 Json 数据",
   },
   file: {
     icon: FileJson,
@@ -99,12 +99,12 @@ const modeConfig: Record<
   local: {
     icon: Laptop,
     title: "读取本机",
-    desc: "读取本地 codex 里的账号信息",
+    desc: "读取本地 Codex 里的账号信息",
   },
   oauth: {
     icon: Cloud,
     title: "OAuth授权",
-    desc: "通过本地 Callback 完成授权；Codex 与 Gemini 将分别走官方 OAuth。",
+    desc: "点击下方按钮，在浏览器中完成 OpenAI 账号 OAuth 授权。",
   },
 };
 
@@ -633,7 +633,7 @@ function App() {
   const scheduleOAuthPoll = (provider: OAuthProvider, loginId: string, attempt = 0) => {
     clearOAuthPoll(provider);
     if (attempt >= 90) {
-      showNotice("info", `${providerLabel(provider)} OAuth 仍在等待完成，可点击“完成添加”重试。`);
+      showNotice("info", `${providerLabel(provider)} OAuth 仍在等待完成，可再次在浏览器中打开授权。`);
       return;
     }
     oauthPollTimers.current[provider] = window.setTimeout(() => {
@@ -658,23 +658,12 @@ function App() {
     }
   };
 
-  const handleOAuthComplete = async (provider: OAuthProvider) => {
-    const loginId = pendingOAuth[provider];
-    if (!loginId) {
-      showNotice("info", `请先启动 ${providerLabel(provider)} OAuth。`);
-      return;
-    }
-    setIsBusy(true);
-    try {
-      await completeOAuth(provider, loginId);
-    } finally {
-      setIsBusy(false);
-    }
-  };
-
   const selectedMode = modeConfig[mode];
   const ModeIcon = selectedMode.icon;
   const isActiveProviderOAuthPending = Boolean(pendingOAuth[activeProvider]);
+  const oauthAccountLabel = activeProvider === "codex" ? "OpenAI" : "Gemini";
+  const selectedModeDesc =
+    mode === "oauth" ? `点击下方按钮，在浏览器中完成 ${oauthAccountLabel} 账号 OAuth 授权。` : selectedMode.desc;
   const isInteractiveDragTarget = (target: EventTarget | null) =>
     target instanceof HTMLElement &&
     Boolean(target.closest("button, input, textarea, select, a, label, [role='button'], [contenteditable='true']"));
@@ -1026,7 +1015,7 @@ function App() {
                 <ModeIcon size={24} />
                 <div>
                   <strong>{selectedMode.title}</strong>
-                  <p>{selectedMode.desc}</p>
+                  <p>{selectedModeDesc}</p>
                 </div>
               </div>
 
@@ -1075,19 +1064,10 @@ function App() {
 
               {mode === "oauth" && (
                 <div className="oauth-flow">
-                  <div>
-                    <span>1</span>
-                    <p>
-                      启动 {providerLabel(activeProvider)} OAuth 登录
-                    </p>
-                  </div>
-                  <button className="wide primary" onClick={() => handleOAuthStart(activeProvider)} disabled={isBusy || isActiveProviderOAuthPending}>
-                    <LockKeyhole size={20} />
-                    {isActiveProviderOAuthPending ? "等待授权完成..." : `启动 ${providerLabel(activeProvider)} OAuth`}
-                  </button>
-                  <button className="wide" onClick={() => handleOAuthComplete(activeProvider)} disabled={isBusy || !isActiveProviderOAuthPending}>
-                    <BadgeCheck size={20} />
-                    我已完成授权，立即添加
+                  <button className={clsx("drop-zone", isActiveProviderOAuthPending && "loading")} onClick={() => handleOAuthStart(activeProvider)} disabled={isBusy || isActiveProviderOAuthPending}>
+                    <LockKeyhole size={28} className={clsx(isActiveProviderOAuthPending && "spin")} />
+                    <strong>在浏览器中打开</strong>
+                    <span>{isActiveProviderOAuthPending ? "等待浏览器授权完成" : `${oauthAccountLabel} OAuth 授权将在浏览器中完成`}</span>
                   </button>
                 </div>
               )}
