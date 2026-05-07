@@ -7,6 +7,8 @@ import {
   BadgeCheck,
   Bot,
   CalendarDays,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
   CirclePlay,
   Clipboard,
@@ -75,6 +77,7 @@ const NOTICE_TIMEOUT_MS = 7000;
 const APP_LOG_STORAGE_KEY = "super-ai:app-logs";
 const APP_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 const APP_LOG_LIMIT = 300;
+const ACCOUNT_PAGE_SIZE = 12;
 
 const noticeToneConfig: Record<NoticeTone, { icon: typeof Info; label: string }> = {
   success: { icon: BadgeCheck, label: "成功" },
@@ -260,7 +263,7 @@ function formatValidityText(account: ManagedAccount) {
     return { label: "有效期", detail: "--", title: account.status?.reason };
   }
   const until = resolveValidityUntil(account);
-  if (until === undefined || until <= 0) return { label: "有效期", detail: "未知" };
+  if (until === undefined || until <= 0) return { label: "有效期", detail: "--" };
   const now = Math.floor(Date.now() / 1000);
   const remaining = until - now;
   if (remaining <= 0) {
@@ -413,6 +416,7 @@ function App() {
   const [pasteValue, setPasteValue] = useState("");
   const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
+  const [accountPage, setAccountPage] = useState(1);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
@@ -458,6 +462,14 @@ function App() {
     }));
   }, [accounts, activeProvider, query]);
 
+  const totalAccountPages = Math.max(1, Math.ceil(filteredAccounts.length / ACCOUNT_PAGE_SIZE));
+  const currentAccountPage = Math.min(accountPage, totalAccountPages);
+  const shouldShowAccountPagination = filteredAccounts.length > ACCOUNT_PAGE_SIZE;
+  const pagedAccounts = useMemo(() => {
+    const start = (currentAccountPage - 1) * ACCOUNT_PAGE_SIZE;
+    return filteredAccounts.slice(start, start + ACCOUNT_PAGE_SIZE);
+  }, [filteredAccounts, currentAccountPage]);
+
   const counts = useMemo(
     () => ({
       codex: accounts.filter((account) => account.provider === "codex").length,
@@ -500,7 +512,7 @@ function App() {
       resizeObserver?.disconnect();
       window.removeEventListener("resize", updateAccountScrollbar);
     };
-  }, [filteredAccounts.length, activeProvider, query, updateAccountScrollbar]);
+  }, [pagedAccounts.length, activeProvider, query, currentAccountPage, updateAccountScrollbar]);
 
   const closeNotice = useCallback(() => {
     if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
@@ -592,6 +604,7 @@ function App() {
         closeImportModal();
         setPasteValue("");
       }
+      setAccountPage(1);
       showNotice("success", options.successText ?? `已添加 ${result.imported.length} 个账号`);
     } else if (result.failed.length > 0) {
       showNotice("error", result.failed[0]?.reason ?? "未添加账号");
@@ -773,6 +786,14 @@ function App() {
     setMode(defaultImportMode);
     setIsImportModalOpen(true);
   };
+  const handleProviderChange = (provider: Provider) => {
+    setActiveProvider(provider);
+    setAccountPage(1);
+  };
+  const handleSearchChange = (value: string) => {
+    setQuery(value);
+    setAccountPage(1);
+  };
   const handleSettings = () => {
     setIsSettingsOpen(true);
   };
@@ -791,6 +812,7 @@ function App() {
       setAccounts((current) =>
         sortAccountsForView(current.map((item) => providerAccounts.find((changed) => changed.id === item.id) ?? item)),
       );
+      setAccountPage(1);
       showNotice("success", `已启用 ${account.email}`);
     } catch (error) {
       showNotice("error", `启用账号失败：${String(error)}`);
@@ -937,12 +959,12 @@ function App() {
         </div>
 
         <nav className="nav-list" aria-label="Providers">
-            <button className={clsx(activeProvider === "codex" && "active")} onClick={() => setActiveProvider("codex")}>
+            <button className={clsx(activeProvider === "codex" && "active")} onClick={() => handleProviderChange("codex")}>
             <Bot size={20} />
             <span>Codex</span>
             <b>{counts.codex}</b>
           </button>
-          <button className={clsx(activeProvider === "gemini" && "active")} onClick={() => setActiveProvider("gemini")}>
+          <button className={clsx(activeProvider === "gemini" && "active")} onClick={() => handleProviderChange("gemini")}>
             <Fingerprint size={20} />
             <span>Gemini Cli</span>
             <b>{counts.gemini}</b>
@@ -979,7 +1001,7 @@ function App() {
               <div className="panel-actions">
                 <label className="search">
                   <Search size={18} />
-                  <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索邮箱、计划或账号 ID" />
+                  <input value={query} onChange={(event) => handleSearchChange(event.target.value)} placeholder="搜索邮箱、计划或账号 ID" />
                 </label>
                 <button className="primary" onClick={handleAddAccount}>
                   <Plus size={18} />
@@ -991,67 +1013,94 @@ function App() {
                 </button>
               </div>
             </div>
-            <div className="account-scroll-shell">
-              <div className="account-list card-mode" ref={accountListRef} onScroll={updateAccountScrollbar}>
-                {filteredAccounts.length === 0 && (
-                  <div className="empty-state">
-                    <FileJson size={54} strokeWidth={1.35} />
-                    <strong>暂无账号</strong>
-                  </div>
-                )}
-                {filteredAccounts.map((account) => (
-                  <article className={clsx("account-row", account.status?.state === "unavailable" && "disabled", isCurrentAccount(account) && "current")} key={account.id}>
-                    <AccountStateCorner account={account} />
-                    <div className="account-main">
-                      <div className="account-title">
-                        <strong>{account.displayName || account.email}</strong>
-                        <AccountPlanBadge account={account} />
+            <div className="account-scroll-frame">
+              <div className="account-scroll-shell" ref={accountListRef} onScroll={updateAccountScrollbar}>
+                <div className="account-list card-mode">
+                  {filteredAccounts.length === 0 && (
+                    <div className="empty-state">
+                      <FileJson size={54} strokeWidth={1.35} />
+                      <strong>暂无账号</strong>
+                    </div>
+                  )}
+                  {pagedAccounts.map((account) => (
+                    <article className={clsx("account-row", account.status?.state === "unavailable" && "disabled", isCurrentAccount(account) && "current")} key={account.id}>
+                      <AccountStateCorner account={account} />
+                      <div className="account-main">
+                        <div className="account-title">
+                          <strong>{account.displayName || account.email}</strong>
+                          <AccountPlanBadge account={account} />
+                        </div>
+                        <div className="account-subtitle">
+                          <span>
+                            <b>邮箱</b>
+                            {account.email}
+                          </span>
+                          {account.accountId && (
+                            <span>
+                              <b>账号</b>
+                              {account.accountId}
+                            </span>
+                          )}
+                          {account.organizationId && (
+                            <span>
+                              <b>组织</b>
+                              {account.organizationId}
+                            </span>
+                          )}
+                        </div>
                       </div>
-                      <div className="account-subtitle">
-                        <span>
-                          <b>邮箱</b>
-                          {account.email}
-                        </span>
-                        {account.accountId && (
-                          <span>
-                            <b>账号</b>
-                            {account.accountId}
-                          </span>
-                        )}
-                        {account.organizationId && (
-                          <span>
-                            <b>组织</b>
-                            {account.organizationId}
-                          </span>
-                        )}
+                      <QuotaMeters account={account} />
+                      <ValidityMeter account={account} />
+                      <div className="account-footer">
+                        <time className="account-stamp">{account.status?.state === "unavailable" ? "--" : formatRelative(account.updatedAt)}</time>
+                        <div className="account-actions">
+                        <button
+                          className="icon-button"
+                          aria-label={isCurrentAccount(account) ? "停用当前账号" : "设为当前账号"}
+                          title={isCurrentAccount(account) ? "停用" : "设为当前"}
+                          onClick={() => handleToggleAccount(account)}
+                        >
+                          <CirclePlay size={15} strokeWidth={1.75} />
+                        </button>
+                        <button className="icon-button" aria-label="刷新账号" title="刷新" onClick={() => handleRefreshAccount(account)} disabled={refreshingAccountIds.has(account.id)}>
+                          <RefreshCcw size={15} strokeWidth={1.75} className={clsx(refreshingAccountIds.has(account.id) && "spin")} />
+                        </button>
+                        <button className="icon-button" aria-label="导出账号" title="导出" onClick={() => void handleExportAccount(account)}>
+                          <FileDown size={15} strokeWidth={1.75} />
+                        </button>
+                        <button className="icon-button danger" aria-label="删除账号" title="删除" onClick={() => handleDeleteAccount(account)}>
+                          <Trash size={15} strokeWidth={1.75} />
+                        </button>
+                        </div>
+                      </div>
+                    </article>
+                  ))}
+                  {shouldShowAccountPagination && (
+                    <div className="account-pagination" aria-label="账号分页">
+                      <span>
+                        第 {currentAccountPage} / {totalAccountPages} 页 · 每页 {ACCOUNT_PAGE_SIZE} 个
+                      </span>
+                      <div>
+                        <button
+                          className="secondary pagination-button"
+                          onClick={() => setAccountPage((page) => Math.max(1, Math.min(page, totalAccountPages) - 1))}
+                          disabled={currentAccountPage <= 1}
+                        >
+                          <ChevronLeft size={16} />
+                          上一页
+                        </button>
+                        <button
+                          className="secondary pagination-button"
+                          onClick={() => setAccountPage((page) => Math.min(totalAccountPages, Math.max(page, 1) + 1))}
+                          disabled={currentAccountPage >= totalAccountPages}
+                        >
+                          下一页
+                          <ChevronRight size={16} />
+                        </button>
                       </div>
                     </div>
-                    <QuotaMeters account={account} />
-                    <ValidityMeter account={account} />
-                    <div className="account-footer">
-                      <time className="account-stamp">{account.status?.state === "unavailable" ? "--" : formatRelative(account.updatedAt)}</time>
-                      <div className="account-actions">
-                      <button
-                        className="icon-button"
-                        aria-label={isCurrentAccount(account) ? "停用当前账号" : "设为当前账号"}
-                        title={isCurrentAccount(account) ? "停用" : "设为当前"}
-                        onClick={() => handleToggleAccount(account)}
-                      >
-                        <CirclePlay size={15} strokeWidth={1.75} />
-                      </button>
-                      <button className="icon-button" aria-label="刷新账号" title="刷新" onClick={() => handleRefreshAccount(account)} disabled={refreshingAccountIds.has(account.id)}>
-                        <RefreshCcw size={15} strokeWidth={1.75} className={clsx(refreshingAccountIds.has(account.id) && "spin")} />
-                      </button>
-                      <button className="icon-button" aria-label="导出账号" title="导出" onClick={() => void handleExportAccount(account)}>
-                        <FileDown size={15} strokeWidth={1.75} />
-                      </button>
-                      <button className="icon-button danger" aria-label="删除账号" title="删除" onClick={() => handleDeleteAccount(account)}>
-                        <Trash size={15} strokeWidth={1.75} />
-                      </button>
-                      </div>
-                    </div>
-                  </article>
-                ))}
+                  )}
+                </div>
               </div>
               <div className={clsx("account-scrollbar", accountScrollbar.visible && "visible")} aria-hidden="true">
                 <i style={{ height: accountScrollbar.height, transform: `translateY(${accountScrollbar.top}px)` }} />

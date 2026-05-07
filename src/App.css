@@ -571,18 +571,18 @@ h2 {
   max-width: 100%;
 }
 
-.account-scroll-shell {
+.account-scroll-frame {
   position: relative;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
 }
 
-.account-list.card-mode {
-  align-content: start;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
+.account-scroll-shell {
+  width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
   padding: 0 18px 0 0;
   overflow-y: scroll;
   overflow-x: hidden;
@@ -590,7 +590,13 @@ h2 {
   scrollbar-width: none;
 }
 
-.account-list.card-mode::-webkit-scrollbar {
+.account-list.card-mode {
+  align-content: start;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.account-scroll-shell::-webkit-scrollbar {
   width: 0;
   height: 0;
   display: none;
@@ -644,6 +650,52 @@ h2 {
     0 1px 2px color-mix(in srgb, var(--surface) 55%, transparent),
     inset 0 0 0 1px color-mix(in srgb, var(--surface) 42%, transparent);
   will-change: transform;
+}
+
+.account-pagination {
+  grid-column: 1 / -1;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--control) 72%, transparent), color-mix(in srgb, var(--surface) 84%, transparent)),
+    color-mix(in srgb, var(--panel) 76%, transparent);
+  box-shadow: 0 1px 4px rgba(15, 23, 42, 0.03);
+}
+
+.account-pagination span {
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.account-pagination div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pagination-button {
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 10px;
+  font-size: 12px;
+  line-height: 1;
+}
+
+.pagination-button svg {
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
 }
 
 .empty-state {
