@@ -8,8 +8,8 @@
     "web:dev": "vite",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build --bundles app",
-    "tauri:build:dmg": "tauri build --bundles dmg",
+    "tauri:build": "node scripts/tauri-build.mjs app",
+    "tauri:build:dmg": "node scripts/tauri-build.mjs dmg",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
@@ -17,6 +17,8 @@
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-opener": "^2.5.4",
+    "@tauri-apps/plugin-process": "^2.3.1",
+    "@tauri-apps/plugin-updater": "^2.10.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.14.0",
     "react": "^19.2.5",

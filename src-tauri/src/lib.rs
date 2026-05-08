@@ -2137,7 +2137,8 @@ fn respond_oauth_redirect(request: tiny_http::Request, location: &str) {
 fn notify_oauth_listener_cancel(port: u16) {
     if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
         use std::io::Write;
-        let _ = stream.write_all(b"GET /cancel HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let _ = stream
+            .write_all(b"GET /cancel HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
         let _ = stream.flush();
     }
 }
@@ -3086,6 +3087,8 @@ async fn complete_gemini_oauth(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             Some(Vec::<&str>::new()),

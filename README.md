@@ -86,6 +86,26 @@ npm run tauri:build
 npm run tauri:build:dmg
 ```
 
+## 远程升级
+
+项目已接入 Tauri 2 官方 updater。生产环境启动时会检测新版本；如果远程存在新版本，界面会显示不可关闭的强制升级弹窗，升级完成后自动重启 APP。
+
+当前 updater 地址：
+
+```text
+https://ai.talentisan.cn/super-ai/latest.json
+```
+
+私钥保存在本机：
+
+```text
+/Users/xusanye/Documents/web/rearend/super_ai/src-tauri/updater-private.key
+```
+
+这个文件被 `.gitignore` 忽略，不要提交到仓库。`tauri build` 会生成 updater 所需的更新包和签名文件，发布时把 `latest.json` 和更新包上传到上面的静态地址即可。
+
+`npm run tauri:build` 和 `npm run tauri:build:dmg` 会自动读取这个私钥并完成 updater 签名。
+
 ## 本地预览生产包
 
 ```bash

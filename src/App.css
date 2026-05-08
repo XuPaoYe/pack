@@ -1586,6 +1586,104 @@ h2 {
   box-shadow: var(--modal-shadow);
 }
 
+.force-update-overlay {
+  z-index: 140;
+}
+
+.force-update-panel.modal-content {
+  width: min(420px, calc(100vw - 48px));
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  padding: 26px;
+  border: 1px solid var(--modal-line);
+  border-radius: 14px;
+  background: var(--modal-panel);
+  box-shadow: var(--modal-shadow);
+}
+
+.force-update-icon {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.force-update-copy {
+  display: grid;
+  gap: 8px;
+  text-align: center;
+}
+
+.force-update-copy h2 {
+  color: var(--text-strong);
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.force-update-copy p {
+  max-width: 320px;
+  color: var(--text-soft);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.force-update-progress {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+}
+
+.force-update-progress div {
+  display: flex;
+  justify-content: space-between;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.force-update-progress b {
+  color: var(--text-strong);
+}
+
+.force-update-progress i {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface-soft));
+}
+
+.force-update-progress i span {
+  display: block;
+  height: 100%;
+  min-width: 8px;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.force-update-error {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(220, 38, 38, 0.24);
+  border-radius: 8px;
+  background: rgba(220, 38, 38, 0.08);
+  color: #b91c1c;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.force-update-button {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
 .confirm-icon {
   width: 46px;
   height: 46px;

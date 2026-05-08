@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { relaunch } from "@tauri-apps/plugin-process";
+import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import clsx from "clsx";
 import {
   BadgeCheck,
@@ -76,6 +78,15 @@ type NoticeTone = "success" | "error" | "info";
 type Notice = { tone: NoticeTone; text: string };
 type AppLogEntry = { id: string; tone: NoticeTone; text: string; createdAt: number };
 type ExportPreview = { account: ManagedAccount; payload: string };
+type ForceUpdateState = {
+  update: Update;
+  phase: "ready" | "downloading" | "installing" | "error";
+  version: string;
+  currentVersion: string;
+  downloadedBytes: number;
+  totalBytes: number | null;
+  error?: string;
+};
 
 const NOTICE_TIMEOUT_MS = 7000;
 const APP_LOG_STORAGE_KEY = "super-ai:app-logs";
@@ -279,6 +290,51 @@ function NoticeToast({ notice, onClose }: { notice: Notice; onClose: () => void 
   );
 }
 
+function formatBytes(bytes: number) {
+  if (bytes <= 0) return "0 KB";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** index;
+  return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
+function ForceUpdateModal({ state, onInstall }: { state: ForceUpdateState; onInstall: () => void }) {
+  const progressPercent = state.totalBytes ? Math.min(100, Math.round((state.downloadedBytes / state.totalBytes) * 100)) : 0;
+  const isWorking = state.phase === "downloading" || state.phase === "installing";
+
+  return (
+    <div className="modal-overlay force-update-overlay">
+      <aside className="force-update-panel modal-content" role="alertdialog" aria-modal="true" aria-labelledby="force-update-title">
+        <div className="force-update-icon">
+          <Download size={24} strokeWidth={2.1} />
+        </div>
+        <div className="force-update-copy">
+          <h2 id="force-update-title">发现新版本</h2>
+          <p>
+            Super AI {state.version} 已可用，当前版本 {state.currentVersion}。必须升级后才能继续使用。
+          </p>
+        </div>
+        {(state.phase === "downloading" || state.phase === "installing") && (
+          <div className="force-update-progress" aria-label="升级进度">
+            <div>
+              <span>{state.phase === "installing" ? "正在安装" : "正在下载"}</span>
+              <b>{state.totalBytes ? `${progressPercent}%` : formatBytes(state.downloadedBytes)}</b>
+            </div>
+            <i>
+              <span style={{ width: state.totalBytes ? `${progressPercent}%` : "35%" }} />
+            </i>
+          </div>
+        )}
+        {state.phase === "error" && <p className="force-update-error">{state.error ?? "升级失败，请重试。"}</p>}
+        <button className="primary force-update-button" onClick={onInstall} disabled={isWorking}>
+          {state.phase === "error" ? <RotateCw size={18} /> : <Download size={18} />}
+          {state.phase === "error" ? "重试升级" : isWorking ? "升级中" : "立即升级"}
+        </button>
+      </aside>
+    </div>
+  );
+}
+
 function AppModal({
   title,
   description,
@@ -333,6 +389,7 @@ function App() {
   const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>(loadAppLogs);
+  const [forceUpdate, setForceUpdate] = useState<ForceUpdateState | null>(null);
   const [settings, setSettings] = useState<AppSettings>({
     theme: "system",
     autoLaunch: false,
@@ -356,6 +413,78 @@ function App() {
       return null;
     }
   }, []);
+
+  const installForceUpdate = useCallback(async () => {
+    if (!forceUpdate) return;
+    let downloadedBytes = 0;
+
+    try {
+      setForceUpdate((current) =>
+        current
+          ? {
+              ...current,
+              phase: "downloading",
+              downloadedBytes: 0,
+              totalBytes: null,
+              error: undefined,
+            }
+          : current,
+      );
+
+      const handleDownloadEvent = (event: DownloadEvent) => {
+        if (event.event === "Started") {
+          downloadedBytes = 0;
+          setForceUpdate((current) =>
+            current
+              ? {
+                  ...current,
+                  phase: "downloading",
+                  downloadedBytes: 0,
+                  totalBytes: event.data.contentLength ?? null,
+                }
+              : current,
+          );
+          return;
+        }
+
+        if (event.event === "Progress") {
+          downloadedBytes += event.data.chunkLength;
+          setForceUpdate((current) =>
+            current
+              ? {
+                  ...current,
+                  downloadedBytes,
+                }
+              : current,
+          );
+          return;
+        }
+
+        setForceUpdate((current) =>
+          current
+            ? {
+                ...current,
+                phase: "installing",
+                downloadedBytes: current.totalBytes ?? current.downloadedBytes,
+              }
+            : current,
+        );
+      };
+
+      await forceUpdate.update.downloadAndInstall(handleDownloadEvent);
+      await relaunch();
+    } catch (error) {
+      setForceUpdate((current) =>
+        current
+          ? {
+              ...current,
+              phase: "error",
+              error: `升级失败：${String(error)}`,
+            }
+          : current,
+      );
+    }
+  }, [forceUpdate]);
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -457,6 +586,44 @@ function App() {
       noticeTimer.current = null;
     }, NOTICE_TIMEOUT_MS);
   }, [appendAppLog]);
+
+  useEffect(() => {
+    if (import.meta.env.DEV || !isTauri()) return;
+    let isCancelled = false;
+
+    async function checkForUpdateOnLaunch() {
+      try {
+        const update = await check();
+        if (!update || isCancelled) return;
+        setForceUpdate({
+          update,
+          phase: "ready",
+          version: update.version,
+          currentVersion: update.currentVersion,
+          downloadedBytes: 0,
+          totalBytes: null,
+        });
+      } catch (error) {
+        if (!isCancelled) {
+          const message = String(error);
+          const isUpdaterUnconfigured =
+            message.includes("plugins > updater doesn't exist") ||
+            (message.includes("updater") && message.includes("configuration"));
+          if (isUpdaterUnconfigured) {
+            appendAppLog("info", "远程升级未配置，已跳过启动更新检测。");
+          } else {
+            showNotice("error", `检测更新失败：${message}`);
+          }
+        }
+      }
+    }
+
+    void checkForUpdateOnLaunch();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [appendAppLog, showNotice]);
 
   const reloadAccountsSoon = useCallback((delay = 1800) => {
     window.setTimeout(() => {
@@ -928,7 +1095,11 @@ function App() {
 
   return (
     <main
-      className={clsx("shell", settings.maskSensitive && "privacy-mask", (isImportModalOpen || isSettingsOpen || isLogsOpen || exportPreview || pendingDeleteAccount) && "modal-active")}
+      className={clsx(
+        "shell",
+        settings.maskSensitive && "privacy-mask",
+        (isImportModalOpen || isSettingsOpen || isLogsOpen || exportPreview || pendingDeleteAccount || forceUpdate) && "modal-active",
+      )}
       onMouseDownCapture={handleShellTopDrag}
     >
       <div className="global-drag-region" data-tauri-drag-region onMouseDown={startWindowDrag} />
@@ -1100,6 +1271,10 @@ function App() {
 
       {notice && (
         <NoticeToast notice={notice} onClose={closeNotice} />
+      )}
+
+      {forceUpdate && (
+        <ForceUpdateModal state={forceUpdate} onInstall={() => void installForceUpdate()} />
       )}
 
       {isImportModalOpen && (
