@@ -28,6 +28,7 @@ export type ManagedAccount = {
   quota?: AccountQuota;
   createdAt: number;
   updatedAt: number;
+  authPayload?: unknown;
 };
 
 export type AccountState = "available" | "warning" | "unavailable" | "unknown";
@@ -175,7 +176,7 @@ function parseCodexQuota(value: JsonObject): AccountQuota | undefined {
   if (weekly !== undefined) {
     metrics.push({
       key: "codex-weekly",
-      label: "WEEKLY",
+      label: "周限",
       remainingPercent: weekly,
       resetAt: numberField(quota?.weekly_reset_time ?? value.weekly_reset_time),
       state: quotaState(weekly),
@@ -388,6 +389,27 @@ function looksLikeWindsurf(value: JsonObject): boolean {
   const explicit = stringField(value.provider)?.toLowerCase();
   if (explicit === "windsurf") return true;
   const tokens = isObject(value.tokens) ? value.tokens : undefined;
+  const auth1Token =
+    stringField(value.auth1_token) ??
+    stringField(value.auth1Token) ??
+    stringField(value.devin_auth1_token) ??
+    stringField(value.devinAuth1Token) ??
+    stringField(tokens?.auth1_token) ??
+    stringField(tokens?.auth1Token) ??
+    stringField(tokens?.devin_auth1_token) ??
+    stringField(tokens?.devinAuth1Token);
+  const sessionToken =
+    stringField(value.session_token) ??
+    stringField(value.sessionToken) ??
+    stringField(value.devin_session_token) ??
+    stringField(value.devinSessionToken) ??
+    stringField(tokens?.session_token) ??
+    stringField(tokens?.sessionToken) ??
+    stringField(tokens?.devin_session_token) ??
+    stringField(tokens?.devinSessionToken);
+  if (auth1Token?.startsWith("auth1_") || sessionToken?.startsWith("devin-session-token$")) {
+    return true;
+  }
   if (
     stringField(value.local_id) ??
     stringField(value.localId) ??
@@ -439,14 +461,35 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
     stringField(tokens?.access_token) ??
     stringField(tokens?.accessToken) ??
     idToken;
+  const auth1Token =
+    stringField(value.auth1_token) ??
+    stringField(value.auth1Token) ??
+    stringField(value.devin_auth1_token) ??
+    stringField(value.devinAuth1Token) ??
+    stringField(tokens?.auth1_token) ??
+    stringField(tokens?.auth1Token) ??
+    stringField(tokens?.devin_auth1_token) ??
+    stringField(tokens?.devinAuth1Token);
+  const sessionToken =
+    stringField(value.session_token) ??
+    stringField(value.sessionToken) ??
+    stringField(value.devin_session_token) ??
+    stringField(value.devinSessionToken) ??
+    stringField(tokens?.session_token) ??
+    stringField(tokens?.sessionToken) ??
+    stringField(tokens?.devin_session_token) ??
+    stringField(tokens?.devinSessionToken);
 
-  if (!idToken && !refreshToken) return null;
+  if (!idToken && !refreshToken && !auth1Token && !sessionToken) return null;
 
   const jwt = parseJwtPayload(idToken);
+  const discriminatorToken = sessionToken ?? auth1Token ?? accessToken ?? refreshToken ?? idToken ?? "windsurf";
   const email =
     stringField(value.email) ??
-    stringField(jwt?.email);
-  if (!email) return null;
+    stringField(value.account) ??
+    stringField(value.active) ??
+    stringField(jwt?.email) ??
+    `windsurf-${stableHash(discriminatorToken).slice(0, 8)}@local`;
 
   const localId =
     stringField(value.local_id) ??
@@ -469,12 +512,12 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
 
   const now = nowUnixSeconds();
   const tokenMeta = {
-    hasAccessToken: Boolean(accessToken),
+    hasAccessToken: Boolean(accessToken || sessionToken || auth1Token),
     hasRefreshToken: Boolean(refreshToken),
     hasIdToken: Boolean(idToken),
     expiresAt,
   };
-  const discriminator = localId ?? email;
+  const discriminator = localId ?? sessionToken ?? auth1Token ?? email;
   const plan =
     stringField(value.plan) ??
     stringField(value.plan_type) ??
@@ -495,6 +538,20 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
     status: deriveStatus(value, tokenMeta),
     createdAt: numberField(value.created_at) ?? now,
     updatedAt: numberField(value.last_used) ?? numberField(value.updated_at) ?? now,
+    authPayload: {
+      provider: "windsurf",
+      email: email.toLowerCase(),
+      display_name: displayName,
+      tokens: {
+        id_token: idToken,
+        refresh_token: refreshToken,
+        access_token: accessToken,
+        auth1_token: auth1Token,
+        session_token: sessionToken,
+        local_id: localId,
+        expires_at: expiresAt,
+      },
+    },
   };
 }
 

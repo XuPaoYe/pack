@@ -53,6 +53,34 @@ const WINDSURF_FIREBASE_SIGNIN_URL: &str =
 const WINDSURF_FIREBASE_REFRESH_URL: &str = "https://securetoken.googleapis.com/v1/token";
 const WINDSURF_FIREBASE_LOOKUP_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:lookup";
+const DEVIN_AUTH_BASE_URL: &str = "https://windsurf.com/_devin-auth";
+const DEVIN_APP_AUTH_BASE_URL: &str = "https://app.devin.ai/api/auth1";
+const WINDSURF_BACKEND_URL: &str = "https://web-backend.windsurf.com";
+
+#[derive(Debug, Deserialize)]
+struct DevinPasswordLoginResponse {
+    #[serde(alias = "token", alias = "auth1Token", alias = "auth_token")]
+    auth1_token: String,
+    #[serde(default, alias = "user_id", alias = "userId", alias = "accountId")]
+    account_id: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WindsurfPostAuthResult {
+    session_token: String,
+    auth1_token: Option<String>,
+    account_id: Option<String>,
+    primary_org_id: Option<String>,
+    orgs: Vec<WindsurfOrg>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WindsurfOrg {
+    id: String,
+    name: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -529,6 +557,38 @@ fn upsert_accounts_into_db(
     Ok(())
 }
 
+fn account_exists(conn: &Connection, account_id: &str) -> Result<bool, String> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(1) FROM accounts WHERE id = ?1",
+            params![account_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("检查账号是否存在失败: {error}"))?;
+    Ok(count > 0)
+}
+
+fn upsert_existing_accounts_into_db(
+    app: &tauri::AppHandle,
+    accounts: &[ManagedAccount],
+) -> Result<Vec<ManagedAccount>, String> {
+    let mut conn = open_app_db(app)?;
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("开启 SQLite 事务失败: {error}"))?;
+    let mut written = Vec::new();
+    for account in accounts {
+        if account_exists(&tx, &account.id)? {
+            upsert_account(&tx, account)?;
+            written.push(account.clone());
+        }
+    }
+    enforce_single_current_account(&tx)?;
+    tx.commit()
+        .map_err(|error| format!("提交 SQLite 事务失败: {error}"))?;
+    Ok(written)
+}
+
 fn stable_hash(input: &str) -> String {
     let mut hash: u32 = 2166136261;
     for byte in input.as_bytes() {
@@ -650,7 +710,7 @@ fn parse_codex_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuot
             .cloned();
         metrics.push(QuotaMetric {
             key: "codex-weekly".to_string(),
-            label: "WEEKLY".to_string(),
+            label: "周限".to_string(),
             remaining_percent: Some(remaining),
             reset_at,
             detail: None,
@@ -1102,6 +1162,33 @@ fn looks_like_windsurf(obj: &serde_json::Map<String, Value>) -> bool {
         return true;
     }
     let tokens = obj.get("tokens").and_then(Value::as_object);
+    let auth1_token = string_field(obj.get("auth1_token"))
+        .or_else(|| string_field(obj.get("auth1Token")))
+        .or_else(|| string_field(obj.get("devin_auth1_token")))
+        .or_else(|| string_field(obj.get("devinAuth1Token")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("auth1_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("auth1Token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("devin_auth1_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("devinAuth1Token"))));
+    let session_token = string_field(obj.get("session_token"))
+        .or_else(|| string_field(obj.get("sessionToken")))
+        .or_else(|| string_field(obj.get("devin_session_token")))
+        .or_else(|| string_field(obj.get("devinSessionToken")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("session_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("sessionToken"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("devin_session_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("devinSessionToken"))));
+    if auth1_token
+        .as_deref()
+        .map(|token| token.starts_with("auth1_"))
+        .unwrap_or(false)
+        || session_token
+            .as_deref()
+            .map(|token| token.starts_with("devin-session-token$"))
+            .unwrap_or(false)
+    {
+        return true;
+    }
     if string_field(obj.get("local_id"))
         .or_else(|| string_field(obj.get("localId")))
         .or_else(|| tokens.and_then(|t| string_field(t.get("local_id"))))
@@ -1157,14 +1244,44 @@ fn parse_windsurf_account(value: &Value, source: &str) -> Option<ManagedAccount>
         .or_else(|| tokens.and_then(|t| string_field(t.get("access_token"))))
         .or_else(|| tokens.and_then(|t| string_field(t.get("accessToken"))))
         .or_else(|| id_token.clone());
+    let auth1_token = string_field(obj.get("auth1_token"))
+        .or_else(|| string_field(obj.get("auth1Token")))
+        .or_else(|| string_field(obj.get("devin_auth1_token")))
+        .or_else(|| string_field(obj.get("devinAuth1Token")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("auth1_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("auth1Token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("devin_auth1_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("devinAuth1Token"))));
+    let session_token = string_field(obj.get("session_token"))
+        .or_else(|| string_field(obj.get("sessionToken")))
+        .or_else(|| string_field(obj.get("devin_session_token")))
+        .or_else(|| string_field(obj.get("devinSessionToken")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("session_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("sessionToken"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("devin_session_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("devinSessionToken"))));
 
-    if id_token.is_none() && refresh_token.is_none() {
+    if id_token.is_none()
+        && refresh_token.is_none()
+        && auth1_token.is_none()
+        && session_token.is_none()
+    {
         return None;
     }
 
     let jwt = id_token.as_deref().and_then(parse_jwt_payload);
+    let discriminator_token = session_token
+        .clone()
+        .or_else(|| auth1_token.clone())
+        .or_else(|| access_token.clone())
+        .or_else(|| refresh_token.clone())
+        .or_else(|| id_token.clone())
+        .unwrap_or_else(|| "windsurf".to_string());
     let email = string_field(obj.get("email"))
-        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("email"))))?;
+        .or_else(|| string_field(obj.get("account")))
+        .or_else(|| string_field(obj.get("active")))
+        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("email"))))
+        .unwrap_or_else(|| format!("windsurf-{}@local", stable_hash(&discriminator_token)));
     let local_id = string_field(obj.get("local_id"))
         .or_else(|| string_field(obj.get("localId")))
         .or_else(|| tokens.and_then(|t| string_field(t.get("local_id"))))
@@ -1183,14 +1300,24 @@ fn parse_windsurf_account(value: &Value, source: &str) -> Option<ManagedAccount>
 
     let now = now_ts();
     let token_meta = TokenMeta {
-        has_access_token: access_token.is_some(),
+        has_access_token: access_token.is_some()
+            || session_token.is_some()
+            || auth1_token.is_some(),
         has_refresh_token: refresh_token.is_some(),
         has_id_token: id_token.is_some(),
         expires_at,
     };
-    let discriminator = local_id.clone().unwrap_or_else(|| email.clone());
-    let id = string_field(obj.get("id"))
-        .unwrap_or_else(|| format!("windsurf_{}", stable_hash(&format!("{}::{}", email.to_lowercase(), discriminator))));
+    let discriminator = local_id
+        .clone()
+        .or_else(|| session_token.clone())
+        .or_else(|| auth1_token.clone())
+        .unwrap_or_else(|| email.clone());
+    let id = string_field(obj.get("id")).unwrap_or_else(|| {
+        format!(
+            "windsurf_{}",
+            stable_hash(&format!("{}::{}", email.to_lowercase(), discriminator))
+        )
+    });
 
     // 规范化存储的凭证 payload，保证 refresh / export 能稳定取出。
     let mut tokens_map = serde_json::Map::new();
@@ -1203,6 +1330,12 @@ fn parse_windsurf_account(value: &Value, source: &str) -> Option<ManagedAccount>
     if let Some(value) = access_token.clone() {
         tokens_map.insert("access_token".to_string(), Value::String(value));
     }
+    if let Some(value) = auth1_token.clone() {
+        tokens_map.insert("auth1_token".to_string(), Value::String(value));
+    }
+    if let Some(value) = session_token.clone() {
+        tokens_map.insert("session_token".to_string(), Value::String(value));
+    }
     if let Some(value) = local_id.clone() {
         tokens_map.insert("local_id".to_string(), Value::String(value));
     }
@@ -1210,7 +1343,10 @@ fn parse_windsurf_account(value: &Value, source: &str) -> Option<ManagedAccount>
         tokens_map.insert("expires_at".to_string(), Value::Number(value.into()));
     }
     let mut payload_map = serde_json::Map::new();
-    payload_map.insert("provider".to_string(), Value::String("windsurf".to_string()));
+    payload_map.insert(
+        "provider".to_string(),
+        Value::String("windsurf".to_string()),
+    );
     payload_map.insert("email".to_string(), Value::String(email.to_lowercase()));
     if let Some(name) = display_name.clone() {
         payload_map.insert("display_name".to_string(), Value::String(name));
@@ -1265,11 +1401,7 @@ fn parse_windsurf_account(value: &Value, source: &str) -> Option<ManagedAccount>
 fn windsurf_payload_string(account: &ManagedAccount, key: &str) -> Option<String> {
     let payload = account.auth_payload.as_ref()?.as_object()?;
     let tokens = payload.get("tokens").and_then(Value::as_object);
-    string_field(
-        tokens
-            .and_then(|t| t.get(key))
-            .or_else(|| payload.get(key)),
-    )
+    string_field(tokens.and_then(|t| t.get(key)).or_else(|| payload.get(key)))
 }
 
 fn windsurf_set_token_field(account: &mut ManagedAccount, key: &str, value: Value) {
@@ -1292,8 +1424,41 @@ async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result
     if account.provider != "windsurf" {
         return Ok(());
     }
-    let refresh_token = windsurf_payload_string(account, "refresh_token")
-        .ok_or_else(|| "缺少 refresh_token".to_string())?;
+    let refresh_token = match windsurf_payload_string(account, "refresh_token") {
+        Some(token) => token,
+        None => {
+            if windsurf_payload_string(account, "session_token").is_none() {
+                if let Some(auth1_token) = windsurf_payload_string(account, "auth1_token") {
+                    let post_auth = windsurf_post_auth(&auth1_token, None).await?;
+                    windsurf_set_token_field(
+                        account,
+                        "session_token",
+                        Value::String(post_auth.session_token.clone()),
+                    );
+                    windsurf_set_token_field(
+                        account,
+                        "access_token",
+                        Value::String(post_auth.session_token),
+                    );
+                    if let Some(value) = post_auth.auth1_token {
+                        windsurf_set_token_field(account, "auth1_token", Value::String(value));
+                    }
+                    if let Some(value) = post_auth.account_id {
+                        windsurf_set_token_field(account, "local_id", Value::String(value));
+                    }
+                    if let Some(value) = post_auth.primary_org_id {
+                        windsurf_set_token_field(account, "primary_org_id", Value::String(value));
+                    }
+                }
+            }
+            if windsurf_payload_string(account, "session_token").is_some() {
+                enrich_windsurf_account_remote(account).await?;
+                account.token_meta.has_access_token = true;
+                return Ok(());
+            }
+            return Err("缺少 refresh_token".to_string());
+        }
+    };
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -1361,6 +1526,7 @@ async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result
         reason: None,
         updated_at: Some(account.updated_at),
     });
+    let _ = enrich_windsurf_account_remote(account).await;
     Ok(())
 }
 
@@ -1379,6 +1545,8 @@ fn build_windsurf_payload(account: &ManagedAccount) -> Result<Value, String> {
         "id_token",
         "refresh_token",
         "access_token",
+        "auth1_token",
+        "session_token",
         "local_id",
         "expires_at",
     ] {
@@ -1387,7 +1555,10 @@ fn build_windsurf_payload(account: &ManagedAccount) -> Result<Value, String> {
         }
     }
     let mut result = serde_json::Map::new();
-    result.insert("provider".to_string(), Value::String("windsurf".to_string()));
+    result.insert(
+        "provider".to_string(),
+        Value::String("windsurf".to_string()),
+    );
     result.insert("email".to_string(), Value::String(account.email.clone()));
     if let Some(name) = account.display_name.clone() {
         result.insert("display_name".to_string(), Value::String(name));
@@ -1481,6 +1652,834 @@ async fn windsurf_firebase_lookup(id_token: &str) -> Option<Value> {
     response.json::<Value>().await.ok()
 }
 
+fn encode_varint(buf: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        buf.push((value as u8 & 0x7F) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
+
+fn encode_proto_string_field(buf: &mut Vec<u8>, field_no: u32, value: &str) {
+    let tag = (field_no << 3) | 2;
+    encode_varint(buf, tag as u64);
+    let bytes = value.as_bytes();
+    encode_varint(buf, bytes.len() as u64);
+    buf.extend_from_slice(bytes);
+}
+
+fn decode_varint(bytes: &[u8], offset: usize) -> Option<(u64, usize)> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    let mut i = offset;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        result |= ((byte & 0x7F) as u64) << shift;
+        i += 1;
+        if byte & 0x80 == 0 {
+            return Some((result, i - offset));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
+    None
+}
+
+fn parse_windsurf_org(bytes: &[u8]) -> Option<WindsurfOrg> {
+    let mut org = WindsurfOrg::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (tag, consumed) = decode_varint(bytes, i)?;
+        i += consumed;
+        let field_no = (tag >> 3) as u32;
+        let wire_type = (tag & 0x7) as u8;
+        if wire_type != 2 {
+            return None;
+        }
+        let (len, consumed_len) = decode_varint(bytes, i)?;
+        i += consumed_len;
+        let end = i + len as usize;
+        if end > bytes.len() {
+            return None;
+        }
+        let payload = &bytes[i..end];
+        match field_no {
+            1 => org.id = String::from_utf8_lossy(payload).into_owned(),
+            2 => org.name = String::from_utf8_lossy(payload).into_owned(),
+            _ => {}
+        }
+        i = end;
+    }
+    if org.id.is_empty() && org.name.is_empty() {
+        None
+    } else {
+        Some(org)
+    }
+}
+
+fn parse_windsurf_post_auth_response(bytes: &[u8]) -> Result<WindsurfPostAuthResult, String> {
+    let mut result = WindsurfPostAuthResult::default();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (tag, consumed) = decode_varint(bytes, i)
+            .ok_or_else(|| "WindsurfPostAuth 响应 tag 解码失败".to_string())?;
+        i += consumed;
+        let field_no = (tag >> 3) as u32;
+        let wire_type = (tag & 0x7) as u8;
+        if wire_type == 2 {
+            let (len, consumed_len) = decode_varint(bytes, i)
+                .ok_or_else(|| "WindsurfPostAuth 响应长度解码失败".to_string())?;
+            i += consumed_len;
+            let end = i + len as usize;
+            if end > bytes.len() {
+                return Err("WindsurfPostAuth 响应长度越界".to_string());
+            }
+            let payload = &bytes[i..end];
+            match field_no {
+                1 => result.session_token = String::from_utf8_lossy(payload).into_owned(),
+                2 => {
+                    if let Some(org) = parse_windsurf_org(payload) {
+                        result.orgs.push(org);
+                    }
+                }
+                3 => result.auth1_token = Some(String::from_utf8_lossy(payload).into_owned()),
+                4 => result.account_id = Some(String::from_utf8_lossy(payload).into_owned()),
+                5 => result.primary_org_id = Some(String::from_utf8_lossy(payload).into_owned()),
+                _ => {}
+            }
+            i = end;
+        } else {
+            match wire_type {
+                0 => {
+                    let (_, consumed_value) = decode_varint(bytes, i)
+                        .ok_or_else(|| "WindsurfPostAuth 响应 varint 跳过失败".to_string())?;
+                    i += consumed_value;
+                }
+                1 => i += 8,
+                5 => i += 4,
+                _ => return Err(format!("WindsurfPostAuth 不支持的 wire type: {wire_type}")),
+            }
+        }
+    }
+    if result.session_token.is_empty() {
+        return Err("WindsurfPostAuth 响应未包含 session_token".to_string());
+    }
+    Ok(result)
+}
+
+fn parse_proto_message(bytes: &[u8]) -> Result<Value, String> {
+    let mut map = serde_json::Map::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (tag, consumed) =
+            decode_varint(bytes, i).ok_or_else(|| "protobuf tag 解码失败".to_string())?;
+        i += consumed;
+        if tag == 0 {
+            break;
+        }
+        let field_no = (tag >> 3) as u32;
+        let wire_type = (tag & 0x7) as u8;
+        match wire_type {
+            0 => {
+                let (value, consumed_value) = decode_varint(bytes, i)
+                    .ok_or_else(|| "protobuf varint 解码失败".to_string())?;
+                i += consumed_value;
+                map.insert(format!("int_{field_no}"), Value::Number(value.into()));
+            }
+            1 => {
+                if i + 8 > bytes.len() {
+                    return Err("protobuf fixed64 长度越界".to_string());
+                }
+                i += 8;
+            }
+            2 => {
+                let (len, consumed_len) = decode_varint(bytes, i)
+                    .ok_or_else(|| "protobuf length 解码失败".to_string())?;
+                i += consumed_len;
+                let end = i + len as usize;
+                if end > bytes.len() {
+                    return Err("protobuf length-delimited 长度越界".to_string());
+                }
+                let payload = &bytes[i..end];
+                let value = if let Ok(text) = String::from_utf8(payload.to_vec()) {
+                    if !text.is_empty()
+                        && text
+                            .chars()
+                            .all(|ch| ch.is_ascii_graphic() || ch.is_ascii_whitespace())
+                    {
+                        Value::String(text)
+                    } else {
+                        parse_proto_message(payload).unwrap_or_else(|_| {
+                            Value::Array(
+                                payload
+                                    .iter()
+                                    .map(|byte| Value::Number((*byte).into()))
+                                    .collect(),
+                            )
+                        })
+                    }
+                } else {
+                    parse_proto_message(payload).unwrap_or_else(|_| {
+                        Value::Array(
+                            payload
+                                .iter()
+                                .map(|byte| Value::Number((*byte).into()))
+                                .collect(),
+                        )
+                    })
+                };
+                let key = if value.is_string() {
+                    format!("string_{field_no}")
+                } else if value.is_object() {
+                    format!("subMesssage_{field_no}")
+                } else {
+                    format!("bytes_{field_no}")
+                };
+                if let Some(existing) = map.get_mut(&key) {
+                    if let Value::Array(items) = existing {
+                        items.push(value);
+                    } else {
+                        let previous = existing.clone();
+                        *existing = Value::Array(vec![previous, value]);
+                    }
+                } else {
+                    map.insert(key, value);
+                }
+                i = end;
+            }
+            5 => {
+                if i + 4 > bytes.len() {
+                    return Err("protobuf fixed32 长度越界".to_string());
+                }
+                i += 4;
+            }
+            _ => return Err(format!("protobuf 不支持的 wire type: {wire_type}")),
+        }
+    }
+    Ok(Value::Object(map))
+}
+
+fn decode_proto_response_body(response_body: &[u8]) -> Vec<u8> {
+    let response_text = String::from_utf8_lossy(response_body);
+    let maybe_base64 = response_text
+        .strip_prefix("data:application/proto;base64,")
+        .unwrap_or(response_text.trim());
+    if !maybe_base64.is_empty()
+        && maybe_base64
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '+' || ch == '/' || ch == '=')
+    {
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(maybe_base64) {
+            return decoded;
+        }
+    }
+    response_body.to_vec()
+}
+
+fn proto_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_i64).or_else(|| {
+        value
+            .and_then(Value::as_u64)
+            .and_then(|v| i64::try_from(v).ok())
+    })
+}
+
+fn extract_windsurf_current_user(response_body: &[u8]) -> Result<Value, String> {
+    let decoded = decode_proto_response_body(response_body);
+    let parsed = parse_proto_message(&decoded)?;
+    let obj = parsed
+        .as_object()
+        .ok_or_else(|| "GetCurrentUser 响应不是对象".to_string())?;
+    let user = obj.get("subMesssage_1").and_then(Value::as_object);
+    let plan = obj.get("subMesssage_6").and_then(Value::as_object);
+    let subscription = obj.get("subMesssage_4").and_then(Value::as_object);
+
+    let mut user_map = serde_json::Map::new();
+    if let Some(user) = user {
+        if let Some(value) = string_field(user.get("string_1")) {
+            user_map.insert("api_key".to_string(), Value::String(value));
+        }
+        if let Some(value) = string_field(user.get("string_2")) {
+            user_map.insert("name".to_string(), Value::String(value));
+        }
+        if let Some(value) = string_field(user.get("string_3")) {
+            user_map.insert("email".to_string(), Value::String(value));
+        }
+        if let Some(value) = string_field(user.get("string_6")) {
+            user_map.insert("id".to_string(), Value::String(value));
+        }
+        if let Some(value) = proto_i64(user.get("int_16")) {
+            user_map.insert("disable_codeium".to_string(), Value::Bool(value != 0));
+        }
+    }
+
+    let mut plan_map = serde_json::Map::new();
+    let base_quota = plan
+        .and_then(|plan| proto_i64(plan.get("int_12")))
+        .unwrap_or(0);
+    if let Some(plan) = plan {
+        if let Some(value) = string_field(plan.get("string_2")) {
+            plan_map.insert("plan_name".to_string(), Value::String(value));
+        }
+        if let Some(value) = proto_i64(plan.get("int_35")) {
+            plan_map.insert("billing_strategy".to_string(), Value::Number(value.into()));
+        }
+    }
+
+    let mut subscription_map = serde_json::Map::new();
+    if let Some(subscription) = subscription {
+        let extra_quota = proto_i64(subscription.get("int_15")).unwrap_or(0);
+        let total_quota = base_quota + extra_quota;
+        let used_quota = proto_i64(subscription.get("int_17")).unwrap_or(0);
+        subscription_map.insert("quota".to_string(), Value::Number(total_quota.into()));
+        subscription_map.insert("used_quota".to_string(), Value::Number(used_quota.into()));
+        if let Some(expires_at) = subscription
+            .get("subMesssage_18")
+            .and_then(|timestamp| proto_i64(timestamp.get("int_1")))
+        {
+            subscription_map.insert("expires_at".to_string(), Value::Number(expires_at.into()));
+        }
+        if let Some(active) = proto_i64(subscription.get("int_7")) {
+            subscription_map.insert("subscription_active".to_string(), Value::Bool(active != 0));
+        }
+    }
+
+    Ok(serde_json::json!({
+        "parsed_data": parsed,
+        "user_info": {
+            "user": Value::Object(user_map),
+            "plan": Value::Object(plan_map),
+            "subscription": Value::Object(subscription_map)
+        }
+    }))
+}
+
+fn apply_windsurf_user_info(account: &mut ManagedAccount, user_info: &Value) {
+    let now = now_ts();
+    if let Some(user) = user_info.get("user") {
+        if let Some(email) = string_field(user.get("email")) {
+            account.email = email.to_lowercase();
+        }
+        if let Some(name) = string_field(user.get("name")) {
+            account.display_name = Some(name);
+        }
+        if let Some(id) = string_field(user.get("id")) {
+            account.account_id = Some(id.clone());
+            account.user_id = Some(id.clone());
+            windsurf_set_token_field(account, "local_id", Value::String(id));
+        }
+    }
+    if let Some(plan) = user_info.get("plan") {
+        if let Some(plan_name) = string_field(plan.get("plan_name")) {
+            account.plan = Some(plan_name.clone());
+            account.plan_type = Some(plan_name);
+        }
+    }
+    let mut metrics = Vec::new();
+    if let Some(subscription) = user_info.get("subscription") {
+        let used = proto_i64(subscription.get("used_quota"));
+        let total = proto_i64(subscription.get("quota"));
+        if let Some(expires_at) = proto_i64(subscription.get("expires_at")) {
+            account.subscription_active_until = Some(Value::Number(expires_at.into()));
+        }
+        if let (Some(used), Some(total)) = (used, total) {
+            if total > 0 {
+                let remaining =
+                    (((total - used).max(0) as f64 / total as f64) * 100.0).round() as i64;
+                metrics.push(QuotaMetric {
+                    key: "windsurf-credits".to_string(),
+                    label: "CREDITS".to_string(),
+                    remaining_percent: Some(remaining.clamp(0, 100)),
+                    reset_at: account.subscription_active_until.clone(),
+                    detail: Some(format!("{}/{} used", used, total)),
+                    state: Some(if remaining <= 0 {
+                        "unavailable".to_string()
+                    } else if remaining <= 15 {
+                        "warning".to_string()
+                    } else {
+                        "available".to_string()
+                    }),
+                });
+            }
+        }
+    }
+    account.quota = if metrics.is_empty() {
+        None
+    } else {
+        Some(AccountQuota {
+            metrics,
+            last_updated: Some(now),
+            error: None,
+            is_forbidden: Some(false),
+        })
+    };
+    account.updated_at = now;
+    account.status = Some(AccountStatus {
+        state: "available".to_string(),
+        label: "可用".to_string(),
+        reason: None,
+        updated_at: Some(now),
+    });
+}
+
+fn extract_windsurf_plan_status(response_body: &[u8]) -> Result<Value, String> {
+    let decoded = decode_proto_response_body(response_body);
+    let parsed = parse_proto_message(&decoded)?;
+    let plan_status = parsed
+        .get("subMesssage_1")
+        .ok_or_else(|| "GetPlanStatus 响应缺少 plan_status".to_string())?;
+    let mut result = serde_json::Map::new();
+    result.insert("raw_data".to_string(), parsed.clone());
+    if let Some(plan_info) = plan_status.get("subMesssage_1") {
+        if let Some(value) = string_field(plan_info.get("string_2")) {
+            result.insert("plan_name".to_string(), Value::String(value));
+        }
+        if let Some(value) = proto_i64(plan_info.get("int_35")) {
+            result.insert("billing_strategy".to_string(), Value::Number(value.into()));
+        }
+    }
+    if let Some(value) = plan_status
+        .get("subMesssage_3")
+        .and_then(|timestamp| proto_i64(timestamp.get("int_1")))
+    {
+        result.insert("plan_end".to_string(), Value::Number(value.into()));
+    }
+    for (key, field) in [
+        ("available_flex_credits", "int_4"),
+        ("used_flow_credits", "int_5"),
+        ("used_prompt_credits", "int_6"),
+        ("used_flex_credits", "int_7"),
+        ("available_prompt_credits", "int_8"),
+        ("available_flow_credits", "int_9"),
+        ("daily_quota_remaining_percent", "int_14"),
+        ("weekly_quota_remaining_percent", "int_15"),
+        ("overage_balance_micros", "int_16"),
+        ("daily_quota_reset_at_unix", "int_17"),
+        ("weekly_quota_reset_at_unix", "int_18"),
+    ] {
+        if let Some(value) = proto_i64(plan_status.get(field)) {
+            result.insert(key.to_string(), Value::Number(value.into()));
+        }
+    }
+    Ok(Value::Object(result))
+}
+
+fn quota_state_from_remaining(remaining: i64) -> String {
+    if remaining <= 0 {
+        "unavailable".to_string()
+    } else if remaining <= 15 {
+        "warning".to_string()
+    } else {
+        "available".to_string()
+    }
+}
+
+fn apply_windsurf_plan_status(account: &mut ManagedAccount, plan_status: &Value) {
+    let now = now_ts();
+    if let Some(plan_name) = string_field(plan_status.get("plan_name")) {
+        account.plan = Some(plan_name.clone());
+        account.plan_type = Some(plan_name);
+    }
+    if let Some(plan_end) = proto_i64(plan_status.get("plan_end")) {
+        account.subscription_active_until = Some(Value::Number(plan_end.into()));
+    }
+
+    let mut metrics = Vec::new();
+    let is_quota_mode = proto_i64(plan_status.get("billing_strategy")) == Some(2)
+        || plan_status.get("daily_quota_remaining_percent").is_some()
+        || plan_status.get("weekly_quota_remaining_percent").is_some()
+        || plan_status.get("daily_quota_reset_at_unix").is_some()
+        || plan_status.get("weekly_quota_reset_at_unix").is_some();
+    if is_quota_mode {
+        let remaining = proto_i64(plan_status.get("daily_quota_remaining_percent"))
+            .unwrap_or(0)
+            .clamp(0, 100);
+        let remaining = remaining.clamp(0, 100);
+        metrics.push(QuotaMetric {
+            key: "windsurf-daily".to_string(),
+            label: "日限".to_string(),
+            remaining_percent: Some(remaining),
+            reset_at: plan_status
+                .get("daily_quota_reset_at_unix")
+                .and_then(|value| proto_i64(Some(value)))
+                .map(|value| Value::Number(value.into())),
+            detail: Some(format!("剩余 {remaining}%")),
+            state: Some(quota_state_from_remaining(remaining)),
+        });
+        let remaining = proto_i64(plan_status.get("weekly_quota_remaining_percent"))
+            .unwrap_or(0)
+            .clamp(0, 100);
+        metrics.push(QuotaMetric {
+            key: "windsurf-weekly".to_string(),
+            label: "周限".to_string(),
+            remaining_percent: Some(remaining),
+            reset_at: plan_status
+                .get("weekly_quota_reset_at_unix")
+                .and_then(|value| proto_i64(Some(value)))
+                .map(|value| Value::Number(value.into())),
+            detail: Some(format!("剩余 {remaining}%")),
+            state: Some(quota_state_from_remaining(remaining)),
+        });
+    }
+
+    if metrics.is_empty() {
+        let used_prompt = proto_i64(plan_status.get("used_prompt_credits")).unwrap_or(0);
+        let used_flex = proto_i64(plan_status.get("used_flex_credits")).unwrap_or(0);
+        let available_prompt = proto_i64(plan_status.get("available_prompt_credits")).unwrap_or(0);
+        let available_flex = proto_i64(plan_status.get("available_flex_credits")).unwrap_or(0);
+        let used = used_prompt + used_flex;
+        let total = used + available_prompt + available_flex;
+        if total > 0 {
+            let remaining = (((total - used).max(0) as f64 / total as f64) * 100.0).round() as i64;
+            metrics.push(QuotaMetric {
+                key: "windsurf-credits".to_string(),
+                label: "CREDITS".to_string(),
+                remaining_percent: Some(remaining.clamp(0, 100)),
+                reset_at: account.subscription_active_until.clone(),
+                detail: Some(format!("{}/{} used", used, total)),
+                state: Some(quota_state_from_remaining(remaining)),
+            });
+        }
+    }
+
+    if !metrics.is_empty() {
+        account.quota = Some(AccountQuota {
+            metrics,
+            last_updated: Some(now),
+            error: None,
+            is_forbidden: Some(false),
+        });
+    }
+    account.updated_at = now;
+    account.status = Some(AccountStatus {
+        state: "available".to_string(),
+        label: "可用".to_string(),
+        reason: None,
+        updated_at: Some(now),
+    });
+}
+
+fn apply_windsurf_auth_headers(
+    request: reqwest::RequestBuilder,
+    session_token: &str,
+    auth1_token: Option<String>,
+    account_id: Option<String>,
+    primary_org_id: Option<String>,
+) -> reqwest::RequestBuilder {
+    let mut request = request.header("x-auth-token", session_token);
+    if session_token.starts_with("devin-session-token$") {
+        request = request.header("x-devin-session-token", session_token);
+        if let Some(value) = account_id {
+            request = request.header("x-devin-account-id", value);
+        }
+        if let Some(value) = auth1_token {
+            request = request.header("x-devin-auth1-token", value);
+        }
+        if let Some(value) = primary_org_id {
+            request = request.header("x-devin-primary-org-id", value);
+        }
+    }
+    request
+}
+
+async fn windsurf_get_current_user(account: &ManagedAccount) -> Result<Value, String> {
+    let session_token = windsurf_payload_string(account, "session_token")
+        .or_else(|| windsurf_payload_string(account, "id_token"))
+        .ok_or_else(|| "缺少可用于查询 Windsurf 账号信息的 token".to_string())?;
+    let auth1_token = windsurf_payload_string(account, "auth1_token");
+    let account_id = windsurf_payload_string(account, "local_id");
+    let primary_org_id = windsurf_payload_string(account, "primary_org_id");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Windsurf GetCurrentUser 客户端失败: {error}"))?;
+    let url = format!(
+        "{WINDSURF_BACKEND_URL}/exa.seat_management_pb.SeatManagementService/GetCurrentUser"
+    );
+    let mut body = Vec::with_capacity(session_token.len() + 8);
+    encode_proto_string_field(&mut body, 1, &session_token);
+    body.extend_from_slice(&[0x10, 0x01, 0x18, 0x01, 0x20, 0x01]);
+    let request = client
+        .post(&url)
+        .body(body)
+        .header(ACCEPT, "*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .header("Cache-Control", "no-cache")
+        .header("connect-protocol-version", "1")
+        .header(CONTENT_TYPE, "application/proto")
+        .header("Pragma", "no-cache")
+        .header("priority", "u=1, i")
+        .header(
+            "Sec-Ch-Ua",
+            r#""Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99""#,
+        )
+        .header("Sec-Ch-Ua-Mobile", "?0")
+        .header("Sec-Ch-Ua-Platform", r#""Windows""#)
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-site")
+        .header("x-debug-email", "")
+        .header("x-debug-team-name", "")
+        .header("Referer", "https://windsurf.com/");
+    let request = apply_windsurf_auth_headers(
+        request,
+        &session_token,
+        auth1_token,
+        account_id,
+        primary_org_id,
+    );
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("GetCurrentUser 请求失败: {error}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取 GetCurrentUser 响应失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "GetCurrentUser 失败 ({status}): {}",
+            String::from_utf8_lossy(&bytes)
+        ));
+    }
+    extract_windsurf_current_user(&bytes)
+}
+
+async fn windsurf_get_plan_status(account: &ManagedAccount) -> Result<Value, String> {
+    let session_token = windsurf_payload_string(account, "session_token")
+        .or_else(|| windsurf_payload_string(account, "id_token"))
+        .ok_or_else(|| "缺少可用于查询 Windsurf 套餐状态的 token".to_string())?;
+    let auth1_token = windsurf_payload_string(account, "auth1_token");
+    let account_id = windsurf_payload_string(account, "local_id");
+    let primary_org_id = windsurf_payload_string(account, "primary_org_id");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Windsurf GetPlanStatus 客户端失败: {error}"))?;
+    let url = format!(
+        "{WINDSURF_BACKEND_URL}/exa.seat_management_pb.SeatManagementService/GetPlanStatus"
+    );
+    let mut body = Vec::with_capacity(session_token.len() + 8);
+    encode_proto_string_field(&mut body, 1, &session_token);
+    let request = client
+        .post(&url)
+        .body(body)
+        .header(ACCEPT, "*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .header("Cache-Control", "no-cache")
+        .header("connect-protocol-version", "1")
+        .header(CONTENT_TYPE, "application/proto")
+        .header("Pragma", "no-cache")
+        .header("priority", "u=1, i")
+        .header(
+            "Sec-Ch-Ua",
+            r#""Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99""#,
+        )
+        .header("Sec-Ch-Ua-Mobile", "?0")
+        .header("Sec-Ch-Ua-Platform", r#""Windows""#)
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-site")
+        .header("x-debug-email", "")
+        .header("x-debug-team-name", "")
+        .header("Referer", "https://windsurf.com/");
+    let request = apply_windsurf_auth_headers(
+        request,
+        &session_token,
+        auth1_token,
+        account_id,
+        primary_org_id,
+    );
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("GetPlanStatus 请求失败: {error}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取 GetPlanStatus 响应失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "GetPlanStatus 失败 ({status}): {}",
+            String::from_utf8_lossy(&bytes)
+        ));
+    }
+    extract_windsurf_plan_status(&bytes)
+}
+
+async fn enrich_windsurf_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
+    let mut last_error = None;
+    match windsurf_get_current_user(account).await {
+        Ok(user_info_result) => {
+            if let Some(user_info) = user_info_result.get("user_info") {
+                apply_windsurf_user_info(account, user_info);
+            }
+        }
+        Err(error) => last_error = Some(error),
+    }
+    match windsurf_get_plan_status(account).await {
+        Ok(plan_status) => apply_windsurf_plan_status(account, &plan_status),
+        Err(error) => {
+            if last_error.is_none() {
+                last_error = Some(error);
+            }
+        }
+    }
+    if account.quota.is_some() || account.plan.is_some() {
+        Ok(())
+    } else {
+        Err(last_error.unwrap_or_else(|| "未能获取 Windsurf 账号信息".to_string()))
+    }
+}
+
+async fn devin_password_login_with_base(
+    base_url: &str,
+    email: &str,
+    password: &str,
+) -> Result<DevinPasswordLoginResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Devin 客户端失败: {error}"))?;
+    let url = format!("{base_url}/password/login");
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({ "email": email, "password": password }))
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .header("Origin", "https://windsurf.com")
+        .header("Referer", "https://windsurf.com/account/login")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-origin")
+        .header(USER_AGENT, CODEX_API_USER_AGENT)
+        .send()
+        .await
+        .map_err(|error| format!("Devin 登录请求失败: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 Devin 登录响应失败: {error}"))?;
+    if !status.is_success() {
+        let lower = text.to_lowercase();
+        if lower.contains("invalid")
+            && (lower.contains("password") || lower.contains("credentials"))
+        {
+            return Err("邮箱或密码错误".to_string());
+        }
+        if lower.contains("not found") || lower.contains("no such") {
+            return Err("该邮箱未注册 Devin/Auth1 账号".to_string());
+        }
+        if lower.contains("too many") || lower.contains("rate") || status.as_u16() == 429 {
+            return Err("尝试次数过多，请稍后再试".to_string());
+        }
+        return Err(format!("Devin 登录失败 ({status}): {text}"));
+    }
+    serde_json::from_str::<DevinPasswordLoginResponse>(&text)
+        .map_err(|error| format!("解析 Devin 登录响应失败: {error}"))
+}
+
+async fn windsurf_post_auth(
+    auth1_token: &str,
+    org_id: Option<&str>,
+) -> Result<WindsurfPostAuthResult, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 WindsurfPostAuth 客户端失败: {error}"))?;
+    let url = format!(
+        "{WINDSURF_BACKEND_URL}/exa.seat_management_pb.SeatManagementService/WindsurfPostAuth"
+    );
+    let mut body = Vec::with_capacity(auth1_token.len() + org_id.unwrap_or("").len() + 4);
+    encode_proto_string_field(&mut body, 1, auth1_token);
+    if let Some(org_id) = org_id.filter(|value| !value.trim().is_empty()) {
+        encode_proto_string_field(&mut body, 2, org_id);
+    }
+    let response = client
+        .post(&url)
+        .body(body)
+        .header(ACCEPT, "*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .header("connect-protocol-version", "1")
+        .header(CONTENT_TYPE, "application/proto")
+        .header("Origin", "https://windsurf.com")
+        .header("Referer", "https://windsurf.com/account/login")
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "same-site")
+        .header("X-Devin-Auth1-Token", auth1_token)
+        .send()
+        .await
+        .map_err(|error| format!("WindsurfPostAuth 请求失败: {error}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("读取 WindsurfPostAuth 响应失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "WindsurfPostAuth 失败 ({status}): {}",
+            String::from_utf8_lossy(&bytes)
+        ));
+    }
+    parse_windsurf_post_auth_response(&bytes)
+}
+
+async fn windsurf_devin_sign_in(email: &str, password: &str) -> Result<Value, String> {
+    let login = match devin_password_login_with_base(DEVIN_AUTH_BASE_URL, email, password).await {
+        Ok(value) => value,
+        Err(bridge_error) => {
+            match devin_password_login_with_base(DEVIN_APP_AUTH_BASE_URL, email, password).await {
+                Ok(value) => value,
+                Err(native_error) => {
+                    return Err(format!(
+                    "Devin/Auth1 登录失败；Windsurf 桥接: {bridge_error}；Devin 原生: {native_error}"
+                ));
+                }
+            }
+        }
+    };
+    let post_auth = windsurf_post_auth(&login.auth1_token, None).await?;
+    let effective_auth1_token = post_auth
+        .auth1_token
+        .clone()
+        .unwrap_or_else(|| login.auth1_token.clone());
+    let resolved_email = login.email.clone().unwrap_or_else(|| email.to_string());
+    let mut tokens_map = serde_json::Map::new();
+    tokens_map.insert(
+        "auth1_token".to_string(),
+        Value::String(effective_auth1_token),
+    );
+    tokens_map.insert(
+        "session_token".to_string(),
+        Value::String(post_auth.session_token),
+    );
+    if let Some(account_id) = post_auth.account_id.clone().or(login.account_id.clone()) {
+        tokens_map.insert("local_id".to_string(), Value::String(account_id));
+    }
+    if let Some(primary_org_id) = post_auth
+        .primary_org_id
+        .clone()
+        .or_else(|| post_auth.orgs.first().map(|org| org.id.clone()))
+    {
+        tokens_map.insert("primary_org_id".to_string(), Value::String(primary_org_id));
+    }
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "provider".to_string(),
+        Value::String("windsurf".to_string()),
+    );
+    payload.insert("email".to_string(), Value::String(resolved_email));
+    payload.insert("tokens".to_string(), Value::Object(tokens_map));
+    Ok(Value::Object(payload))
+}
+
 #[tauri::command]
 #[allow(non_snake_case)]
 async fn add_windsurf_account_by_password(
@@ -1494,7 +2493,25 @@ async fn add_windsurf_account_by_password(
         return Err("邮箱和密码不能为空".to_string());
     }
 
-    let signin = windsurf_firebase_sign_in(trimmed_email, trimmed_password).await?;
+    let signin = match windsurf_firebase_sign_in(trimmed_email, trimmed_password).await {
+        Ok(value) => value,
+        Err(firebase_error) => {
+            match windsurf_devin_sign_in(trimmed_email, trimmed_password).await {
+                Ok(value) => {
+                    let mut account = parse_windsurf_account(&value, "password")
+                        .ok_or_else(|| "构建 Devin/Auth1 Windsurf 账号记录失败".to_string())?;
+                    let _ = enrich_windsurf_account_remote(&mut account).await;
+                    upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
+                    return Ok(account);
+                }
+                Err(devin_error) => {
+                    return Err(format!(
+                        "Firebase 登录失败：{firebase_error}；Devin/Auth1 登录失败：{devin_error}"
+                    ));
+                }
+            }
+        }
+    };
     let id_token = string_field(signin.get("idToken"))
         .ok_or_else(|| "Windsurf 登录响应缺少 idToken".to_string())?;
     let refresh_token = string_field(signin.get("refreshToken"))
@@ -1530,7 +2547,10 @@ async fn add_windsurf_account_by_password(
     tokens_map.insert("expires_at".to_string(), Value::Number(expires_at.into()));
 
     let mut payload = serde_json::Map::new();
-    payload.insert("provider".to_string(), Value::String("windsurf".to_string()));
+    payload.insert(
+        "provider".to_string(),
+        Value::String("windsurf".to_string()),
+    );
     payload.insert("email".to_string(), Value::String(resolved_email.clone()));
     if let Some(name) = final_display_name.clone() {
         payload.insert("display_name".to_string(), Value::String(name));
@@ -1539,7 +2559,7 @@ async fn add_windsurf_account_by_password(
 
     let account = parse_windsurf_account(&Value::Object(payload), "password")
         .ok_or_else(|| "构建 Windsurf 账号记录失败".to_string())?;
-    upsert_accounts_into_db(&app, &[account.clone()])?;
+    upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
     Ok(account)
 }
 
@@ -1636,9 +2656,9 @@ fn usage_window_metric(
         label: window_minutes
             .map(|minutes| {
                 if minutes >= 1440 {
-                    format!("{}d", minutes / 1440)
+                    format!("{}D", minutes / 1440)
                 } else {
-                    format!("{}h", (minutes + 59) / 60)
+                    format!("{}H", (minutes + 59) / 60)
                 }
             })
             .unwrap_or_else(|| fallback_label.to_string()),
@@ -1654,14 +2674,14 @@ fn parse_codex_usage_quota(payload: &Value) -> AccountQuota {
     let mut metrics = Vec::new();
     if let Some(metric) = usage_window_metric(
         "primary",
-        "5h",
+        "5H",
         rate_limit.and_then(|r| r.get("primary_window")),
     ) {
         metrics.push(metric);
     }
     if let Some(metric) = usage_window_metric(
         "secondary",
-        "Weekly",
+        "周限",
         rate_limit.and_then(|r| r.get("secondary_window")),
     ) {
         metrics.push(metric);
@@ -1675,7 +2695,7 @@ fn parse_codex_usage_quota(payload: &Value) -> AccountQuota {
 }
 
 async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
-    if account.provider != "codex" || account.token_meta.has_access_token == false {
+    if account.provider != "codex" || !account.token_meta.has_access_token {
         return Ok(());
     }
     let access_token =
@@ -2018,11 +3038,34 @@ async fn refresh_imported_accounts(accounts: &mut [ManagedAccount]) {
     }
 }
 
+fn persist_and_refresh_imported(
+    app: tauri::AppHandle,
+    result: ImportResult,
+) -> Result<ImportResult, String> {
+    upsert_accounts_into_db(&app, &result.imported)?;
+    refresh_imported_accounts_in_background(app, result.imported.clone());
+    Ok(result)
+}
+
+fn oauth_pending_get(login_id: &str) -> Result<Option<OAuthPending>, String> {
+    Ok(OAUTH_PENDING
+        .lock()
+        .map_err(|_| "OAuth 状态锁失败".to_string())?
+        .get(login_id)
+        .cloned())
+}
+
+fn oauth_pending_remove(login_id: &str) {
+    if let Ok(mut guard) = OAUTH_PENDING.lock() {
+        guard.remove(login_id);
+    }
+}
+
 fn refresh_imported_accounts_in_background(app: tauri::AppHandle, accounts: Vec<ManagedAccount>) {
     tauri::async_runtime::spawn(async move {
         let mut refreshed = accounts;
         refresh_imported_accounts(&mut refreshed).await;
-        let _ = upsert_accounts_into_db(&app, &refreshed);
+        let _ = upsert_existing_accounts_into_db(&app, &refreshed);
     });
 }
 
@@ -2629,7 +3672,8 @@ fn cancel_pending_oauth_for_provider(provider: &str) {
         .map(|mut pending| {
             let ids = pending
                 .iter()
-                .filter_map(|(id, item)| (item.provider == provider).then(|| id.clone()))
+                .filter(|&(_, item)| item.provider == provider)
+                .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
             ids.into_iter()
                 .filter_map(|id| pending.remove(&id).map(|item| item.port))
@@ -2914,7 +3958,7 @@ async fn exchange_gemini_oauth_code(code: &str, redirect_uri: &str) -> Result<Va
             payload
                 .id_token
                 .as_deref()
-                .and_then(|token| parse_jwt_payload(token))
+                .and_then(parse_jwt_payload)
                 .and_then(|jwt| string_field(jwt.get("email")))
         })
         .unwrap_or_else(|| "unknown@gmail.com".to_string());
@@ -2923,7 +3967,7 @@ async fn exchange_gemini_oauth_code(code: &str, redirect_uri: &str) -> Result<Va
             payload
                 .id_token
                 .as_deref()
-                .and_then(|token| parse_jwt_payload(token))
+                .and_then(parse_jwt_payload)
                 .and_then(|jwt| string_field(jwt.get("sub")))
         });
     let name = normalize_non_empty(user_info.as_ref().and_then(|info| info.name.as_deref()))
@@ -2931,7 +3975,7 @@ async fn exchange_gemini_oauth_code(code: &str, redirect_uri: &str) -> Result<Va
             payload
                 .id_token
                 .as_deref()
-                .and_then(|token| parse_jwt_payload(token))
+                .and_then(parse_jwt_payload)
                 .and_then(|jwt| string_field(jwt.get("name")))
         });
     let expiry_date = payload
@@ -3103,8 +4147,10 @@ async fn refresh_account(
         mark_account_current(&mut account);
     }
 
-    let conn = open_app_db(&app)?;
-    upsert_account(&conn, &account)?;
+    let written = upsert_existing_accounts_into_db(&app, &[account.clone()])?;
+    if written.is_empty() {
+        return Err("账号已被删除，刷新结果已丢弃".to_string());
+    }
     Ok(account)
 }
 
@@ -3146,8 +4192,7 @@ async fn refresh_provider_accounts(
         }
     }
 
-    upsert_accounts_into_db(&app, &accounts)?;
-    Ok(accounts)
+    upsert_existing_accounts_into_db(&app, &accounts)
 }
 
 #[tauri::command]
@@ -3177,8 +4222,7 @@ async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccoun
         }
     }
 
-    upsert_accounts_into_db(&app, &accounts)?;
-    Ok(accounts)
+    upsert_existing_accounts_into_db(&app, &accounts)
 }
 
 #[tauri::command]
@@ -3227,11 +4271,11 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
 fn system_auto_launch_enabled(app: &tauri::AppHandle) -> Result<Option<bool>, String> {
     #[cfg(desktop)]
     {
-        return app
+        app
             .autolaunch()
             .is_enabled()
             .map(Some)
-            .map_err(|error| format!("读取系统开机自启状态失败: {error}"));
+            .map_err(|error| format!("读取系统开机自启状态失败: {error}"))
     }
 
     #[cfg(not(desktop))]
@@ -3331,9 +4375,7 @@ fn import_accounts_from_json(
 ) -> Result<ImportResult, String> {
     let result =
         parse_auth_json_content(&json_content, "paste", label.as_deref().unwrap_or("JSON"));
-    upsert_accounts_into_db(&app, &result.imported)?;
-    refresh_imported_accounts_in_background(app, result.imported.clone());
-    Ok(result)
+    persist_and_refresh_imported(app, result)
 }
 
 #[tauri::command]
@@ -3352,9 +4394,7 @@ fn import_codex_from_local(app: tauri::AppHandle) -> Result<ImportResult, String
         }];
         return Ok(result);
     }
-    upsert_accounts_into_db(&app, &result.imported)?;
-    refresh_imported_accounts_in_background(app, result.imported.clone());
-    Ok(result)
+    persist_and_refresh_imported(app, result)
 }
 
 #[tauri::command]
@@ -3400,9 +4440,7 @@ fn import_gemini_from_local(app: tauri::AppHandle) -> Result<ImportResult, Strin
     }
 
     let result = parse_auth_json_content(&oauth_value.to_string(), "local", "Gemini 本机账号");
-    upsert_accounts_into_db(&app, &result.imported)?;
-    refresh_imported_accounts_in_background(app, result.imported.clone());
-    Ok(result)
+    persist_and_refresh_imported(app, result)
 }
 
 #[tauri::command]
@@ -3453,44 +4491,26 @@ async fn complete_codex_oauth(
     app: tauri::AppHandle,
     login_id: String,
 ) -> Result<ImportResult, String> {
-    let pending = OAUTH_PENDING
-        .lock()
-        .map_err(|_| "OAuth 状态锁失败".to_string())?
-        .get(&login_id)
-        .cloned();
-    let Some(pending) = pending else {
-        return Ok(ImportResult {
-            imported: vec![],
-            failed: vec![],
-        });
+    let Some(pending) = oauth_pending_get(&login_id)? else {
+        return Ok(ImportResult { imported: vec![], failed: vec![] });
     };
     if pending.provider != "codex" {
         return Err("无效的 Codex OAuth 会话".to_string());
     }
     if pending.expires_at <= now_ts() {
-        OAUTH_PENDING
-            .lock()
-            .map_err(|_| "OAuth 状态锁失败".to_string())?
-            .remove(&login_id);
+        oauth_pending_remove(&login_id);
         return Err("Codex OAuth 登录已超时，请重新发起授权".to_string());
     }
     let Some(code) = pending.code else {
-        return Ok(ImportResult {
-            imported: vec![],
-            failed: vec![],
-        });
+        return Ok(ImportResult { imported: vec![], failed: vec![] });
     };
     let code_verifier = pending
         .code_verifier
         .ok_or_else(|| "Codex OAuth 会话缺少 code_verifier".to_string())?;
     let payload = exchange_codex_oauth_code(&code, &code_verifier, pending.port).await?;
     let result = parse_auth_json_content(&payload.to_string(), "oauth", "Codex OAuth");
-    upsert_accounts_into_db(&app, &result.imported)?;
-    refresh_imported_accounts_in_background(app, result.imported.clone());
-    OAUTH_PENDING
-        .lock()
-        .map_err(|_| "OAuth 状态锁失败".to_string())?
-        .remove(&login_id);
+    let result = persist_and_refresh_imported(app, result)?;
+    oauth_pending_remove(&login_id);
     Ok(result)
 }
 
@@ -3540,41 +4560,23 @@ async fn complete_gemini_oauth(
     app: tauri::AppHandle,
     login_id: String,
 ) -> Result<ImportResult, String> {
-    let pending = OAUTH_PENDING
-        .lock()
-        .map_err(|_| "OAuth 状态锁失败".to_string())?
-        .get(&login_id)
-        .cloned();
-    let Some(pending) = pending else {
-        return Ok(ImportResult {
-            imported: vec![],
-            failed: vec![],
-        });
+    let Some(pending) = oauth_pending_get(&login_id)? else {
+        return Ok(ImportResult { imported: vec![], failed: vec![] });
     };
     if pending.provider != "gemini" {
         return Err("无效的 Gemini OAuth 会话".to_string());
     }
     if pending.expires_at <= now_ts() {
-        OAUTH_PENDING
-            .lock()
-            .map_err(|_| "OAuth 状态锁失败".to_string())?
-            .remove(&login_id);
+        oauth_pending_remove(&login_id);
         return Err("Gemini OAuth 登录已超时，请重新发起授权".to_string());
     }
     let Some(code) = pending.code else {
-        return Ok(ImportResult {
-            imported: vec![],
-            failed: vec![],
-        });
+        return Ok(ImportResult { imported: vec![], failed: vec![] });
     };
     let payload = exchange_gemini_oauth_code(&code, &pending.redirect_uri).await?;
     let result = parse_auth_json_content(&payload.to_string(), "oauth", "Gemini OAuth");
-    upsert_accounts_into_db(&app, &result.imported)?;
-    refresh_imported_accounts_in_background(app, result.imported.clone());
-    OAUTH_PENDING
-        .lock()
-        .map_err(|_| "OAuth 状态锁失败".to_string())?
-        .remove(&login_id);
+    let result = persist_and_refresh_imported(app, result)?;
+    oauth_pending_remove(&login_id);
     Ok(result)
 }
 

@@ -1024,10 +1024,13 @@ h2 {
   max-width: 100%;
 }
 
+.account-title > .pill {
+  flex: 0 0 auto;
+}
+
 .account-title strong {
   flex: 0 1 auto;
   min-width: 0;
-  max-width: calc(100% - 62px);
   color: var(--text-strong);
   font-size: 14px;
   font-weight: 700;
@@ -2047,6 +2050,12 @@ h2 {
   justify-content: center;
   gap: 6px;
   min-width: 86px;
+  line-height: 1;
+}
+
+.export-actions button > svg {
+  flex-shrink: 0;
+  display: block;
 }
 
 .privacy-mask .account-title strong,

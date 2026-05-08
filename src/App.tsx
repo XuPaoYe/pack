@@ -113,7 +113,7 @@ const modeConfig: Record<
   paste: {
     icon: Clipboard,
     title: "粘贴凭证",
-    desc: "粘贴 Auth.json 内容或账号 Json 数据",
+    desc: "粘贴 Auth.json、账号 Json、Windsurf auth1/session 凭证",
   },
   file: {
     icon: FileJson,
@@ -133,7 +133,7 @@ const modeConfig: Record<
   password: {
     icon: LockKeyhole,
     title: "账号密码",
-    desc: "使用 Windsurf 邮箱和密码登录，自动获取 token。",
+    desc: "使用旧版 Windsurf Firebase 邮箱密码登录。",
   },
 };
 
@@ -234,6 +234,14 @@ function AccountPlanBadge({ account }: { account: ManagedAccount }) {
   return <span className={clsx("pill", "plan", badge.tone)}>{badge.label}</span>;
 }
 
+function localizeQuotaLabel(label: string): string {
+  const upper = label.toUpperCase();
+  if (upper === "DAILY") return "日限";
+  if (upper === "WEEKLY") return "周限";
+  if (/^\d+[HD]$/.test(upper)) return upper;
+  return label;
+}
+
 function QuotaMeters({ account }: { account: ManagedAccount }) {
   const isUnavailable = account.status?.state === "unavailable";
   const metrics =
@@ -241,7 +249,7 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
       ? account.quota.metrics
       : [
           { key: "codex-5h", label: "5H", remainingPercent: 0 },
-          { key: "codex-weekly", label: "WEEKLY", remainingPercent: 0 },
+          { key: "codex-weekly", label: "周限", remainingPercent: 0 },
         ];
 
   return (
@@ -253,7 +261,7 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
         return (
           <div className={clsx("quota-meter", state)} key={metric.key} title={metric.detail ?? account.quota?.error ?? metric.label}>
             <div className="quota-meter-head">
-              <span>{metric.label}</span>
+              <span>{localizeQuotaLabel(metric.label)}</span>
               <time className="quota-meter-reset">{resetText}</time>
               <div className="quota-meter-value">
                 <strong>{remaining === undefined ? "N/A" : `${remaining}%`}</strong>
@@ -1366,7 +1374,7 @@ function App() {
                     value={pasteValue}
                     onChange={(event) => setPasteValue(event.target.value)}
                     spellCheck={false}
-                    placeholder={'{\n  "tokens": {\n    "id_token": "eyJ...",\n    "access_token": "eyJ...",\n    "refresh_token": "rt_..."\n  }\n}'}
+                    placeholder={'{\n  "provider": "windsurf",\n  "email": "name@example.com",\n  "tokens": {\n    "auth1_token": "auth1_...",\n    "session_token": "devin-session-token$..."\n  }\n}'}
                   />
                   <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim() || isBusy}>
                     <Clipboard size={20} />
@@ -1446,7 +1454,7 @@ function App() {
                     {isBusy ? "登录中..." : "登录并添加"}
                   </button>
                   <p className="windsurf-password-tip">
-                    账号密码仅用于本地 Firebase 登录调用，不会上传到任何第三方服务。
+                    此入口仅适用于使用邮箱 + 密码注册的 Windsurf 账号（Firebase 密码登录）。通过 Google/Devin SSO 登录的账号请用“粘贴凭证”导入 auth1_token 或 session_token。
                   </p>
                 </div>
               )}
