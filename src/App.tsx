@@ -41,11 +41,12 @@ import "./App.css";
 import logoUrl from "./assets/logo.svg";
 import { CodexIcon } from "./components/icons/CodexIcon";
 import { GeminiIcon } from "./components/icons/GeminiIcon";
+import { WindsurfIcon } from "./components/icons/WindsurfIcon";
 import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/accountPresentation";
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
-type ImportMode = "paste" | "file" | "local" | "oauth";
+type ImportMode = "paste" | "file" | "local" | "oauth" | "password";
 type OAuthProvider = "codex" | "gemini";
 type ThemeMode = "system" | "light" | "dark";
 
@@ -129,13 +130,30 @@ const modeConfig: Record<
     title: "OAuth授权",
     desc: "点击下方按钮，在浏览器中完成 OpenAI 账号 OAuth 授权。",
   },
+  password: {
+    icon: LockKeyhole,
+    title: "账号密码",
+    desc: "使用 Windsurf 邮箱和密码登录，自动获取 token。",
+  },
 };
 
 const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
+const windsurfImportModeOrder: ImportMode[] = ["password", "paste"];
 const defaultImportMode: ImportMode = "oauth";
+const defaultWindsurfImportMode: ImportMode = "password";
+
+function importModesForProvider(provider: Provider): ImportMode[] {
+  return provider === "windsurf" ? windsurfImportModeOrder : importModeOrder;
+}
+
+function defaultImportModeForProvider(provider: Provider): ImportMode {
+  return provider === "windsurf" ? defaultWindsurfImportMode : defaultImportMode;
+}
 
 function providerLabel(provider: Provider) {
-  return provider === "codex" ? "Codex" : "Gemini Cli";
+  if (provider === "codex") return "Codex";
+  if (provider === "gemini") return "Gemini Cli";
+  return "Windsurf";
 }
 
 function isAppLogEntry(value: unknown): value is AppLogEntry {
@@ -373,6 +391,8 @@ function App() {
   const [activeProvider, setActiveProvider] = useState<Provider>("codex");
   const [mode, setMode] = useState<ImportMode>(defaultImportMode);
   const [pasteValue, setPasteValue] = useState("");
+  const [windsurfEmail, setWindsurfEmail] = useState("");
+  const [windsurfPassword, setWindsurfPassword] = useState("");
   const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
   const [accountPage, setAccountPage] = useState(1);
@@ -513,6 +533,7 @@ function App() {
     () => ({
       codex: accounts.filter((account) => account.provider === "codex").length,
       gemini: accounts.filter((account) => account.provider === "gemini").length,
+      windsurf: accounts.filter((account) => account.provider === "windsurf").length,
     }),
     [accounts],
   );
@@ -719,7 +740,9 @@ function App() {
 
   const closeImportModal = () => {
     setIsImportModalOpen(false);
-    setMode(defaultImportMode);
+    setMode(defaultImportModeForProvider(activeProvider));
+    setWindsurfEmail("");
+    setWindsurfPassword("");
   };
 
   const applyImportResult = (
@@ -869,7 +892,8 @@ function App() {
 
   const selectedMode = modeConfig[mode];
   const ModeIcon = selectedMode.icon;
-  const isActiveProviderOAuthPending = Boolean(pendingOAuth[activeProvider]);
+  const isActiveProviderOAuthPending =
+    activeProvider !== "windsurf" && Boolean(pendingOAuth[activeProvider as OAuthProvider]);
   const oauthAccountLabel = activeProvider === "codex" ? "OpenAI" : "Gemini";
   const localImportDesc =
     activeProvider === "codex" ? "从本地已登录的会话中导入 Codex 账号" : "从本地已登录的会话中导入 Gemini Cli 账号";
@@ -914,8 +938,32 @@ function App() {
     close();
   };
   const handleAddAccount = () => {
-    setMode(defaultImportMode);
+    setMode(defaultImportModeForProvider(activeProvider));
     setIsImportModalOpen(true);
+  };
+
+  const handleWindsurfPasswordImport = async () => {
+    if (!windsurfEmail.trim() || !windsurfPassword.trim()) {
+      showNotice("error", "请输入 Windsurf 邮箱和密码");
+      return;
+    }
+    setIsBusy(true);
+    setFailures([]);
+    try {
+      const account = await invoke<ManagedAccount>("add_windsurf_account_by_password", {
+        email: windsurfEmail.trim(),
+        password: windsurfPassword,
+      });
+      applyImportResult(
+        { imported: [account], failed: [] },
+        { successText: `Windsurf 账号 ${account.email} 已添加` },
+      );
+    } catch (error) {
+      const text = String(error).replace(/^Windsurf\s*登录失败[:：]?\s*/, "");
+      showNotice("error", `Windsurf 登录失败：${text}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
   const handleProviderChange = (provider: Provider) => {
     setActiveProvider(provider);
@@ -1127,6 +1175,11 @@ function App() {
             <span>Gemini Cli</span>
             <b>{counts.gemini}</b>
           </button>
+          <button className={clsx(activeProvider === "windsurf" && "active")} onClick={() => handleProviderChange("windsurf")}>
+            <WindsurfIcon className="provider-nav-icon windsurf" />
+            <span>Windsurf</span>
+            <b>{counts.windsurf}</b>
+          </button>
         </nav>
 
         <div className="sidebar-footer">
@@ -1286,7 +1339,7 @@ function App() {
           onClose={closeImportModal}
         >
             <div className="mode-grid">
-              {importModeOrder.map((key) => {
+              {importModesForProvider(activeProvider).map((key) => {
                 const item = modeConfig[key];
                 const Icon = item.icon;
                 return (
@@ -1340,9 +1393,9 @@ function App() {
                 </>
               )}
 
-              {mode === "local" && (
+              {mode === "local" && activeProvider !== "windsurf" && (
                 <>
-                  <button className="drop-zone local-import-button" onClick={() => handleLocalImport(activeProvider)} disabled={isBusy}>
+                  <button className="drop-zone local-import-button" onClick={() => handleLocalImport(activeProvider as OAuthProvider)} disabled={isBusy}>
                     <FolderDown size={28} />
                     <strong>{isBusy ? "正在读取本机账号..." : `读取 ${providerLabel(activeProvider)} 本机账号`}</strong>
                     <span>{providerLabel(activeProvider)} 本机凭证只在当前设备处理</span>
@@ -1350,13 +1403,51 @@ function App() {
                 </>
               )}
 
-              {mode === "oauth" && (
+              {mode === "oauth" && activeProvider !== "windsurf" && (
                 <div className="oauth-flow">
-                  <button className={clsx("drop-zone", isActiveProviderOAuthPending && "oauth-pending")} onClick={() => handleOAuthStart(activeProvider)}>
+                  <button className={clsx("drop-zone", isActiveProviderOAuthPending && "oauth-pending")} onClick={() => handleOAuthStart(activeProvider as OAuthProvider)}>
                     <LockKeyhole size={28} />
                     <strong>{isActiveProviderOAuthPending ? "重新打开授权" : "在浏览器中打开"}</strong>
                     <span>{isActiveProviderOAuthPending ? "浏览器关闭或卡住时可重新发起" : `${oauthAccountLabel} OAuth 授权将在浏览器中完成`}</span>
                   </button>
+                </div>
+              )}
+
+              {mode === "password" && activeProvider === "windsurf" && (
+                <div className="windsurf-password-form">
+                  <label className="field">
+                    <span>邮箱</span>
+                    <input
+                      type="email"
+                      autoComplete="username"
+                      value={windsurfEmail}
+                      onChange={(event) => setWindsurfEmail(event.target.value)}
+                      placeholder="name@example.com"
+                      disabled={isBusy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>密码</span>
+                    <input
+                      type="password"
+                      autoComplete="current-password"
+                      value={windsurfPassword}
+                      onChange={(event) => setWindsurfPassword(event.target.value)}
+                      placeholder="输入 Windsurf 账号密码"
+                      disabled={isBusy}
+                    />
+                  </label>
+                  <button
+                    className="wide primary"
+                    onClick={() => void handleWindsurfPasswordImport()}
+                    disabled={!windsurfEmail.trim() || !windsurfPassword.trim() || isBusy}
+                  >
+                    <LockKeyhole size={20} />
+                    {isBusy ? "登录中..." : "登录并添加"}
+                  </button>
+                  <p className="windsurf-password-tip">
+                    账号密码仅用于本地 Firebase 登录调用，不会上传到任何第三方服务。
+                  </p>
                 </div>
               )}
             </div>

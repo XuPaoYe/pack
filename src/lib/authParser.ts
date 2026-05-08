@@ -1,6 +1,6 @@
 import { normalizeUnixSeconds, nowUnixSeconds } from "./time";
 
-export type Provider = "codex" | "gemini";
+export type Provider = "codex" | "gemini" | "windsurf";
 
 export type ImportSource = "paste" | "file" | "local" | "oauth";
 
@@ -384,6 +384,120 @@ function parseCodex(value: unknown, source: ImportSource): ManagedAccount | null
   };
 }
 
+function looksLikeWindsurf(value: JsonObject): boolean {
+  const explicit = stringField(value.provider)?.toLowerCase();
+  if (explicit === "windsurf") return true;
+  const tokens = isObject(value.tokens) ? value.tokens : undefined;
+  if (
+    stringField(value.local_id) ??
+    stringField(value.localId) ??
+    stringField(tokens?.local_id) ??
+    stringField(tokens?.localId)
+  ) {
+    return true;
+  }
+  const idToken =
+    stringField(value.id_token) ??
+    stringField(value.idToken) ??
+    stringField(tokens?.id_token) ??
+    stringField(tokens?.idToken);
+  const refreshToken =
+    stringField(value.refresh_token) ??
+    stringField(value.refreshToken) ??
+    stringField(tokens?.refresh_token) ??
+    stringField(tokens?.refreshToken);
+  const jwt = parseJwtPayload(idToken);
+  if (jwt) {
+    const aud = stringField(jwt.aud) ?? "";
+    const iss = stringField(jwt.iss) ?? "";
+    if (aud.includes("exafunction-windsurf") || iss.includes("exafunction-windsurf")) return true;
+    const firebase = isObject(jwt.firebase) ? jwt.firebase : undefined;
+    const signInProvider = stringField(firebase?.sign_in_provider);
+    if (signInProvider === "password" && refreshToken) return true;
+  }
+  return false;
+}
+
+function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | null {
+  if (!isObject(value)) return null;
+  if (!looksLikeWindsurf(value)) return null;
+
+  const tokens = isObject(value.tokens) ? value.tokens : undefined;
+  const idToken =
+    stringField(value.id_token) ??
+    stringField(value.idToken) ??
+    stringField(tokens?.id_token) ??
+    stringField(tokens?.idToken);
+  const refreshToken =
+    stringField(value.refresh_token) ??
+    stringField(value.refreshToken) ??
+    stringField(tokens?.refresh_token) ??
+    stringField(tokens?.refreshToken);
+  const accessToken =
+    stringField(value.access_token) ??
+    stringField(value.accessToken) ??
+    stringField(tokens?.access_token) ??
+    stringField(tokens?.accessToken) ??
+    idToken;
+
+  if (!idToken && !refreshToken) return null;
+
+  const jwt = parseJwtPayload(idToken);
+  const email =
+    stringField(value.email) ??
+    stringField(jwt?.email);
+  if (!email) return null;
+
+  const localId =
+    stringField(value.local_id) ??
+    stringField(value.localId) ??
+    stringField(tokens?.local_id) ??
+    stringField(tokens?.localId) ??
+    stringField(jwt?.user_id) ??
+    stringField(jwt?.sub);
+  const displayName =
+    stringField(value.display_name) ??
+    stringField(value.displayName) ??
+    stringField(value.name) ??
+    stringField(jwt?.name);
+  const expiresAt =
+    numberField(value.expires_at) ??
+    numberField(value.expiresAt) ??
+    numberField(tokens?.expires_at) ??
+    numberField(tokens?.expiresAt) ??
+    numberField(jwt?.exp);
+
+  const now = nowUnixSeconds();
+  const tokenMeta = {
+    hasAccessToken: Boolean(accessToken),
+    hasRefreshToken: Boolean(refreshToken),
+    hasIdToken: Boolean(idToken),
+    expiresAt,
+  };
+  const discriminator = localId ?? email;
+  const plan =
+    stringField(value.plan) ??
+    stringField(value.plan_type) ??
+    stringField(value.planType);
+
+  return {
+    id: stringField(value.id) ?? accountIdFor("windsurf", email, discriminator),
+    provider: "windsurf",
+    email: email.toLowerCase(),
+    displayName,
+    plan,
+    planType: plan,
+    subscriptionActiveUntil: expiresAt,
+    accountId: localId,
+    userId: localId,
+    source,
+    tokenMeta,
+    status: deriveStatus(value, tokenMeta),
+    createdAt: numberField(value.created_at) ?? now,
+    updatedAt: numberField(value.last_used) ?? numberField(value.updated_at) ?? now,
+  };
+}
+
 function parseGemini(value: unknown, source: ImportSource): ManagedAccount | null {
   if (!isObject(value)) return null;
 
@@ -464,7 +578,7 @@ export function parseAuthJson(content: string, source: ImportSource, label = "JS
 
   items.forEach((item, index) => {
     const itemLabel = `${label}${items.length > 1 ? ` #${index + 1}` : ""}`;
-    const account = parseCodex(item, source) ?? parseGemini(item, source);
+    const account = parseCodex(item, source) ?? parseWindsurf(item, source) ?? parseGemini(item, source);
     if (account) {
       imported.push(account);
     } else {

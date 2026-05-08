@@ -24,6 +24,7 @@ use std::os::windows::process::CommandExt;
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const GEMINI_KEYCHAIN_SERVICE: &str = "gemini-cli-oauth";
 const GEMINI_KEYCHAIN_ACCOUNT: &str = "main-account";
+const GEMINI_FILE_KEYCHAIN_FILE: &str = "gemini-credentials.json";
 const CODEX_ACCOUNT_CHECK_URL: &str =
     "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
@@ -46,6 +47,12 @@ const GEMINI_CODE_ASSIST_LOAD_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const GEMINI_CODE_ASSIST_QUOTA_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+const WINDSURF_FIREBASE_API_KEY: &str = "AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY";
+const WINDSURF_FIREBASE_SIGNIN_URL: &str =
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword";
+const WINDSURF_FIREBASE_REFRESH_URL: &str = "https://securetoken.googleapis.com/v1/token";
+const WINDSURF_FIREBASE_LOOKUP_URL: &str =
+    "https://identitytoolkit.googleapis.com/v1/accounts:lookup";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -208,6 +215,12 @@ fn now_ts() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+fn codex_last_refresh_now() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.6fZ")
+        .to_string()
 }
 
 fn now_ts_ms() -> i64 {
@@ -1081,6 +1094,455 @@ fn parse_gemini_account(value: &Value, source: &str) -> Option<ManagedAccount> {
     })
 }
 
+fn looks_like_windsurf(obj: &serde_json::Map<String, Value>) -> bool {
+    if string_field(obj.get("provider"))
+        .map(|p| p.eq_ignore_ascii_case("windsurf"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let tokens = obj.get("tokens").and_then(Value::as_object);
+    if string_field(obj.get("local_id"))
+        .or_else(|| string_field(obj.get("localId")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("local_id"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("localId"))))
+        .is_some()
+    {
+        return true;
+    }
+    let refresh_token = string_field(obj.get("refresh_token"))
+        .or_else(|| string_field(obj.get("refreshToken")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("refresh_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("refreshToken"))));
+    let id_token = string_field(obj.get("id_token"))
+        .or_else(|| string_field(obj.get("idToken")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("id_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("idToken"))));
+    if let Some(jwt) = id_token.as_deref().and_then(parse_jwt_payload) {
+        let aud = string_field(jwt.get("aud")).unwrap_or_default();
+        let iss = string_field(jwt.get("iss")).unwrap_or_default();
+        if aud.contains("exafunction-windsurf") || iss.contains("exafunction-windsurf") {
+            return true;
+        }
+        if let Some(sign_in_provider) = jwt
+            .get("firebase")
+            .and_then(Value::as_object)
+            .and_then(|f| string_field(f.get("sign_in_provider")))
+        {
+            if sign_in_provider == "password" && refresh_token.is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn parse_windsurf_account(value: &Value, source: &str) -> Option<ManagedAccount> {
+    let obj = value.as_object()?;
+    if !looks_like_windsurf(obj) {
+        return None;
+    }
+    let tokens = obj.get("tokens").and_then(Value::as_object);
+
+    let id_token = string_field(obj.get("id_token"))
+        .or_else(|| string_field(obj.get("idToken")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("id_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("idToken"))));
+    let refresh_token = string_field(obj.get("refresh_token"))
+        .or_else(|| string_field(obj.get("refreshToken")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("refresh_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("refreshToken"))));
+    let access_token = string_field(obj.get("access_token"))
+        .or_else(|| string_field(obj.get("accessToken")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("access_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("accessToken"))))
+        .or_else(|| id_token.clone());
+
+    if id_token.is_none() && refresh_token.is_none() {
+        return None;
+    }
+
+    let jwt = id_token.as_deref().and_then(parse_jwt_payload);
+    let email = string_field(obj.get("email"))
+        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("email"))))?;
+    let local_id = string_field(obj.get("local_id"))
+        .or_else(|| string_field(obj.get("localId")))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("local_id"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("localId"))))
+        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("user_id"))))
+        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("sub"))));
+    let display_name = string_field(obj.get("display_name"))
+        .or_else(|| string_field(obj.get("displayName")))
+        .or_else(|| string_field(obj.get("name")))
+        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("name"))));
+    let expires_at = number_field(obj.get("expires_at"))
+        .or_else(|| number_field(obj.get("expiresAt")))
+        .or_else(|| tokens.and_then(|t| number_field(t.get("expires_at"))))
+        .or_else(|| tokens.and_then(|t| number_field(t.get("expiresAt"))))
+        .or_else(|| jwt.as_ref().and_then(|j| number_field(j.get("exp"))));
+
+    let now = now_ts();
+    let token_meta = TokenMeta {
+        has_access_token: access_token.is_some(),
+        has_refresh_token: refresh_token.is_some(),
+        has_id_token: id_token.is_some(),
+        expires_at,
+    };
+    let discriminator = local_id.clone().unwrap_or_else(|| email.clone());
+    let id = string_field(obj.get("id"))
+        .unwrap_or_else(|| format!("windsurf_{}", stable_hash(&format!("{}::{}", email.to_lowercase(), discriminator))));
+
+    // 规范化存储的凭证 payload，保证 refresh / export 能稳定取出。
+    let mut tokens_map = serde_json::Map::new();
+    if let Some(value) = id_token.clone() {
+        tokens_map.insert("id_token".to_string(), Value::String(value));
+    }
+    if let Some(value) = refresh_token.clone() {
+        tokens_map.insert("refresh_token".to_string(), Value::String(value));
+    }
+    if let Some(value) = access_token.clone() {
+        tokens_map.insert("access_token".to_string(), Value::String(value));
+    }
+    if let Some(value) = local_id.clone() {
+        tokens_map.insert("local_id".to_string(), Value::String(value));
+    }
+    if let Some(value) = expires_at {
+        tokens_map.insert("expires_at".to_string(), Value::Number(value.into()));
+    }
+    let mut payload_map = serde_json::Map::new();
+    payload_map.insert("provider".to_string(), Value::String("windsurf".to_string()));
+    payload_map.insert("email".to_string(), Value::String(email.to_lowercase()));
+    if let Some(name) = display_name.clone() {
+        payload_map.insert("display_name".to_string(), Value::String(name));
+    }
+    payload_map.insert("tokens".to_string(), Value::Object(tokens_map));
+    let auth_payload = Value::Object(payload_map);
+
+    let plan = string_field(obj.get("plan"))
+        .or_else(|| string_field(obj.get("plan_type")))
+        .or_else(|| string_field(obj.get("planType")));
+
+    let status = AccountStatus {
+        state: if token_meta.has_access_token || token_meta.has_refresh_token {
+            "available".to_string()
+        } else {
+            "unavailable".to_string()
+        },
+        label: if token_meta.has_access_token || token_meta.has_refresh_token {
+            "可用".to_string()
+        } else {
+            "不可用".to_string()
+        },
+        reason: None,
+        updated_at: Some(now),
+    };
+
+    Some(ManagedAccount {
+        id,
+        provider: "windsurf".to_string(),
+        email: email.to_lowercase(),
+        display_name,
+        account_name: None,
+        organization_id: None,
+        plan: plan.clone(),
+        plan_type: plan,
+        auth_file_plan_type: None,
+        subscription_active_until: expires_at.map(|value| Value::Number(value.into())),
+        account_id: local_id.clone(),
+        user_id: local_id,
+        source: source.to_string(),
+        token_meta,
+        status: Some(status),
+        quota: None,
+        created_at: number_field(obj.get("created_at")).unwrap_or(now),
+        updated_at: number_field(obj.get("last_used"))
+            .or_else(|| number_field(obj.get("updated_at")))
+            .unwrap_or(now),
+        auth_payload: Some(auth_payload),
+    })
+}
+
+fn windsurf_payload_string(account: &ManagedAccount, key: &str) -> Option<String> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    let tokens = payload.get("tokens").and_then(Value::as_object);
+    string_field(
+        tokens
+            .and_then(|t| t.get(key))
+            .or_else(|| payload.get(key)),
+    )
+}
+
+fn windsurf_set_token_field(account: &mut ManagedAccount, key: &str, value: Value) {
+    let payload = account
+        .auth_payload
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let map = match payload {
+        Value::Object(map) => map,
+        _ => return,
+    };
+    let tokens_value = map
+        .entry("tokens".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Value::Object(tokens_map) = tokens_value {
+        tokens_map.insert(key.to_string(), value);
+    }
+}
+
+async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
+    if account.provider != "windsurf" {
+        return Ok(());
+    }
+    let refresh_token = windsurf_payload_string(account, "refresh_token")
+        .ok_or_else(|| "缺少 refresh_token".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Windsurf 客户端失败: {error}"))?;
+    let url = format!("{WINDSURF_FIREBASE_REFRESH_URL}?key={WINDSURF_FIREBASE_API_KEY}");
+    let body = format!("grant_type=refresh_token&refresh_token={}", refresh_token);
+    let response = client
+        .post(&url)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(ACCEPT, "*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .header(
+            "Sec-Ch-Ua",
+            r#""Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99""#,
+        )
+        .header("Sec-Ch-Ua-Mobile", "?0")
+        .header("Sec-Ch-Ua-Platform", r#""Windows""#)
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "cross-site")
+        .header("X-Client-Version", "Chrome/JsCore/11.0.0/FirebaseCore-web")
+        .header("Origin", "https://windsurf.com")
+        .header("Referer", "https://windsurf.com/")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| format!("Windsurf token 刷新请求失败: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 Windsurf 刷新响应失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("Windsurf 刷新失败 ({status}): {text}"));
+    }
+    let payload: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("解析 Windsurf 刷新响应失败: {error}"))?;
+    let id_token = string_field(payload.get("id_token"))
+        .ok_or_else(|| "Windsurf 刷新响应缺少 id_token".to_string())?;
+    let access_token =
+        string_field(payload.get("access_token")).unwrap_or_else(|| id_token.clone());
+    let new_refresh_token =
+        string_field(payload.get("refresh_token")).unwrap_or(refresh_token.clone());
+    let expires_in = number_field(payload.get("expires_in")).unwrap_or(3600);
+    let expires_at = now_ts() + expires_in;
+
+    windsurf_set_token_field(account, "id_token", Value::String(id_token.clone()));
+    windsurf_set_token_field(account, "access_token", Value::String(access_token));
+    windsurf_set_token_field(account, "refresh_token", Value::String(new_refresh_token));
+    windsurf_set_token_field(account, "expires_at", Value::Number(expires_at.into()));
+
+    account.token_meta = TokenMeta {
+        has_access_token: true,
+        has_refresh_token: true,
+        has_id_token: true,
+        expires_at: Some(expires_at),
+    };
+    account.subscription_active_until = Some(Value::Number(expires_at.into()));
+    account.updated_at = now_ts();
+    account.status = Some(AccountStatus {
+        state: "available".to_string(),
+        label: "可用".to_string(),
+        reason: None,
+        updated_at: Some(account.updated_at),
+    });
+    Ok(())
+}
+
+fn build_windsurf_payload(account: &ManagedAccount) -> Result<Value, String> {
+    let payload = account
+        .auth_payload
+        .as_ref()
+        .and_then(Value::as_object)
+        .ok_or_else(|| "该账号缺少可导出的 Windsurf 凭证".to_string())?;
+    let tokens = payload
+        .get("tokens")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "该账号缺少 tokens 字段".to_string())?;
+    let mut tokens_map = serde_json::Map::new();
+    for key in [
+        "id_token",
+        "refresh_token",
+        "access_token",
+        "local_id",
+        "expires_at",
+    ] {
+        if let Some(value) = tokens.get(key) {
+            tokens_map.insert(key.to_string(), value.clone());
+        }
+    }
+    let mut result = serde_json::Map::new();
+    result.insert("provider".to_string(), Value::String("windsurf".to_string()));
+    result.insert("email".to_string(), Value::String(account.email.clone()));
+    if let Some(name) = account.display_name.clone() {
+        result.insert("display_name".to_string(), Value::String(name));
+    }
+    result.insert("tokens".to_string(), Value::Object(tokens_map));
+    Ok(Value::Object(result))
+}
+
+async fn windsurf_firebase_sign_in(email: &str, password: &str) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Windsurf 客户端失败: {error}"))?;
+    let url = format!("{WINDSURF_FIREBASE_SIGNIN_URL}?key={WINDSURF_FIREBASE_API_KEY}");
+    let body = serde_json::json!({
+        "email": email,
+        "password": password,
+        "returnSecureToken": true,
+        "clientType": "CLIENT_TYPE_WEB",
+    });
+    let response = client
+        .post(&url)
+        .json(&body)
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .header(
+            "Sec-Ch-Ua",
+            r#""Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99""#,
+        )
+        .header("Sec-Ch-Ua-Mobile", "?0")
+        .header("Sec-Ch-Ua-Platform", r#""Windows""#)
+        .header("Sec-Fetch-Dest", "empty")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "cross-site")
+        .header("X-Client-Version", "Chrome/JsCore/11.0.0/FirebaseCore-web")
+        .header("Origin", "https://windsurf.com")
+        .header("Referer", "https://windsurf.com/")
+        .send()
+        .await
+        .map_err(|error| format!("Windsurf 登录请求失败: {error}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 Windsurf 登录响应失败: {error}"))?;
+    if !status.is_success() {
+        if text.contains("INVALID_LOGIN_CREDENTIALS") || text.contains("INVALID_PASSWORD") {
+            return Err("邮箱或密码错误".to_string());
+        }
+        if text.contains("EMAIL_NOT_FOUND") {
+            return Err("该邮箱未注册".to_string());
+        }
+        if text.contains("USER_DISABLED") {
+            return Err("该账号已被禁用".to_string());
+        }
+        if text.contains("TOO_MANY_ATTEMPTS_TRY_LATER") {
+            return Err("登录尝试次数过多，请 15-30 分钟后再试".to_string());
+        }
+        return Err(format!("Windsurf 登录失败 ({status}): {text}"));
+    }
+    serde_json::from_str::<Value>(&text)
+        .map_err(|error| format!("解析 Windsurf 登录响应失败: {error}"))
+}
+
+async fn windsurf_firebase_lookup(id_token: &str) -> Option<Value> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .ok()?;
+    let url = format!("{WINDSURF_FIREBASE_LOOKUP_URL}?key={WINDSURF_FIREBASE_API_KEY}");
+    let response = client
+        .post(&url)
+        .json(&serde_json::json!({ "idToken": id_token }))
+        .header(CONTENT_TYPE, "application/json")
+        .header(ACCEPT, "*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+        .header("Sec-Fetch-Mode", "cors")
+        .header("Sec-Fetch-Site", "cross-site")
+        .header("X-Client-Version", "Chrome/JsCore/11.0.0/FirebaseCore-web")
+        .header("Origin", "https://windsurf.com")
+        .header("Referer", "https://windsurf.com/")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<Value>().await.ok()
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+async fn add_windsurf_account_by_password(
+    app: tauri::AppHandle,
+    email: String,
+    password: String,
+) -> Result<ManagedAccount, String> {
+    let trimmed_email = email.trim();
+    let trimmed_password = password.trim();
+    if trimmed_email.is_empty() || trimmed_password.is_empty() {
+        return Err("邮箱和密码不能为空".to_string());
+    }
+
+    let signin = windsurf_firebase_sign_in(trimmed_email, trimmed_password).await?;
+    let id_token = string_field(signin.get("idToken"))
+        .ok_or_else(|| "Windsurf 登录响应缺少 idToken".to_string())?;
+    let refresh_token = string_field(signin.get("refreshToken"))
+        .ok_or_else(|| "Windsurf 登录响应缺少 refreshToken".to_string())?;
+    let local_id = string_field(signin.get("localId"));
+    let display_name = string_field(signin.get("displayName"));
+    let resolved_email =
+        string_field(signin.get("email")).unwrap_or_else(|| trimmed_email.to_string());
+    let expires_in = string_field(signin.get("expiresIn"))
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(3600);
+    let expires_at = now_ts() + expires_in;
+
+    // 通过 lookup 拿到 displayName 等信息（可选）。
+    let mut final_display_name = display_name;
+    if final_display_name.is_none() {
+        if let Some(lookup) = windsurf_firebase_lookup(&id_token).await {
+            if let Some(users) = lookup.get("users").and_then(Value::as_array) {
+                if let Some(user) = users.first() {
+                    final_display_name = string_field(user.get("displayName"));
+                }
+            }
+        }
+    }
+
+    let mut tokens_map = serde_json::Map::new();
+    tokens_map.insert("id_token".to_string(), Value::String(id_token.clone()));
+    tokens_map.insert("refresh_token".to_string(), Value::String(refresh_token));
+    tokens_map.insert("access_token".to_string(), Value::String(id_token));
+    if let Some(value) = local_id.clone() {
+        tokens_map.insert("local_id".to_string(), Value::String(value));
+    }
+    tokens_map.insert("expires_at".to_string(), Value::Number(expires_at.into()));
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("provider".to_string(), Value::String("windsurf".to_string()));
+    payload.insert("email".to_string(), Value::String(resolved_email.clone()));
+    if let Some(name) = final_display_name.clone() {
+        payload.insert("display_name".to_string(), Value::String(name));
+    }
+    payload.insert("tokens".to_string(), Value::Object(tokens_map));
+
+    let account = parse_windsurf_account(&Value::Object(payload), "password")
+        .ok_or_else(|| "构建 Windsurf 账号记录失败".to_string())?;
+    upsert_accounts_into_db(&app, &[account.clone()])?;
+    Ok(account)
+}
+
 fn codex_access_token(account: &ManagedAccount) -> Option<String> {
     let payload = account.auth_payload.as_ref()?.as_object()?;
     let tokens = payload.get("tokens").and_then(Value::as_object);
@@ -1546,6 +2008,11 @@ async fn refresh_imported_accounts(accounts: &mut [ManagedAccount]) {
                     mark_account_unavailable(account, error);
                 }
             }
+            "windsurf" => {
+                if let Err(error) = refresh_windsurf_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
             _ => {}
         }
     }
@@ -1590,14 +2057,15 @@ fn parse_auth_json_content(content: &str, source: &str, label: &str) -> ImportRe
         } else {
             label.to_string()
         };
-        if let Some(account) =
-            parse_codex_account(item, source).or_else(|| parse_gemini_account(item, source))
+        if let Some(account) = parse_codex_account(item, source)
+            .or_else(|| parse_windsurf_account(item, source))
+            .or_else(|| parse_gemini_account(item, source))
         {
             imported.push(account);
         } else {
             failed.push(ImportFailure {
                 label: item_label,
-                reason: "未识别到 Codex 或 Gemini 凭证字段".to_string(),
+                reason: "未识别到 Codex / Gemini / Windsurf 凭证字段".to_string(),
             });
         }
     }
@@ -1739,7 +2207,7 @@ fn build_codex_auth_payload(account: &ManagedAccount) -> Result<Value, String> {
         payload
             .get("last_refresh")
             .cloned()
-            .unwrap_or_else(|| Value::String(now_ts().to_string())),
+            .unwrap_or_else(|| Value::String(codex_last_refresh_now())),
     );
     Ok(Value::Object(result))
 }
@@ -1750,7 +2218,9 @@ fn write_codex_auth(account: &ManagedAccount) -> Result<(), String> {
         .map_err(|error| format!("序列化 Codex auth.json 失败: {error}"))?;
     let codex_home = codex_home_dir()?;
     write_string_atomic(&codex_home.join("auth.json"), &content)?;
-    let _ = write_codex_keychain(&codex_home, &content);
+    if auth_payload.get("tokens").is_some() {
+        write_codex_keychain(&codex_home, &content)?;
+    }
     Ok(())
 }
 
@@ -1911,12 +2381,22 @@ fn write_gemini_selected_auth_type() -> Result<(), String> {
     write_string_atomic(&path, &content)
 }
 
+fn clear_gemini_file_keychain() -> Result<(), String> {
+    let path = gemini_home_dir()?.join(GEMINI_FILE_KEYCHAIN_FILE);
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(&path)
+        .map_err(|error| format!("清理 Gemini file keychain 失败 {}: {error}", path.display()))
+}
+
 fn write_gemini_auth(account: &ManagedAccount) -> Result<(), String> {
     let oauth_payload = build_gemini_oauth_payload(account)?;
     let oauth_content = serde_json::to_string_pretty(&oauth_payload)
         .map_err(|error| format!("序列化 Gemini oauth_creds.json 失败: {error}"))?;
     write_string_atomic(&gemini_home_dir()?.join("oauth_creds.json"), &oauth_content)?;
     write_gemini_keychain(&oauth_payload)?;
+    clear_gemini_file_keychain()?;
     write_gemini_active_account(&account.email)?;
     write_gemini_selected_auth_type()
 }
@@ -2388,7 +2868,7 @@ async fn exchange_codex_oauth_code(
         "auth_mode": "chatgpt",
         "OPENAI_API_KEY": Value::Null,
         "tokens": Value::Object(tokens),
-        "last_refresh": now_ts().to_string()
+        "last_refresh": codex_last_refresh_now()
     }))
 }
 
@@ -2612,6 +3092,11 @@ async fn refresh_account(
                 mark_account_unavailable(&mut account, error);
             }
         }
+        "windsurf" => {
+            if let Err(error) = refresh_windsurf_account_remote(&mut account).await {
+                mark_account_unavailable(&mut account, error);
+            }
+        }
         other => return Err(format!("不支持的账号类型: {other}")),
     }
     if was_current {
@@ -2646,6 +3131,11 @@ async fn refresh_provider_accounts(
             }
             "gemini" => {
                 if let Err(error) = refresh_gemini_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
+            "windsurf" => {
+                if let Err(error) = refresh_windsurf_account_remote(account).await {
                     mark_account_unavailable(account, error);
                 }
             }
@@ -2712,6 +3202,9 @@ fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
     match account.provider.as_str() {
         "codex" => write_codex_auth(&account)?,
         "gemini" => write_gemini_auth(&account)?,
+        "windsurf" => {
+            // Windsurf 是 Web 端账号，没有本机配置文件需要写入；仅在数据库中标记为当前。
+        }
         other => return Err(format!("不支持的账号类型: {other}")),
     }
     set_account_current_state(&conn, &account.provider, &account.id)
@@ -2725,6 +3218,7 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
     let value = match account.provider.as_str() {
         "codex" => build_codex_auth_payload(&account)?,
         "gemini" => build_gemini_oauth_payload(&account)?,
+        "windsurf" => build_windsurf_payload(&account)?,
         _ => serde_json::to_value(&account).map_err(|error| format!("序列化账号失败: {error}"))?,
     };
     serde_json::to_string_pretty(&value).map_err(|error| format!("序列化导出内容失败: {error}"))
@@ -3112,7 +3606,8 @@ pub fn run() {
             start_codex_oauth,
             complete_codex_oauth,
             start_gemini_oauth,
-            complete_gemini_oauth
+            complete_gemini_oauth,
+            add_windsurf_account_by_password
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

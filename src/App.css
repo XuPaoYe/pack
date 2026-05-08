@@ -176,6 +176,55 @@ button:disabled {
   padding: 0;
 }
 
+.provider-nav-icon.windsurf {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+}
+
+.windsurf-password-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 4px;
+}
+
+.windsurf-password-form .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+
+.windsurf-password-form .field input {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  background: var(--surface, #fff);
+  color: var(--text);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  outline: none;
+}
+
+.windsurf-password-form .field input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
+}
+
+.windsurf-password-form .field input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.windsurf-password-tip {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-soft);
+  line-height: 1.55;
+}
+
 .nav-list b {
   min-width: 24px;
   height: 22px;
@@ -2012,7 +2061,8 @@ h2 {
 
 .mode-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 4px;
   margin: 16px;
   padding: 4px;

@@ -49,8 +49,20 @@ function resolveGeminiPlanBadge(account: ManagedAccount): PlanBadge {
   return { label: account.plan || account.planType || "未知", tone: "unknown" };
 }
 
+function resolveWindsurfPlanBadge(account: ManagedAccount): PlanBadge {
+  const raw = normalizePlanKey(account.plan || account.planType);
+  if (!raw) return { label: "Windsurf", tone: "unknown" };
+  if (raw.includes("enterprise")) return { label: "Enterprise", tone: "enterprise" };
+  if (raw.includes("team")) return { label: "Team", tone: "team" };
+  if (raw.includes("pro")) return { label: "Pro", tone: "pro" };
+  if (raw.includes("free")) return { label: "Free", tone: "free" };
+  return { label: account.plan || "Windsurf", tone: "unknown" };
+}
+
 export function resolvePlanBadge(account: ManagedAccount): PlanBadge {
-  return account.provider === "gemini" ? resolveGeminiPlanBadge(account) : resolveCodexPlanBadge(account);
+  if (account.provider === "gemini") return resolveGeminiPlanBadge(account);
+  if (account.provider === "windsurf") return resolveWindsurfPlanBadge(account);
+  return resolveCodexPlanBadge(account);
 }
 
 export function resolveValidityUntil(account: ManagedAccount) {
