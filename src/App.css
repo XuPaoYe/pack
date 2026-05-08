@@ -474,6 +474,10 @@ h2 {
   max-width: 100%;
 }
 
+.accounts-panel.has-pagination {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
 .accounts-toolbar {
   min-width: 0;
   max-width: 100%;
@@ -674,7 +678,6 @@ h2 {
 }
 
 .account-pagination {
-  grid-column: 1 / -1;
   min-height: 44px;
   display: flex;
   align-items: center;

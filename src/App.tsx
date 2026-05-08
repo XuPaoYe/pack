@@ -82,6 +82,7 @@ const APP_LOG_STORAGE_KEY = "super-ai:app-logs";
 const APP_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 const APP_LOG_LIMIT = 300;
 const ACCOUNT_PAGE_SIZE = 12;
+const ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS = 15_000;
 
 const noticeToneConfig: Record<NoticeTone, { icon: typeof Info; label: string }> = {
   success: { icon: BadgeCheck, label: "成功" },
@@ -341,6 +342,8 @@ function App() {
   const accountListRef = useRef<HTMLDivElement | null>(null);
   const oauthPollTimers = useRef<Partial<Record<OAuthProvider, number>>>({});
   const noticeTimer = useRef<number | null>(null);
+  const hasStartedStartupRefresh = useRef(false);
+  const activeAccountRefreshInFlight = useRef<string | null>(null);
   const [accountScrollbar, setAccountScrollbar] = useState({
     visible: false,
     top: 0,
@@ -372,12 +375,20 @@ function App() {
     const start = (currentAccountPage - 1) * ACCOUNT_PAGE_SIZE;
     return filteredAccounts.slice(start, start + ACCOUNT_PAGE_SIZE);
   }, [filteredAccounts, currentAccountPage]);
+  const isActiveProviderRefreshing = useMemo(
+    () => refreshingProvider === activeProvider || filteredAccounts.some((account) => refreshingAccountIds.has(account.id)),
+    [activeProvider, filteredAccounts, refreshingAccountIds, refreshingProvider],
+  );
 
   const counts = useMemo(
     () => ({
       codex: accounts.filter((account) => account.provider === "codex").length,
       gemini: accounts.filter((account) => account.provider === "gemini").length,
     }),
+    [accounts],
+  );
+  const activeAccount = useMemo(
+    () => accounts.find((account) => isCurrentAccount(account)) ?? null,
     [accounts],
   );
 
@@ -447,13 +458,63 @@ function App() {
     }, NOTICE_TIMEOUT_MS);
   }, [appendAppLog]);
 
-  const reloadAccountsSoon = (delay = 1800) => {
+  const reloadAccountsSoon = useCallback((delay = 1800) => {
     window.setTimeout(() => {
       void invoke<ManagedAccount[]>("list_accounts")
         .then((storedAccounts) => setAccounts(storedAccounts))
         .catch(() => undefined);
     }, delay);
-  };
+  }, []);
+
+  const refreshAllAccountsOnLaunch = useCallback((storedAccounts: ManagedAccount[]) => {
+    if (hasStartedStartupRefresh.current || storedAccounts.length === 0) return;
+    hasStartedStartupRefresh.current = true;
+    const startupAccountIds = Array.from(new Set(storedAccounts.map((account) => account.id)));
+
+    setRefreshingAccountIds((current) => {
+      const next = new Set(current);
+      startupAccountIds.forEach((accountId) => next.add(accountId));
+      return next;
+    });
+
+    void invoke<ManagedAccount[]>("refresh_all_accounts")
+      .then((refreshedAccounts) => {
+        const refreshedById = new Map(refreshedAccounts.map((account) => [account.id, account]));
+        setAccounts((current) =>
+          sortAccountsForView(
+            (current.length > 0 ? current : refreshedAccounts).map((account) => refreshedById.get(account.id) ?? account),
+          ),
+        );
+        showNotice("success", `启动检查完成，已刷新 ${refreshedAccounts.length} 个账号状态`);
+      })
+      .catch((error) => {
+        reloadAccountsSoon(1200);
+        showNotice("error", `启动检查账号状态失败：${String(error)}`);
+      })
+      .finally(() => {
+        setRefreshingAccountIds((current) => {
+          const next = new Set(current);
+          startupAccountIds.forEach((accountId) => next.delete(accountId));
+          return next;
+        });
+      });
+  }, [reloadAccountsSoon, showNotice]);
+
+  const refreshActiveAccountSilently = useCallback(async () => {
+    if (!activeAccount) return;
+    if (activeAccountRefreshInFlight.current) return;
+    if (refreshingAccountIds.has(activeAccount.id)) return;
+
+    activeAccountRefreshInFlight.current = activeAccount.id;
+    try {
+      const refreshed = await invoke<ManagedAccount>("refresh_account", { accountId: activeAccount.id });
+      setAccounts((current) => sortAccountsForView(current.map((item) => (item.id === refreshed.id ? refreshed : item))));
+    } catch {
+      reloadAccountsSoon(1200);
+    } finally {
+      activeAccountRefreshInFlight.current = null;
+    }
+  }, [activeAccount, refreshingAccountIds, reloadAccountsSoon]);
 
   const refreshImportedAccountStatus = (importedAccounts: ManagedAccount[]) => {
     const accountIds = Array.from(new Set(importedAccounts.map((account) => account.id)));
@@ -815,6 +876,7 @@ function App() {
     void invoke<ManagedAccount[]>("list_accounts")
       .then((storedAccounts) => {
         setAccounts(storedAccounts);
+        refreshAllAccountsOnLaunch(storedAccounts);
       })
       .catch(() => undefined);
 
@@ -834,7 +896,7 @@ function App() {
       oauthPollTimers.current = {};
       if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
     };
-  }, []);
+  }, [refreshAllAccountsOnLaunch]);
 
   useEffect(() => {
     if (!isSettingsLoaded) return;
@@ -846,6 +908,14 @@ function App() {
   useEffect(() => {
     persistAppLogs(appLogs);
   }, [appLogs]);
+
+  useEffect(() => {
+    if (!activeAccount) return undefined;
+    const timer = window.setInterval(() => {
+      void refreshActiveAccountSilently();
+    }, ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [activeAccount, refreshActiveAccountSilently]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -910,7 +980,7 @@ function App() {
 
       <section className="workspace">
         <section className="content-grid">
-          <div className="accounts-panel">
+          <div className={clsx("accounts-panel", shouldShowAccountPagination && "has-pagination")}>
             <div className="accounts-toolbar">
               <div className="toolbar-meta">
                   {providerLabel(activeProvider)} · {filteredAccounts.length} 个匹配项
@@ -924,8 +994,8 @@ function App() {
                   <Plus size={18} />
                   添加账号
                 </button>
-                <button className="secondary refresh-all" onClick={handleRefreshVisibleAccounts} disabled={isBusy}>
-                  <RotateCw size={18} className={clsx(refreshingProvider === activeProvider && "spin")} />
+                <button className="secondary refresh-all" onClick={handleRefreshVisibleAccounts} disabled={isBusy || isActiveProviderRefreshing}>
+                  <RotateCw size={18} className={clsx(isActiveProviderRefreshing && "spin")} />
                   刷新账号
                 </button>
               </div>
@@ -993,37 +1063,37 @@ function App() {
                       </div>
                     </article>
                   ))}
-                  {shouldShowAccountPagination && (
-                    <div className="account-pagination" aria-label="账号分页">
-                      <span>
-                        第 {currentAccountPage} / {totalAccountPages} 页 · 每页 {ACCOUNT_PAGE_SIZE} 个
-                      </span>
-                      <div>
-                        <button
-                          className="secondary pagination-button"
-                          onClick={() => setAccountPage((page) => Math.max(1, Math.min(page, totalAccountPages) - 1))}
-                          disabled={currentAccountPage <= 1}
-                        >
-                          <ChevronLeft size={16} />
-                          上一页
-                        </button>
-                        <button
-                          className="secondary pagination-button"
-                          onClick={() => setAccountPage((page) => Math.min(totalAccountPages, Math.max(page, 1) + 1))}
-                          disabled={currentAccountPage >= totalAccountPages}
-                        >
-                          下一页
-                          <ChevronRight size={16} />
-                        </button>
-                      </div>
-                    </div>
-                  )}
                 </div>
               </div>
               <div className={clsx("account-scrollbar", accountScrollbar.visible && "visible")} aria-hidden="true">
                 <i style={{ height: accountScrollbar.height, transform: `translateY(${accountScrollbar.top}px)` }} />
               </div>
             </div>
+            {shouldShowAccountPagination && (
+              <div className="account-pagination" aria-label="账号分页">
+                <span>
+                  第 {currentAccountPage} / {totalAccountPages} 页 · 每页 {ACCOUNT_PAGE_SIZE} 个
+                </span>
+                <div>
+                  <button
+                    className="secondary pagination-button"
+                    onClick={() => setAccountPage((page) => Math.max(1, Math.min(page, totalAccountPages) - 1))}
+                    disabled={currentAccountPage <= 1}
+                  >
+                    <ChevronLeft size={16} />
+                    上一页
+                  </button>
+                  <button
+                    className="secondary pagination-button"
+                    onClick={() => setAccountPage((page) => Math.min(totalAccountPages, Math.max(page, 1) + 1))}
+                    disabled={currentAccountPage >= totalAccountPages}
+                  >
+                    下一页
+                    <ChevronRight size={16} />
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </section>
       </section>

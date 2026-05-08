@@ -1634,8 +1634,7 @@ fn write_string_atomic(path: &Path, content: &str) -> Result<(), String> {
     ));
     fs::write(&tmp_path, content)
         .map_err(|error| format!("写入临时文件失败 {}: {error}", tmp_path.display()))?;
-    fs::rename(&tmp_path, path)
-        .map_err(|error| format!("替换文件失败 {}: {error}", path.display()))?;
+    rename_replace_file(&tmp_path, path)?;
 
     #[cfg(unix)]
     {
@@ -1644,6 +1643,18 @@ fn write_string_atomic(path: &Path, content: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn rename_replace_file(from: &Path, to: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        if to.exists() {
+            fs::remove_file(to)
+                .map_err(|error| format!("移除旧文件失败 {}: {error}", to.display()))?;
+        }
+    }
+
+    fs::rename(from, to).map_err(|error| format!("替换文件失败 {}: {error}", to.display()))
 }
 
 fn codex_home_dir() -> Result<PathBuf, String> {
@@ -2649,6 +2660,37 @@ async fn refresh_provider_accounts(
 }
 
 #[tauri::command]
+async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
+    let mut accounts = {
+        let conn = open_app_db(&app)?;
+        read_accounts_from_conn(&conn)?
+    };
+
+    for account in &mut accounts {
+        let was_current = is_current_status(&account.status);
+        match account.provider.as_str() {
+            "codex" => {
+                if let Err(error) = refresh_codex_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
+            "gemini" => {
+                if let Err(error) = refresh_gemini_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
+            _ => {}
+        }
+        if was_current {
+            mark_account_current(account);
+        }
+    }
+
+    upsert_accounts_into_db(&app, &accounts)?;
+    Ok(accounts)
+}
+
+#[tauri::command]
 #[allow(non_snake_case)]
 fn delete_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
@@ -3055,6 +3097,7 @@ pub fn run() {
             upsert_accounts,
             refresh_account,
             refresh_provider_accounts,
+            refresh_all_accounts,
             delete_account,
             switch_account,
             export_account,
