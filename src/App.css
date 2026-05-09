@@ -2309,3 +2309,200 @@ textarea:focus {
     grid-template-columns: 1fr;
   }
 }
+
+/* Windsurf 本地 API 服务卡片 */
+.account-row.windsurf-api-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 18px;
+  border: 1px solid var(--border-soft);
+  background: linear-gradient(180deg, rgba(38, 109, 255, 0.06), rgba(38, 109, 255, 0.02));
+}
+
+.account-row.windsurf-api-card.running {
+  border-color: rgba(60, 165, 92, 0.45);
+  background: linear-gradient(180deg, rgba(60, 165, 92, 0.08), rgba(60, 165, 92, 0.02));
+}
+
+.windsurf-api-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.windsurf-api-icon {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  background: rgba(38, 109, 255, 0.12);
+  color: #2f6dff;
+}
+
+.account-row.windsurf-api-card.running .windsurf-api-icon {
+  background: rgba(60, 165, 92, 0.16);
+  color: #2f8a4d;
+}
+
+.windsurf-api-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+
+.windsurf-api-title strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.windsurf-api-title span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.windsurf-api-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.windsurf-api-toggle.on {
+  background: rgba(38, 109, 255, 0.1);
+  color: #2f6dff;
+  border-color: rgba(38, 109, 255, 0.3);
+}
+
+.windsurf-api-toggle.on:hover:not(:disabled) {
+  background: rgba(38, 109, 255, 0.18);
+}
+
+.windsurf-api-toggle.off {
+  background: rgba(60, 165, 92, 0.12);
+  color: #2f8a4d;
+  border-color: rgba(60, 165, 92, 0.3);
+}
+
+.windsurf-api-toggle.off:hover:not(:disabled) {
+  background: rgba(60, 165, 92, 0.2);
+}
+
+.windsurf-api-toggle:disabled {
+  opacity: 0.55;
+  cursor: progress;
+}
+
+.windsurf-api-grid {
+  display: grid;
+  grid-template-columns: 48px 1fr;
+  row-gap: 6px;
+  column-gap: 12px;
+  margin: 0;
+  font-size: 12px;
+}
+
+.windsurf-api-grid dt {
+  color: var(--text-muted);
+  align-self: center;
+}
+
+.windsurf-api-grid dd {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.windsurf-api-grid code {
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
+  font-size: 12px;
+  background: var(--bg-subtle);
+  padding: 3px 8px;
+  border-radius: 6px;
+  color: var(--text-strong);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.windsurf-api-grid .icon-btn {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-soft);
+  background: transparent;
+  border-radius: 6px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.windsurf-api-grid .icon-btn:hover:not(:disabled) {
+  background: var(--bg-subtle);
+  color: var(--text-strong);
+}
+
+.windsurf-api-grid .icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.windsurf-api-hint {
+  margin: 0;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-subtle);
+  border-radius: 7px;
+  text-align: center;
+  line-height: 1.55;
+}
+
+.windsurf-api-actions {
+  display: flex;
+  justify-content: center;
+}
+
+.windsurf-api-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 18px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(38, 109, 255, 0.1);
+  color: #2f6dff;
+  border: 1px solid rgba(38, 109, 255, 0.3);
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.windsurf-api-add:hover {
+  background: rgba(38, 109, 255, 0.18);
+}
+
+.windsurf-api-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #c0413c;
+  background: rgba(192, 65, 60, 0.08);
+  border: 1px solid rgba(192, 65, 60, 0.25);
+  border-radius: 6px;
+}

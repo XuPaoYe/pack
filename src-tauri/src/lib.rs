@@ -1,3 +1,5 @@
+mod windsurf_api;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
@@ -185,6 +187,18 @@ struct AppSettings {
     show_startup_check: bool,
     #[serde(default = "default_true")]
     auto_detect: bool,
+    #[serde(default)]
+    windsurf_api_enabled: bool,
+    #[serde(default = "default_windsurf_api_host")]
+    windsurf_api_host: String,
+    #[serde(default)]
+    windsurf_api_port: u16,
+    #[serde(default)]
+    windsurf_api_key: String,
+}
+
+fn default_windsurf_api_host() -> String {
+    windsurf_api::DEFAULT_HOST.to_string()
 }
 
 fn default_theme() -> String {
@@ -198,6 +212,10 @@ fn default_app_settings() -> AppSettings {
         mask_sensitive: false,
         show_startup_check: true,
         auto_detect: true,
+        windsurf_api_enabled: false,
+        windsurf_api_host: default_windsurf_api_host(),
+        windsurf_api_port: windsurf_api::DEFAULT_PORT,
+        windsurf_api_key: String::new(),
     }
 }
 
@@ -4580,6 +4598,96 @@ async fn complete_gemini_oauth(
     Ok(result)
 }
 
+fn read_settings_record(app: &tauri::AppHandle) -> Result<AppSettings, String> {
+    let conn = open_app_db(app)?;
+    let result = conn.query_row(
+        "SELECT value_json FROM settings WHERE key = 'app'",
+        [],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(value_json) => serde_json::from_str::<AppSettings>(&value_json)
+            .map_err(|error| format!("解析设置失败: {error}")),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(default_app_settings()),
+        Err(error) => Err(format!("读取设置失败: {error}")),
+    }
+}
+
+fn write_settings_record(app: &tauri::AppHandle, settings: &AppSettings) -> Result<(), String> {
+    let conn = open_app_db(app)?;
+    let value_json =
+        serde_json::to_string(settings).map_err(|error| format!("序列化设置失败: {error}"))?;
+    conn.execute(
+        r#"
+      INSERT INTO settings (key, value_json, updated_at)
+      VALUES ('app', ?1, ?2)
+      ON CONFLICT(key) DO UPDATE SET
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+      "#,
+        params![value_json, now_ts()],
+    )
+    .map_err(|error| format!("保存设置失败: {error}"))?;
+    Ok(())
+}
+
+fn ensure_windsurf_api_key(app: &tauri::AppHandle, settings: &mut AppSettings) -> Result<(), String> {
+    if settings.windsurf_api_key.trim().is_empty() {
+        settings.windsurf_api_key = windsurf_api::generate_api_key();
+        write_settings_record(app, settings)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_windsurf_api_status(
+    app: tauri::AppHandle,
+) -> Result<windsurf_api::WindsurfApiStatus, String> {
+    let mut settings = read_settings_record(&app)?;
+    ensure_windsurf_api_key(&app, &mut settings)?;
+    Ok(windsurf_api::current_status(
+        &settings.windsurf_api_host,
+        settings.windsurf_api_port,
+        &settings.windsurf_api_key,
+    ))
+}
+
+#[tauri::command]
+fn start_windsurf_api(
+    app: tauri::AppHandle,
+) -> Result<windsurf_api::WindsurfApiStatus, String> {
+    let mut settings = read_settings_record(&app)?;
+    ensure_windsurf_api_key(&app, &mut settings)?;
+    let status = windsurf_api::start(
+        &settings.windsurf_api_host,
+        settings.windsurf_api_port,
+        &settings.windsurf_api_key,
+    )?;
+    if !settings.windsurf_api_enabled {
+        settings.windsurf_api_enabled = true;
+        write_settings_record(&app, &settings)?;
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+fn stop_windsurf_api(
+    app: tauri::AppHandle,
+) -> Result<windsurf_api::WindsurfApiStatus, String> {
+    windsurf_api::stop()?;
+    let mut settings = read_settings_record(&app)?;
+    ensure_windsurf_api_key(&app, &mut settings)?;
+    if settings.windsurf_api_enabled {
+        settings.windsurf_api_enabled = false;
+        write_settings_record(&app, &settings)?;
+    }
+    Ok(windsurf_api::current_status(
+        &settings.windsurf_api_host,
+        settings.windsurf_api_port,
+        &settings.windsurf_api_key,
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -4609,7 +4717,10 @@ pub fn run() {
             complete_codex_oauth,
             start_gemini_oauth,
             complete_gemini_oauth,
-            add_windsurf_account_by_password
+            add_windsurf_account_by_password,
+            get_windsurf_api_status,
+            start_windsurf_api,
+            stop_windsurf_api,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -4627,6 +4738,21 @@ pub fn run() {
                         .build(),
                 )?;
             }
+
+            let handle = app.handle().clone();
+            if let Ok(mut settings) = read_settings_record(&handle) {
+                let _ = ensure_windsurf_api_key(&handle, &mut settings);
+                if settings.windsurf_api_enabled {
+                    if let Err(error) = windsurf_api::start(
+                        &settings.windsurf_api_host,
+                        settings.windsurf_api_port,
+                        &settings.windsurf_api_key,
+                    ) {
+                        eprintln!("[Windsurf API] 自启失败: {error}");
+                    }
+                }
+            }
+
             Ok(())
         })
         .run(tauri::generate_context!())

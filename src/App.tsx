@@ -15,6 +15,7 @@ import {
   Copy,
   Cloud,
   Download,
+  Eye,
   EyeOff,
   ExternalLink,
   FileJson,
@@ -25,12 +26,14 @@ import {
   Moon,
   Plus,
   Info,
+  Power,
   RefreshCw,
   RotateCw,
   Rocket,
   ScrollText,
   Search,
   SearchX,
+  Server,
   Settings,
   Sun,
   Trash2,
@@ -72,6 +75,16 @@ type OAuthStartResult = {
   provider: OAuthProvider;
   command: string;
   message: string;
+};
+
+type WindsurfApiStatus = {
+  running: boolean;
+  bindHost: string;
+  bindPort: number;
+  actualPort: number | null;
+  address: string | null;
+  apiKey: string;
+  lastError: string | null;
 };
 
 type SwitchAccountResult = ManagedAccount[];
@@ -300,6 +313,110 @@ function mergeAccounts(current: ManagedAccount[], next: ManagedAccount[]) {
   return sortAccountsForView([...map.values()]);
 }
 
+function WindsurfApiCard({
+  status,
+  busy,
+  showKey,
+  onToggleKey,
+  onToggleService,
+  onCopy,
+  onAddAccount,
+}: {
+  status: WindsurfApiStatus | null;
+  busy: boolean;
+  showKey: boolean;
+  onToggleKey: () => void;
+  onToggleService: () => void;
+  onCopy: (text: string, label: string) => void;
+  onAddAccount: () => void;
+}) {
+  const running = Boolean(status?.running);
+  const address = status?.address ?? "—";
+  const apiKey = status?.apiKey ?? "";
+  const maskedKey = apiKey ? `${apiKey.slice(0, 9)}${"•".repeat(Math.max(apiKey.length - 9, 4))}` : "—";
+
+  return (
+    <article className={clsx("account-row windsurf-api-card", running && "running")}>
+      <div className="windsurf-api-head">
+        <div className="windsurf-api-icon">
+          <Server size={20} strokeWidth={1.7} />
+        </div>
+        <div className="windsurf-api-title">
+          <strong>API 服务</strong>
+          <span>本机/局域网</span>
+        </div>
+        <button
+          type="button"
+          className={clsx("windsurf-api-toggle", running ? "off" : "on")}
+          onClick={onToggleService}
+          disabled={busy}
+        >
+          <Power size={14} />
+          {busy ? "处理中…" : running ? "已启用" : "已停用"}
+        </button>
+      </div>
+
+      <dl className="windsurf-api-grid">
+        <dt>地址</dt>
+        <dd>
+          <code>{address}</code>
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => onCopy(address === "—" ? "" : address, "地址")}
+            disabled={!status?.address}
+            aria-label="复制地址"
+          >
+            <Copy size={14} />
+          </button>
+        </dd>
+        <dt>密钥</dt>
+        <dd>
+          <code>{showKey ? apiKey || "—" : maskedKey}</code>
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={onToggleKey}
+            disabled={!apiKey}
+            aria-label={showKey ? "隐藏密钥" : "显示密钥"}
+          >
+            {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => onCopy(apiKey, "密钥")}
+            disabled={!apiKey}
+            aria-label="复制密钥"
+          >
+            <Copy size={14} />
+          </button>
+        </dd>
+      </dl>
+
+      <p className="windsurf-api-hint">
+        {running
+          ? "正在监听本机与局域网，账号池会按 Windsurf 账号余量自动轮询。"
+          : "将账号添加到 API 服务，点击启动即可，无需其他配置。"}
+      </p>
+
+      <div className="windsurf-api-actions">
+        <button type="button" className="windsurf-api-add" onClick={onAddAccount}>
+          <Plus size={14} />
+          添加账号
+        </button>
+      </div>
+
+      {status?.lastError && (
+        <p className="windsurf-api-error">
+          <CircleAlert size={13} />
+          {status.lastError}
+        </p>
+      )}
+    </article>
+  );
+}
+
 function NoticeToast({ notice, onClose }: { notice: Notice; onClose: () => void }) {
   const config = noticeToneConfig[notice.tone];
   const Icon = config.icon;
@@ -418,6 +535,9 @@ function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>(loadAppLogs);
   const [forceUpdate, setForceUpdate] = useState<ForceUpdateState | null>(null);
+  const [windsurfApi, setWindsurfApi] = useState<WindsurfApiStatus | null>(null);
+  const [showWindsurfApiKey, setShowWindsurfApiKey] = useState(false);
+  const [isWindsurfApiBusy, setIsWindsurfApiBusy] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({
     theme: "system",
     autoLaunch: false,
@@ -1133,6 +1253,44 @@ function App() {
   }, [appLogs]);
 
   useEffect(() => {
+    if (!isTauri()) return;
+    invoke<WindsurfApiStatus>("get_windsurf_api_status")
+      .then((status) => setWindsurfApi(status))
+      .catch(() => undefined);
+  }, []);
+
+  const toggleWindsurfApi = useCallback(async () => {
+    if (isWindsurfApiBusy) return;
+    setIsWindsurfApiBusy(true);
+    try {
+      const command = windsurfApi?.running ? "stop_windsurf_api" : "start_windsurf_api";
+      const status = await invoke<WindsurfApiStatus>(command);
+      setWindsurfApi(status);
+      showNotice(
+        "success",
+        status.running ? `已启动 API 服务${status.address ? "：" + status.address : ""}` : "已停用 API 服务",
+      );
+    } catch (error) {
+      showNotice("error", `操作 API 服务失败：${String(error)}`);
+    } finally {
+      setIsWindsurfApiBusy(false);
+    }
+  }, [isWindsurfApiBusy, showNotice, windsurfApi?.running]);
+
+  const copyWindsurfApiText = useCallback(
+    async (text: string, label: string) => {
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        showNotice("success", `已复制${label}`);
+      } catch (error) {
+        showNotice("error", `复制${label}失败：${String(error)}`);
+      }
+    },
+    [showNotice],
+  );
+
+  useEffect(() => {
     if (!activeAccount) return undefined;
     const timer = window.setInterval(() => {
       void refreshActiveAccountSilently();
@@ -1235,7 +1393,21 @@ function App() {
             <div className="account-scroll-frame">
               <div className="account-scroll-shell" ref={accountListRef} onScroll={updateAccountScrollbar}>
                 <div className="account-list card-mode">
-                  {filteredAccounts.length === 0 && (
+                  {activeProvider === "windsurf" && (
+                    <WindsurfApiCard
+                      status={windsurfApi}
+                      busy={isWindsurfApiBusy}
+                      showKey={showWindsurfApiKey}
+                      onToggleKey={() => setShowWindsurfApiKey((prev) => !prev)}
+                      onToggleService={() => void toggleWindsurfApi()}
+                      onCopy={(text, label) => void copyWindsurfApiText(text, label)}
+                      onAddAccount={() => {
+                        setMode(defaultImportModeForProvider("windsurf"));
+                        setIsImportModalOpen(true);
+                      }}
+                    />
+                  )}
+                  {filteredAccounts.length === 0 && activeProvider !== "windsurf" && (
                     <div className="empty-state">
                       <SearchX size={48} strokeWidth={1.55} />
                       <strong>暂无账号</strong>
