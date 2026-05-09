@@ -697,17 +697,16 @@ function WindsurfApiCard({
           </button>
         </dd>
         <dt>配置</dt>
-        <dd className="windsurf-api-config-row">
-          <span className="windsurf-api-config-summary" title={modelSummary}>
-            {modelSummary}
-          </span>
+        <dd>
+          <code>{modelSummary}</code>
           <button
             type="button"
-            className="windsurf-api-config-button"
+            className="icon-btn"
             onClick={onOpenConfig}
+            aria-label="打开配置"
+            title="打开配置"
           >
             <Settings size={14} />
-            配置
           </button>
         </dd>
       </dl>
@@ -1830,6 +1829,11 @@ function App() {
         </div>
 
         <nav className="nav-list" aria-label="Providers">
+          <button className={clsx(activeProvider === "windsurf" && "active")} onClick={() => handleProviderChange("windsurf")}>
+            <WindsurfIcon className="provider-nav-icon windsurf" />
+            <span>SuperAl</span>
+            <b>{counts.windsurf}</b>
+          </button>
           <button className={clsx(activeProvider === "codex" && "active")} onClick={() => handleProviderChange("codex")}>
             <CodexIcon className="provider-nav-icon codex" />
             <span>Codex</span>
@@ -1839,11 +1843,6 @@ function App() {
             <GeminiIcon className="provider-nav-icon gemini" />
             <span>Gemini Cli</span>
             <b>{counts.gemini}</b>
-          </button>
-          <button className={clsx(activeProvider === "windsurf" && "active")} onClick={() => handleProviderChange("windsurf")}>
-            <WindsurfIcon className="provider-nav-icon windsurf" />
-            <span>SuperAl</span>
-            <b>{counts.windsurf}</b>
           </button>
         </nav>
 

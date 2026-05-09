@@ -2558,45 +2558,6 @@ textarea:focus {
   min-width: 0;
 }
 
-.windsurf-api-config-row {
-  min-width: 0;
-}
-
-.windsurf-api-config-summary {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-strong);
-  font-size: 12.5px;
-  font-weight: 500;
-}
-
-.windsurf-api-config-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: 26px;
-  padding: 0 9px;
-  border: 1px solid var(--line-soft);
-  border-radius: 7px;
-  background: var(--surface-soft);
-  color: var(--text);
-  font: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  flex: 0 0 auto;
-  transition: border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
-}
-
-.windsurf-api-config-button:hover {
-  border-color: var(--line);
-  background: var(--control-hover);
-  color: var(--text-strong);
-}
-
 .windsurf-api-model-count {
   flex: 0 0 auto;
   font-size: 11px;
