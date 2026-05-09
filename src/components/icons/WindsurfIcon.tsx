@@ -5,27 +5,10 @@ type WindsurfIconProps = {
 
 export function WindsurfIcon({ className, size = 20 }: WindsurfIconProps) {
   return (
-    <svg className={className} width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none">
+    <svg className={className} width={size} height={size} viewBox="0 0 195 261" aria-hidden="true" fill="none">
       <path
-        d="M3 7.5h11.5a3.5 3.5 0 1 0-3.4-4.3"
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
-        d="M3 12h15a3 3 0 1 1-3 3"
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <path
-        d="M3 16.5h9.5"
-        stroke="currentColor"
-        strokeWidth="1.7"
-        strokeLinecap="round"
-        strokeLinejoin="round"
+        d="M0.105469 130.264118 14.547684 14.74896C15.561172 6.642633 22.452896.562888 30.662155.562888h85.437103c7.601166 0 13.732773 6.13041 13.732773 13.730091 0 1.621266-.304046 3.293195-.861465 4.813132l-23.462265 62.520045h70.589492c10.236237 0 18.597519 8.308986 18.597519 18.593888 0 3.749176-1.114837 7.397023-3.243164 10.487561L94.055878 253.074971c-2.989792 4.35715-7.905212 6.941042-13.12468 6.941042H79.46164c-7.955888 0-14.442216-6.485061-14.442216-14.439395 0-1.165284.152024-2.330569.45607-3.495853l23.816986-95.603993H16.321289c-8.969375 0-16.21582-7.245029-16.21582-16.212654Z"
+        fill="currentColor"
       />
     </svg>
   );

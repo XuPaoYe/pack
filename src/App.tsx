@@ -22,6 +22,7 @@ import {
   ExternalLink,
   FileJson,
   FolderDown,
+  KeyRound,
   Laptop,
   LockKeyhole,
   Monitor,
@@ -51,7 +52,7 @@ import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/acco
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
-type ImportMode = "paste" | "file" | "local" | "oauth" | "password" | "token";
+type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey";
 type OAuthProvider = "codex" | "gemini";
 type ThemeMode = "system" | "light" | "dark";
 
@@ -119,6 +120,7 @@ const APP_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
 const APP_LOG_LIMIT = 300;
 const ACCOUNT_PAGE_SIZE = 12;
 const ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS = 15_000;
+const API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS = 3_000;
 
 const noticeToneConfig: Record<NoticeTone, { icon: typeof Info; label: string }> = {
   success: { icon: BadgeCheck, label: "成功" },
@@ -129,7 +131,7 @@ const noticeToneConfig: Record<NoticeTone, { icon: typeof Info; label: string }>
 const modeConfig: Record<
   ImportMode,
   {
-    icon: typeof Clipboard;
+    icon: typeof FileJson;
     title: string;
     desc: string;
   }
@@ -137,12 +139,12 @@ const modeConfig: Record<
   paste: {
     icon: Clipboard,
     title: "粘贴凭证",
-    desc: "粘贴 Auth.json、账号 Json、Windsurf api_key / refresh_token 凭证",
+    desc: "粘贴 Auth.json 或账号 JSON。",
   },
   file: {
     icon: FileJson,
     title: "上传Json",
-    desc: "支持 Auth.json、SuperAI 等多种格式",
+    desc: "支持 Auth.json、SuperAl 等多种格式",
   },
   local: {
     icon: Laptop,
@@ -154,22 +156,17 @@ const modeConfig: Record<
     title: "OAuth授权",
     desc: "点击下方按钮，在浏览器中完成 OpenAI 账号 OAuth 授权。",
   },
-  password: {
-    icon: LockKeyhole,
-    title: "账号密码",
-    desc: "使用旧版 Windsurf Firebase 邮箱密码登录。",
-  },
-  token: {
-    icon: LockKeyhole,
-    title: "Token",
-    desc: "粘贴 Token",
+  batchKey: {
+    icon: KeyRound,
+    title: "批量密钥",
+    desc: "一行一个密钥，支持多个 SuperAl 账号一起导入。",
   },
 };
 
 const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
-const windsurfImportModeOrder: ImportMode[] = ["token", "password", "paste"];
+const windsurfImportModeOrder: ImportMode[] = ["batchKey"];
 const defaultImportMode: ImportMode = "oauth";
-const defaultWindsurfImportMode: ImportMode = "token";
+const defaultWindsurfImportMode: ImportMode = "batchKey";
 
 function importModesForProvider(provider: Provider): ImportMode[] {
   return provider === "windsurf" ? windsurfImportModeOrder : importModeOrder;
@@ -182,7 +179,13 @@ function defaultImportModeForProvider(provider: Provider): ImportMode {
 function providerLabel(provider: Provider) {
   if (provider === "codex") return "Codex";
   if (provider === "gemini") return "Gemini Cli";
-  return "Windsurf";
+  return "SuperAl";
+}
+
+function sanitizeUserFacingText(text: string) {
+  return text
+    .replaceAll("Windsurf", "SuperAl")
+    .replaceAll("windsurfapi", "superal-sidecar");
 }
 
 function isAppLogEntry(value: unknown): value is AppLogEntry {
@@ -712,7 +715,7 @@ function WindsurfApiCard({
       {status?.lastError && (
         <p className="windsurf-api-error">
           <CircleAlert size={14} />
-          {status.lastError}
+          {sanitizeUserFacingText(status.lastError)}
         </p>
       )}
 
@@ -729,7 +732,7 @@ function WindsurfApiCard({
 
         <p className="windsurf-api-hint">
           {running
-            ? "API 服务运行中。账号池会按 Windsurf 账号可用额度自动轮询请求。"
+            ? "API 服务运行中。账号池会按 SuperAl 账号可用额度自动轮询请求。"
             : "启动 API 服务后，你可以通过上方地址和密钥在 IDE 或其他工具中调用。"}
         </p>
       </div>
@@ -802,7 +805,7 @@ function NoticeToast({ notice, onClose }: { notice: Notice; onClose: () => void 
       <Icon className="toast-icon" size={16} aria-hidden="true" />
       <span className="toast-text">
         <b>{config.label}</b>
-        {notice.text}
+        {sanitizeUserFacingText(notice.text)}
       </span>
       <button onClick={onClose} aria-label="关闭提示">×</button>
     </div>
@@ -892,9 +895,7 @@ function App() {
   const [activeProvider, setActiveProvider] = useState<Provider>("codex");
   const [mode, setMode] = useState<ImportMode>(defaultImportMode);
   const [pasteValue, setPasteValue] = useState("");
-  const [windsurfEmail, setWindsurfEmail] = useState("");
-  const [windsurfPassword, setWindsurfPassword] = useState("");
-  const [windsurfToken, setWindsurfToken] = useState("");
+  const [windsurfBatchKeys, setWindsurfBatchKeys] = useState("");
   const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
   const [accountPage, setAccountPage] = useState(1);
@@ -1095,12 +1096,13 @@ function App() {
   }, []);
 
   const appendAppLog = useCallback((tone: NoticeTone, text: string) => {
+    const sanitizedText = sanitizeUserFacingText(text);
     setAppLogs((current) =>
       pruneAppLogs([
         {
           id: createLogId(),
           tone,
-          text,
+          text: sanitizedText,
           createdAt: Date.now(),
         },
         ...current,
@@ -1109,9 +1111,10 @@ function App() {
   }, []);
 
   const showNotice = useCallback((tone: NoticeTone, text: string) => {
-    appendAppLog(tone, text);
+    const sanitizedText = sanitizeUserFacingText(text);
+    appendAppLog(tone, sanitizedText);
     if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
-    setNotice({ tone, text });
+    setNotice({ tone, text: sanitizedText });
     noticeTimer.current = window.setTimeout(() => {
       setNotice(null);
       noticeTimer.current = null;
@@ -1255,9 +1258,8 @@ function App() {
   const closeImportModal = () => {
     setIsImportModalOpen(false);
     setMode(defaultImportModeForProvider(activeProvider));
-    setWindsurfEmail("");
-    setWindsurfPassword("");
-    setWindsurfToken("");
+    setPasteValue("");
+    setWindsurfBatchKeys("");
   };
 
   const applyImportResult = (
@@ -1295,16 +1297,6 @@ function App() {
     }
   };
 
-  const handlePasteImport = async () => {
-    setIsBusy(true);
-    try {
-      const result = await parseWithBackend(pasteValue, "粘贴内容");
-      applyImportResult(result);
-    } finally {
-      setIsBusy(false);
-    }
-  };
-
   const handleFileImport = async (files: FileList | null) => {
     if (!files?.length) return;
     setIsBusy(true);
@@ -1328,6 +1320,16 @@ function App() {
       }
     } finally {
       setIsFileImporting(false);
+      setIsBusy(false);
+    }
+  };
+
+  const handlePasteImport = async () => {
+    setIsBusy(true);
+    try {
+      const result = await parseWithBackend(pasteValue, "粘贴内容");
+      applyImportResult(result);
+    } finally {
       setIsBusy(false);
     }
   };
@@ -1458,56 +1460,28 @@ function App() {
     setIsImportModalOpen(true);
   };
 
-  const handleWindsurfTokenImport = async () => {
-    const trimmed = windsurfToken.trim();
-    if (!trimmed) {
-      showNotice("error", "请粘贴 Windsurf Token");
+  const handleWindsurfBatchKeyImport = async () => {
+    const keys = windsurfBatchKeys
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (keys.length === 0) {
+      showNotice("error", "请粘贴 SuperAl 批量密钥");
       return;
     }
     setIsBusy(true);
     setFailures([]);
     try {
-      const account = await invoke<ManagedAccount>("add_windsurf_account_by_token", {
-        token: trimmed,
+      const result = await invoke<BackendImportResult>("add_windsurf_accounts_by_batch_keys", { keys });
+      applyImportResult(result, {
+        closeModal: result.imported.length > 0,
+        successText: `已添加 ${result.imported.length} 个 SuperAl 账号`,
       });
-      applyImportResult(
-        { imported: [account], failed: [] },
-        { closeModal: true, successText: `已添加 Windsurf 账号 ${account.email}` },
-      );
+      if (result.imported.length > 0) {
+        setWindsurfBatchKeys("");
+      }
     } catch (error) {
-      const rawMessage = String(error);
-      const message = rawMessage.includes("invalid token") || rawMessage.includes("401")
-        ? "Windsurf Token 无效或已过期，请重新从 Windsurf 页面复制完整 token"
-        : rawMessage.split("(trace ID:")[0].trim();
-      setFailures([{ label: "Windsurf Token", reason: message }]);
-      showNotice("error", `Token 登录失败：${message}`);
-    } finally {
-      setIsBusy(false);
-    }
-  };
-
-  const handleWindsurfPasswordImport = async () => {
-    if (!windsurfEmail.trim() || !windsurfPassword.trim()) {
-      showNotice("error", "请输入 Windsurf 邮箱和密码");
-      return;
-    }
-    setIsBusy(true);
-    setFailures([]);
-    try {
-      const account = await invoke<ManagedAccount>("add_windsurf_account_by_password", {
-        email: windsurfEmail.trim(),
-        password: windsurfPassword,
-      });
-      applyImportResult(
-        { imported: [account], failed: [] },
-        { successText: `Windsurf 账号 ${account.email} 已添加` },
-      );
-    } catch (error) {
-      const rawText = String(error).replace(/^Windsurf\s*登录失败[:：]?\s*/, "");
-      const text = rawText.includes("401") || rawText.includes("{")
-        ? "邮箱或密码错误，或该账号不支持邮箱密码登录"
-        : rawText.split("(trace ID:")[0].trim();
-      showNotice("error", `Windsurf 登录失败：${text}`);
+      showNotice("error", `批量导入失败：${String(error)}`);
     } finally {
       setIsBusy(false);
     }
@@ -1697,13 +1671,36 @@ function App() {
     };
   }, [windsurfApi?.running, windsurfApi?.actualPort]);
 
+  useEffect(() => {
+    if (!isTauri() || !windsurfApi?.running) return undefined;
+    let cancelled = false;
+
+    const syncActiveApiAccount = () => {
+      void invoke<SwitchAccountResult>("sync_windsurf_active_account")
+        .then((changedAccounts) => {
+          if (cancelled || changedAccounts.length === 0) return;
+          setAccounts((current) =>
+            sortAccountsForView(current.map((item) => changedAccounts.find((changed) => changed.id === item.id) ?? item)),
+          );
+        })
+        .catch(() => undefined);
+    };
+
+    syncActiveApiAccount();
+    const timer = window.setInterval(syncActiveApiAccount, API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [windsurfApi?.running, windsurfApi?.actualPort]);
+
   // 自启失败的事件 → toast。
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
     void listen<{ phase?: string; message?: string }>("windsurf-api-error", (event) => {
       const message = event.payload?.message ?? "未知错误";
-      showNotice("error", `Windsurf API 服务异常：${message}`);
+      showNotice("error", `SuperAl API 服务异常：${message}`);
     }).then((fn) => {
       unlisten = fn;
     });
@@ -1845,7 +1842,7 @@ function App() {
           </button>
           <button className={clsx(activeProvider === "windsurf" && "active")} onClick={() => handleProviderChange("windsurf")}>
             <WindsurfIcon className="provider-nav-icon windsurf" />
-            <span>Windsurf</span>
+            <span>SuperAl</span>
             <b>{counts.windsurf}</b>
           </button>
         </nav>
@@ -2038,13 +2035,13 @@ function App() {
                 </div>
               </div>
 
-              {mode === "paste" && (
+              {mode === "paste" && activeProvider !== "windsurf" && (
                 <>
                   <textarea
                     value={pasteValue}
                     onChange={(event) => setPasteValue(event.target.value)}
                     spellCheck={false}
-                    placeholder={'{\n  "provider": "windsurf",\n  "email": "name@example.com",\n  "tokens": {\n    "api_key": "codeium-api-key...",\n    "refresh_token": "firebase-refresh-token..."\n  }\n}'}
+                    placeholder={'{\n  "tokens": {\n    "id_token": "...",\n    "access_token": "...",\n    "refresh_token": "..."\n  }\n}'}
                   />
                   <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim() || isBusy}>
                     <Clipboard size={20} />
@@ -2091,67 +2088,26 @@ function App() {
                 </div>
               )}
 
-              {mode === "token" && activeProvider === "windsurf" && (
-                <div className="windsurf-password-form">
-                  <label className="field">
-                    <span>Token</span>
-                    <textarea
-                      value={windsurfToken}
-                      onChange={(event) => setWindsurfToken(event.target.value)}
-                      placeholder="eyJhbGciOi... (Firebase id_token JWT)"
-                      spellCheck={false}
-                      rows={5}
-                      disabled={isBusy}
-                    />
-                  </label>
+              {mode === "batchKey" && activeProvider === "windsurf" && (
+                <>
+                  <textarea
+                    value={windsurfBatchKeys}
+                    onChange={(event) => setWindsurfBatchKeys(event.target.value)}
+                    placeholder="一行一个批量密钥"
+                    spellCheck={false}
+                    disabled={isBusy}
+                  />
                   <button
                     className="wide primary"
-                    onClick={() => void handleWindsurfTokenImport()}
-                    disabled={!windsurfToken.trim() || isBusy}
+                    onClick={() => void handleWindsurfBatchKeyImport()}
+                    disabled={!windsurfBatchKeys.trim() || isBusy}
                   >
-                    <LockKeyhole size={20} />
-                    {isBusy ? "登录中..." : "登录并添加"}
+                    <KeyRound size={20} />
+                    {isBusy ? "导入中..." : "批量导入"}
                   </button>
-                </div>
+                </>
               )}
 
-              {mode === "password" && activeProvider === "windsurf" && (
-                <div className="windsurf-password-form">
-                  <label className="field">
-                    <span>邮箱</span>
-                    <input
-                      type="email"
-                      autoComplete="username"
-                      value={windsurfEmail}
-                      onChange={(event) => setWindsurfEmail(event.target.value)}
-                      placeholder="name@example.com"
-                      disabled={isBusy}
-                    />
-                  </label>
-                  <label className="field">
-                    <span>密码</span>
-                    <input
-                      type="password"
-                      autoComplete="current-password"
-                      value={windsurfPassword}
-                      onChange={(event) => setWindsurfPassword(event.target.value)}
-                      placeholder="输入 Windsurf 账号密码"
-                      disabled={isBusy}
-                    />
-                  </label>
-                  <button
-                    className="wide primary"
-                    onClick={() => void handleWindsurfPasswordImport()}
-                    disabled={!windsurfEmail.trim() || !windsurfPassword.trim() || isBusy}
-                  >
-                    <LockKeyhole size={20} />
-                    {isBusy ? "登录中..." : "登录并添加"}
-                  </button>
-                  <p className="windsurf-password-tip">
-                    此入口优先使用 Devin/Auth1 账密登录并换取 session token；失败时再回退 Firebase 老登录。通过 Google/GitHub/SSO 登录且未设置密码的账号请使用 Token 导入。
-                  </p>
-                </div>
-              )}
             </div>
 
             {failures.length > 0 && (
@@ -2237,7 +2193,7 @@ function App() {
                 </button>
               </section>
 
-              <section className="setting-row">
+              <section className="setting-row api-listen-setting">
                 <div className="setting-copy">
                   <Server size={18} />
                   <div>
@@ -2317,7 +2273,7 @@ function App() {
                         <strong>{noticeToneConfig[log.tone].label}</strong>
                         <time>{formatDateTime(Math.floor(log.createdAt / 1000))}</time>
                       </div>
-                      <p>{log.text}</p>
+                      <p>{sanitizeUserFacingText(log.text)}</p>
                     </div>
                   </article>
                 ))}

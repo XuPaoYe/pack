@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 构建 Windsurf 本地 API 服务所需的两个 sidecar 二进制：
-#   1) windsurfapi-<target>     —— 用 bun --compile 把 vendor/windsurfapi 打成单文件
-#   2) language_server_<target> —— 从已安装的 Windsurf.app / 用户指定路径里抽
+# 构建 SuperAl 本地 API 服务所需的两个 sidecar 二进制：
+#   1) superal-api-<target>     —— 用 bun --compile 把 vendor 里的上游服务打成单文件
+#   2) language_server_<target> —— 从已安装的运行时应用 / 用户指定路径里抽
 #
 # 输出统一放到 src-tauri/binaries/，遵循 Tauri externalBin 的 <name>-<rust-target-triple>
 # 命名规范，调用方按 target triple 选择对应文件。
@@ -72,9 +72,9 @@ repair_macos_binary() {
   fi
 }
 
-# 1) 编译 WindsurfPoolAPI sidecar
+# 1) 编译本地 API sidecar
 echo "▶ bun build --compile --target=$BUN_TARGET"
-SIDECAR_OUT="$OUTPUT_DIR/windsurfapi-$RUST_TRIPLE"
+SIDECAR_OUT="$OUTPUT_DIR/superal-api-$RUST_TRIPLE"
 WINDOWS_SUFFIX=""
 if [[ "$RUST_TRIPLE" == *windows* ]]; then
   WINDOWS_SUFFIX=".exe"
@@ -86,7 +86,7 @@ bun build --compile --target="$BUN_TARGET" \
 repair_macos_binary "$SIDECAR_OUT"
 echo "✓ $SIDECAR_OUT"
 
-# 2) 抽 Windsurf Language Server 二进制
+# 2) 抽运行时 Language Server 二进制
 LS_OUT="$OUTPUT_DIR/language_server-$RUST_TRIPLE$WINDOWS_SUFFIX"
 
 # 用户显式指定优先
@@ -130,8 +130,8 @@ done
 
 if [[ -z "$found" ]]; then
   cat >&2 <<EOF
-❌ 没找到 Windsurf Language Server 二进制
-   请安装 Windsurf 应用后重试，或手动设置 WINDSURF_LS_PATH 指向已有的 LS 文件。
+❌ 没找到 SuperAl runtime 二进制
+   请安装运行时应用后重试，或手动设置 WINDSURF_LS_PATH 指向已有的 LS 文件。
    候选位置：
 $(printf '   - %s\n' "${candidates[@]}")
 EOF

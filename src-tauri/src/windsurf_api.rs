@@ -1,8 +1,8 @@
-//! Windsurf 本地 API 服务（阶段 2）
+//! SuperAl 本地 API 服务（阶段 2）
 //!
 //! 我们对外暴露 OpenAI / Anthropic 兼容入口（`/v1/...`），
-//! 实际由打包进 Tauri 的 `windsurfapi` sidecar（基于上游 WindsurfPoolAPI，bun --compile）+
-//! Windsurf Language Server 二进制处理推理。
+//! 实际由打包进 Tauri 的 `superal-api` sidecar（bun --compile）+
+//! SuperAl runtime 二进制处理推理。
 //!
 //! 本模块负责：
 //! - 起停服务（spawn sidecar 子进程 + tiny_http 反向代理）
@@ -107,9 +107,23 @@ struct Runtime {
 }
 
 static RUNTIME: LazyLock<Mutex<Option<Runtime>>> = LazyLock::new(|| Mutex::new(None));
+static LAST_USED_ACCOUNT_EMAIL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Runtime>> {
-    RUNTIME.lock().expect("Windsurf API 运行态锁失败")
+    RUNTIME.lock().expect("SuperAl API 运行态锁失败")
+}
+
+pub fn last_used_account_email() -> Option<String> {
+    LAST_USED_ACCOUNT_EMAIL
+        .lock()
+        .ok()
+        .and_then(|email| email.clone())
+}
+
+fn set_last_used_account_email(email: String) {
+    if let Ok(mut current) = LAST_USED_ACCOUNT_EMAIL.lock() {
+        *current = Some(email);
+    }
 }
 
 /// 生成形如 `agt_wsf_xxxxxxxxxxxxxxxx` 的密钥。
@@ -220,7 +234,7 @@ fn resolve_bundled_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// WindsurfAPI 2.0.92 自带孤儿 LS 清理，但当前上游是在设置
+/// 当前上游自带孤儿 LS 清理，但当前是在设置
 /// `LS_BINARY_PATH` 前调用 cleanup，打包后无法命中我们的 externalBin 路径。
 /// 这里按 argv[0] 精确匹配同一个 LS 二进制，避免旧进程占住固定端口导致
 /// 新 sidecar 等待 LS ready 超时。
@@ -371,7 +385,7 @@ fn spawn_sidecar(
 
     // stdout 解析端口；同步打到主进程 stderr 便于调试
     let stdout_join = thread::Builder::new()
-        .name("windsurfapi-stdout".into())
+        .name("superal-api-stdout".into())
         .spawn(move || {
             let reader = BufReader::new(stdout);
             let mut sent_port = false;
@@ -384,18 +398,20 @@ fn spawn_sidecar(
                         }
                     }
                 }
-                eprintln!("[windsurfapi] {line}");
+                let line = line.replace("Windsurf", "SuperAl").replace("windsurf", "superal");
+                eprintln!("[SuperAl sidecar] {line}");
             }
         })
         .map_err(|error| format!("无法启动 stdout 读线程: {error}"))?;
 
     let stderr_join = thread::Builder::new()
-        .name("windsurfapi-stderr".into())
+        .name("superal-api-stderr".into())
         .spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
-                eprintln!("[windsurfapi:err] {line}");
+                let line = line.replace("Windsurf", "SuperAl").replace("windsurf", "superal");
+                eprintln!("[SuperAl sidecar:err] {line}");
             }
         })
         .map_err(|error| format!("无法启动 stderr 读线程: {error}"))?;
@@ -463,21 +479,21 @@ pub fn start(
     }
     stop()?;
 
-    let sidecar_bin = resolve_bundled_binary("windsurfapi").ok_or_else(|| {
+    let sidecar_bin = resolve_bundled_binary("superal-api").ok_or_else(|| {
         format!(
             "未找到 sidecar 二进制 {}。请先运行 `npm run build:sidecar`",
-            binary_filename("windsurfapi")
+            binary_filename("superal-api")
         )
     })?;
     let ls_bin = resolve_bundled_binary("language_server").ok_or_else(|| {
         format!(
-            "未找到 Windsurf Language Server 二进制 {}。请先运行 `npm run build:sidecar`",
+            "未找到 SuperAl runtime 二进制 {}。请先运行 `npm run build:sidecar`",
             binary_filename("language_server")
         )
     })?;
 
     let inner_key = generate_inner_key();
-    let sidecar_data_dir = app_data_dir.join("windsurfapi");
+    let sidecar_data_dir = app_data_dir.join("superal-api");
     let (sidecar, sidecar_port) =
         spawn_sidecar(&sidecar_bin, &ls_bin, &sidecar_data_dir, &inner_key)?;
 
@@ -845,7 +861,7 @@ fn handle_request(mut request: Request, api_key: &str, target: Option<&ProxyTarg
                 501,
                 &json!({
                     "error": {
-                        "message": "Windsurf 本地 API 服务尚未接入 Language Server，请等待后续版本。",
+                        "message": "SuperAl 本地 API 服务尚未接入运行时，请等待后续版本。",
                         "type": "not_implemented",
                         "code": "ls_unavailable",
                     }
@@ -901,7 +917,7 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
                     forced_model = Some(target.default_model.clone());
                     if requested_model != target.default_model {
                         eprintln!(
-                            "[Windsurf API] model override: {requested_model} -> {}",
+                            "[SuperAl API] model override: {requested_model} -> {}",
                             target.default_model
                         );
                     }
@@ -988,6 +1004,9 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
             return;
         }
     };
+    if matches!(path, "/v1/chat/completions" | "/v1/messages" | "/v1/responses") {
+        update_last_used_account_from_sidecar(&client, target);
+    }
 
     // 收集响应头（除 hop-by-hop 与 Content-Length；body 长度让 tiny_http 自行决定）。
     let status = upstream_resp.status().as_u16();
@@ -1026,6 +1045,45 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
 
     let response = Response::new(StatusCode(status), headers, upstream_resp, None, None);
     let _ = request.respond(response);
+}
+
+fn update_last_used_account_from_sidecar(client: &reqwest::blocking::Client, target: &ProxyTarget) {
+    let Ok(resp) = client
+        .get(format!("{}/auth/accounts", target.base_url))
+        .header("Authorization", format!("Bearer {}", target.inner_key))
+        .send()
+    else {
+        return;
+    };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(body) = resp.json::<Value>() else {
+        return;
+    };
+    let Some(accounts) = body.get("accounts").and_then(Value::as_array) else {
+        return;
+    };
+
+    let mut latest: Option<(&str, &str)> = None;
+    for account in accounts {
+        let Some(email) = account.get("email").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(last_used) = account.get("lastUsed").and_then(Value::as_str) else {
+            continue;
+        };
+        if latest
+            .map(|(_, current_last_used)| last_used > current_last_used)
+            .unwrap_or(true)
+        {
+            latest = Some((email, last_used));
+        }
+    }
+
+    if let Some((email, _)) = latest {
+        set_last_used_account_email(email.to_ascii_lowercase());
+    }
 }
 
 // ---------- 辅助 ----------
@@ -1237,7 +1295,7 @@ mod tests {
     }
 
     /// 真跑：spawn sidecar + 反向代理 /v1/models。
-    /// 依赖 src-tauri/binaries/{windsurfapi,language_server}-<triple> 已经构建好；
+    /// 依赖 src-tauri/binaries/{superal-api,language_server}-<triple> 已经构建好；
     /// 默认忽略，按需 `cargo test windsurf_api -- --ignored --test-threads=1` 跑。
     #[test]
     #[ignore = "needs prebuilt sidecar binaries; run with --ignored"]
@@ -1253,7 +1311,7 @@ mod tests {
 
         let (code, body) = http_get(&addr, "/v1/models", Some(key));
         assert_eq!(code, 200, "body: {body}");
-        // 真实模型清单包含来自 Windsurf catalog 的标识
+        // 真实模型清单包含来自上游 catalog 的标识
         assert!(
             body.contains("\"object\":\"list\"") && body.contains("claude"),
             "unexpected body: {body}",

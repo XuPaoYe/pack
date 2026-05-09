@@ -197,23 +197,33 @@ button:disabled {
   color: var(--text-soft);
 }
 
-.windsurf-password-form .field input {
+.windsurf-password-form .field input,
+.windsurf-password-form .field textarea {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 9px 12px;
   font-size: 13px;
+  font-family: inherit;
   background: var(--surface, #fff);
   color: var(--text);
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
   outline: none;
 }
 
-.windsurf-password-form .field input:focus {
+.windsurf-password-form .field textarea {
+  min-height: 148px;
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.windsurf-password-form .field input:focus,
+.windsurf-password-form .field textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.18);
 }
 
-.windsurf-password-form .field input:disabled {
+.windsurf-password-form .field input:disabled,
+.windsurf-password-form .field textarea:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
@@ -1629,6 +1639,10 @@ h2 {
   background: var(--modal-panel);
 }
 
+.settings-panel.modal-content {
+  max-width: 580px;
+}
+
 .api-config-panel.modal-content {
   max-width: 620px;
   overflow: visible;
@@ -1831,6 +1845,23 @@ h2 {
   justify-content: space-between;
   gap: 18px;
   padding: 0 14px;
+}
+
+.api-listen-setting {
+  min-height: 118px;
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: start;
+  gap: 14px;
+  padding: 14px;
+}
+
+.api-listen-setting .setting-copy {
+  align-items: flex-start;
+}
+
+.api-listen-setting .setting-copy p {
+  max-width: 480px;
 }
 
 .setting-copy {
@@ -2318,7 +2349,7 @@ textarea:focus {
   }
 }
 
-/* Windsurf 本地 API 服务 card */
+/* SuperAl 本地 API 服务 card */
 .account-row.windsurf-api-card {
   position: relative;
   display: flex;
@@ -2889,22 +2920,24 @@ textarea:focus {
 }
 
 .setting-inline-fields {
-  display: flex;
-  align-items: center;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px;
   gap: 12px;
+  width: 100%;
 }
 
 .setting-inline-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
   font-size: 11px;
   color: var(--text-soft);
 }
 
 .setting-inline-field input {
-  width: 110px;
-  padding: 6px 10px;
+  width: 100%;
+  height: 34px;
+  padding: 7px 10px;
   font-size: 12.5px;
   font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
   background: var(--surface-soft);

@@ -596,7 +596,7 @@ fn upsert_accounts_into_db(
     tx.commit()
         .map_err(|error| format!("提交 SQLite 事务失败: {error}"))?;
     drop(conn);
-    // 若有 Windsurf 账号且 API 服务正在跑，把账号推送给 sidecar 让它能用最新凭据。
+    // 若有 SuperAl 账号且 API 服务正在跑，把账号推送给 sidecar 让它能用最新凭据。
     if accounts.iter().any(|a| a.provider == "windsurf") {
         schedule_windsurf_sync(app.clone());
     }
@@ -1527,7 +1527,7 @@ async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("创建 Windsurf 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 SuperAl 客户端失败: {error}"))?;
     let url = format!("{WINDSURF_FIREBASE_REFRESH_URL}?key={WINDSURF_FIREBASE_API_KEY}");
     let body = format!("grant_type=refresh_token&refresh_token={}", refresh_token);
     let response = client
@@ -1552,19 +1552,19 @@ async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result
         .body(body)
         .send()
         .await
-        .map_err(|error| format!("Windsurf token 刷新请求失败: {error}"))?;
+        .map_err(|error| format!("SuperAl 凭证刷新请求失败: {error}"))?;
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|error| format!("读取 Windsurf 刷新响应失败: {error}"))?;
+        .map_err(|error| format!("读取 SuperAl 刷新响应失败: {error}"))?;
     if !status.is_success() {
-        return Err(format!("Windsurf 刷新失败 ({status}): {text}"));
+        return Err(format!("SuperAl 刷新失败 ({status}): {text}"));
     }
     let payload: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("解析 Windsurf 刷新响应失败: {error}"))?;
+        .map_err(|error| format!("解析 SuperAl 刷新响应失败: {error}"))?;
     let id_token = string_field(payload.get("id_token"))
-        .ok_or_else(|| "Windsurf 刷新响应缺少 id_token".to_string())?;
+        .ok_or_else(|| "SuperAl 刷新响应缺少 id_token".to_string())?;
     let access_token =
         string_field(payload.get("access_token")).unwrap_or_else(|| id_token.clone());
     let new_refresh_token =
@@ -1605,7 +1605,7 @@ fn build_windsurf_payload(account: &ManagedAccount) -> Result<Value, String> {
         .auth_payload
         .as_ref()
         .and_then(Value::as_object)
-        .ok_or_else(|| "该账号缺少可导出的 Windsurf 凭证".to_string())?;
+        .ok_or_else(|| "该账号缺少可导出的 SuperAl 凭证".to_string())?;
     let tokens = payload
         .get("tokens")
         .and_then(Value::as_object)
@@ -1642,7 +1642,7 @@ async fn windsurf_firebase_sign_in(email: &str, password: &str) -> Result<Value,
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("创建 Windsurf 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 SuperAl 客户端失败: {error}"))?;
     let url = format!("{WINDSURF_FIREBASE_SIGNIN_URL}?key={WINDSURF_FIREBASE_API_KEY}");
     let body = serde_json::json!({
         "email": email,
@@ -1672,12 +1672,12 @@ async fn windsurf_firebase_sign_in(email: &str, password: &str) -> Result<Value,
         .header("Referer", "https://windsurf.com/")
         .send()
         .await
-        .map_err(|error| format!("Windsurf 登录请求失败: {error}"))?;
+        .map_err(|error| format!("SuperAl 登录请求失败: {error}"))?;
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|error| format!("读取 Windsurf 登录响应失败: {error}"))?;
+        .map_err(|error| format!("读取 SuperAl 登录响应失败: {error}"))?;
     if !status.is_success() {
         if status.as_u16() == 401
             || text.contains("INVALID_LOGIN_CREDENTIALS")
@@ -1695,12 +1695,12 @@ async fn windsurf_firebase_sign_in(email: &str, password: &str) -> Result<Value,
             return Err("登录尝试次数过多，请 15-30 分钟后再试".to_string());
         }
         return Err(format!(
-            "Windsurf 登录失败 ({status})：{}",
+            "SuperAl 登录失败 ({status})：{}",
             summarize_windsurf_error_body(&text)
         ));
     }
     serde_json::from_str::<Value>(&text)
-        .map_err(|error| format!("解析 Windsurf 登录响应失败: {error}"))
+        .map_err(|error| format!("解析 SuperAl 登录响应失败: {error}"))
 }
 
 async fn windsurf_firebase_lookup(id_token: &str) -> Option<Value> {
@@ -1757,7 +1757,7 @@ async fn windsurf_register_with_codeium(
         .map_err(|error| format!("读取 Codeium 注册响应失败: {error}"))?;
     if !status.is_success() {
         if status.as_u16() == 401 || text.to_ascii_lowercase().contains("invalid token") {
-            return Err("Windsurf Token 无效或已过期，请重新从 Windsurf 页面复制完整 token".to_string());
+            return Err("SuperAl 凭证无效或已过期，请重新导入".to_string());
         }
         return Err(format!(
             "Codeium 注册失败 ({status})：{}",
@@ -1835,7 +1835,7 @@ fn windsurf_auth1_error(text: &str, fallback: &str) -> String {
             "邮箱或密码错误".to_string()
         }
         "No password set" | "No password set. Please log in with Google or GitHub." => {
-            "该账号没有设置邮箱密码，请使用 Google/GitHub 登录或粘贴 Windsurf Token".to_string()
+            "该账号没有设置邮箱密码，暂不支持导入".to_string()
         }
         "USER_DISABLED" => "该账号已被禁用".to_string(),
         "TOO_MANY_ATTEMPTS_TRY_LATER" => "登录尝试次数过多，请 15-30 分钟后再试".to_string(),
@@ -1849,25 +1849,25 @@ async fn windsurf_auth1_password_login(email: &str, password: &str) -> Result<St
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("创建 Windsurf Auth1 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 SuperAl Auth1 客户端失败: {error}"))?;
     let response = client
         .post(WINDSURF_AUTH1_PASSWORD_LOGIN_URL)
         .headers(windsurf_browser_headers())
         .json(&serde_json::json!({ "email": email, "password": password }))
         .send()
         .await
-        .map_err(|error| format!("Windsurf Auth1 登录请求失败: {error}"))?;
+        .map_err(|error| format!("SuperAl Auth1 登录请求失败: {error}"))?;
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|error| format!("读取 Windsurf Auth1 登录响应失败: {error}"))?;
+        .map_err(|error| format!("读取 SuperAl Auth1 登录响应失败: {error}"))?;
     if !status.is_success() {
-        return Err(windsurf_auth1_error(&text, "Windsurf Auth1 登录失败"));
+        return Err(windsurf_auth1_error(&text, "SuperAl Auth1 登录失败"));
     }
     let value = serde_json::from_str::<Value>(&text)
-        .map_err(|error| format!("解析 Windsurf Auth1 登录响应失败: {error}"))?;
-    string_field(value.get("token")).ok_or_else(|| "Windsurf Auth1 登录响应缺少 token".to_string())
+        .map_err(|error| format!("解析 SuperAl Auth1 登录响应失败: {error}"))?;
+    string_field(value.get("token")).ok_or_else(|| "SuperAl Auth1 登录响应缺少 token".to_string())
 }
 
 fn extract_prefixed_token(text: &str, prefix: &str) -> Option<String> {
@@ -1981,17 +1981,17 @@ fn parse_windsurf_post_auth_response(bytes: &[u8]) -> Result<WindsurfPostAuthRes
     let mut i = 0;
     while i < bytes.len() {
         let (tag, consumed) = decode_varint(bytes, i)
-            .ok_or_else(|| "WindsurfPostAuth 响应 tag 解码失败".to_string())?;
+            .ok_or_else(|| "SuperAl PostAuth 响应 tag 解码失败".to_string())?;
         i += consumed;
         let field_no = (tag >> 3) as u32;
         let wire_type = (tag & 0x7) as u8;
         if wire_type == 2 {
             let (len, consumed_len) = decode_varint(bytes, i)
-                .ok_or_else(|| "WindsurfPostAuth 响应长度解码失败".to_string())?;
+                .ok_or_else(|| "SuperAl PostAuth 响应长度解码失败".to_string())?;
             i += consumed_len;
             let end = i + len as usize;
             if end > bytes.len() {
-                return Err("WindsurfPostAuth 响应长度越界".to_string());
+                return Err("SuperAl PostAuth 响应长度越界".to_string());
             }
             let payload = &bytes[i..end];
             match field_no {
@@ -2011,17 +2011,17 @@ fn parse_windsurf_post_auth_response(bytes: &[u8]) -> Result<WindsurfPostAuthRes
             match wire_type {
                 0 => {
                     let (_, consumed_value) = decode_varint(bytes, i)
-                        .ok_or_else(|| "WindsurfPostAuth 响应 varint 跳过失败".to_string())?;
+                        .ok_or_else(|| "SuperAl PostAuth 响应 varint 跳过失败".to_string())?;
                     i += consumed_value;
                 }
                 1 => i += 8,
                 5 => i += 4,
-                _ => return Err(format!("WindsurfPostAuth 不支持的 wire type: {wire_type}")),
+                _ => return Err(format!("SuperAl PostAuth 不支持的 wire type: {wire_type}")),
             }
         }
     }
     if result.session_token.is_empty() {
-        return Err("WindsurfPostAuth 响应未包含 session_token".to_string());
+        return Err("SuperAl PostAuth 响应未包含 session_token".to_string());
     }
     Ok(result)
 }
@@ -2476,7 +2476,7 @@ async fn refresh_windsurf_account_by_api_key(account: &mut ManagedAccount) -> Re
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("创建 Windsurf 状态客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 SuperAl 状态客户端失败: {error}"))?;
     let body = serde_json::json!({
         "metadata": {
             "apiKey": api_key,
@@ -2510,17 +2510,17 @@ async fn refresh_windsurf_account_by_api_key(account: &mut ManagedAccount) -> Re
         let text = response
             .text()
             .await
-            .map_err(|error| format!("读取 Windsurf 状态响应失败: {error}"))?;
+            .map_err(|error| format!("读取 SuperAl 状态响应失败: {error}"))?;
         if !status.is_success() {
             last_error = Some(format!("{host} → {status}: {text}"));
             continue;
         }
         let value = serde_json::from_str::<Value>(&text)
-            .map_err(|error| format!("解析 Windsurf 状态响应失败: {error}"))?;
+            .map_err(|error| format!("解析 SuperAl 状态响应失败: {error}"))?;
         apply_windsurf_user_status_json(account, &value);
         return Ok(());
     }
-    Err(last_error.unwrap_or_else(|| "Windsurf 状态刷新失败".to_string()))
+    Err(last_error.unwrap_or_else(|| "SuperAl 状态刷新失败".to_string()))
 }
 
 fn apply_windsurf_auth_headers(
@@ -2564,7 +2564,7 @@ async fn windsurf_seat_management_call(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("创建 Windsurf {endpoint} 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 SuperAl {endpoint} 客户端失败: {error}"))?;
     let url = format!(
         "{WINDSURF_BACKEND_URL}/exa.seat_management_pb.SeatManagementService/{endpoint}"
     );
@@ -2622,7 +2622,7 @@ async fn windsurf_get_current_user(account: &ManagedAccount) -> Result<Value, St
     let bytes = windsurf_seat_management_call(
         account,
         "GetCurrentUser",
-        "缺少可用于查询 Windsurf 账号信息的 token",
+        "缺少可用于查询 SuperAl 账号信息的 token",
         &[0x10, 0x01, 0x18, 0x01, 0x20, 0x01],
     )
     .await?;
@@ -2633,7 +2633,7 @@ async fn windsurf_get_plan_status(account: &ManagedAccount) -> Result<Value, Str
     let bytes = windsurf_seat_management_call(
         account,
         "GetPlanStatus",
-        "缺少可用于查询 Windsurf 套餐状态的 token",
+        "缺少可用于查询 SuperAl 套餐状态的 token",
         &[],
     )
     .await?;
@@ -2661,7 +2661,7 @@ async fn enrich_windsurf_account_remote(account: &mut ManagedAccount) -> Result<
     if account.quota.is_some() || account.plan.is_some() {
         Ok(())
     } else {
-        Err(last_error.unwrap_or_else(|| "未能获取 Windsurf 账号信息".to_string()))
+        Err(last_error.unwrap_or_else(|| "未能获取 SuperAl 账号信息".to_string()))
     }
 }
 
@@ -2672,7 +2672,7 @@ async fn windsurf_post_auth(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("创建 WindsurfPostAuth 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 SuperAl PostAuth 客户端失败: {error}"))?;
     let mut last_error = None;
     let mut body = Vec::with_capacity(auth1_token.len() + org_id.unwrap_or_default().len() + 4);
     encode_proto_string_field(&mut body, 1, auth1_token);
@@ -2699,12 +2699,12 @@ async fn windsurf_post_auth(
             .header("X-Devin-Auth1-Token", auth1_token)
             .send()
             .await
-            .map_err(|error| format!("WindsurfPostAuth 请求失败: {error}"))?;
+            .map_err(|error| format!("SuperAl PostAuth 请求失败: {error}"))?;
         let status = response.status();
         let bytes = response
             .bytes()
             .await
-            .map_err(|error| format!("读取 WindsurfPostAuth 响应失败: {error}"))?;
+            .map_err(|error| format!("读取 SuperAl PostAuth 响应失败: {error}"))?;
         if !status.is_success() {
             last_error = Some(format!(
                 "{url} → {status}: {}",
@@ -2727,7 +2727,7 @@ async fn windsurf_post_auth(
             Err(error) => last_error = Some(format!("{url} → {error}")),
         }
     }
-    Err(last_error.unwrap_or_else(|| "WindsurfPostAuth 失败".to_string()))
+    Err(last_error.unwrap_or_else(|| "SuperAl PostAuth 失败".to_string()))
 }
 
 #[tauri::command]
@@ -2779,7 +2779,7 @@ async fn add_windsurf_account_by_password(
             payload.insert("tokens".to_string(), Value::Object(tokens_map));
 
             let mut account = parse_windsurf_account(&Value::Object(payload), "password")
-                .ok_or_else(|| "构建 Windsurf 账号记录失败".to_string())?;
+                .ok_or_else(|| "构建 SuperAl 账号记录失败".to_string())?;
             let _ = enrich_windsurf_account_remote(&mut account).await;
             upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
             return Ok(account);
@@ -2797,10 +2797,10 @@ async fn add_windsurf_account_by_password(
 
     let signin = windsurf_firebase_sign_in(trimmed_email, trimmed_password).await?;
     let id_token = string_field(signin.get("idToken"))
-        .ok_or_else(|| "Windsurf 登录响应缺少 idToken".to_string())?;
+        .ok_or_else(|| "SuperAl 登录响应缺少 idToken".to_string())?;
     let register = windsurf_register_with_codeium(&id_token).await?;
     let refresh_token = string_field(signin.get("refreshToken"))
-        .ok_or_else(|| "Windsurf 登录响应缺少 refreshToken".to_string())?;
+        .ok_or_else(|| "SuperAl 登录响应缺少 refreshToken".to_string())?;
     let local_id = string_field(signin.get("localId"));
     let display_name = string_field(signin.get("displayName"));
     let resolved_email =
@@ -2853,9 +2853,114 @@ async fn add_windsurf_account_by_password(
     payload.insert("tokens".to_string(), Value::Object(tokens_map));
 
     let account = parse_windsurf_account(&Value::Object(payload), "password")
-        .ok_or_else(|| "构建 Windsurf 账号记录失败".to_string())?;
+        .ok_or_else(|| "构建 SuperAl 账号记录失败".to_string())?;
     upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
     Ok(account)
+}
+
+fn parse_windsurf_batch_key_line(line: &str) -> Result<(String, String), String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err("密钥为空".to_string());
+    }
+
+    let candidates = [trimmed.to_string(), decode_batch_key_text(trimmed).unwrap_or_default()];
+    for candidate in candidates.iter().filter(|value| !value.trim().is_empty()) {
+        if let Ok(value) = serde_json::from_str::<Value>(candidate) {
+            if let Some((account, password)) = account_password_from_value(&value) {
+                return Ok((account, password));
+            }
+        }
+        if let Some((account, password)) = split_account_password(candidate) {
+            return Ok((account, password));
+        }
+    }
+
+    Err("密钥格式无效".to_string())
+}
+
+fn decode_batch_key_text(value: &str) -> Option<String> {
+    let normalized = value.trim();
+    for decoded in [
+        base64::engine::general_purpose::STANDARD.decode(normalized).ok(),
+        base64::engine::general_purpose::URL_SAFE.decode(normalized).ok(),
+        URL_SAFE_NO_PAD.decode(normalized).ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(text) = String::from_utf8(decoded) {
+            return Some(text);
+        }
+    }
+    None
+}
+
+fn account_password_from_value(value: &Value) -> Option<(String, String)> {
+    let obj = value.as_object()?;
+    let account = string_field(obj.get("account"))
+        .or_else(|| string_field(obj.get("username")))
+        .or_else(|| string_field(obj.get("email")))?;
+    let password = string_field(obj.get("password"))
+        .or_else(|| string_field(obj.get("pwd")))?;
+    Some((account, password))
+}
+
+fn split_account_password(value: &str) -> Option<(String, String)> {
+    for delimiter in ["----", "｜", "|", "\t", ","] {
+        if let Some((account, password)) = value.split_once(delimiter) {
+            let account = account.trim();
+            let password = password.trim();
+            if !account.is_empty() && !password.is_empty() {
+                return Some((account.to_string(), password.to_string()));
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+async fn add_windsurf_accounts_by_batch_keys(
+    app: tauri::AppHandle,
+    keys: Vec<String>,
+) -> Result<ImportResult, String> {
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+
+    for (index, key) in keys.into_iter().enumerate() {
+        let label = format!("第 {} 行", index + 1);
+        let (account, password) = match parse_windsurf_batch_key_line(&key) {
+            Ok(value) => value,
+            Err(reason) => {
+                failed.push(ImportFailure { label, reason });
+                continue;
+            }
+        };
+
+        match add_windsurf_account_by_password(app.clone(), account, password).await {
+            Ok(mut account) => {
+                attach_windsurf_batch_key(&mut account, &key);
+                upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
+                imported.push(account);
+            }
+            Err(error) => failed.push(ImportFailure { label, reason: error }),
+        }
+    }
+
+    Ok(ImportResult { imported, failed })
+}
+
+fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str) {
+    let mut payload = account
+        .auth_payload
+        .take()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    payload.insert(
+        "batch_key".to_string(),
+        Value::String(key.trim().to_string()),
+    );
+    account.auth_payload = Some(Value::Object(payload));
 }
 
 #[tauri::command]
@@ -2867,7 +2972,7 @@ async fn add_windsurf_account_by_token(
 ) -> Result<ManagedAccount, String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
-        return Err("Token 不能为空".to_string());
+        return Err("凭证不能为空".to_string());
     }
 
     let register = windsurf_register_with_codeium(trimmed).await?;
@@ -2919,7 +3024,7 @@ async fn add_windsurf_account_by_token(
     payload.insert("tokens".to_string(), Value::Object(tokens_map));
 
     let account = parse_windsurf_account(&Value::Object(payload), "windsurf_token")
-        .ok_or_else(|| "构建 Windsurf 账号记录失败".to_string())?;
+        .ok_or_else(|| "构建 SuperAl 账号记录失败".to_string())?;
     upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
     Ok(account)
 }
@@ -3469,7 +3574,7 @@ fn parse_auth_json_content(content: &str, source: &str, label: &str) -> ImportRe
         } else {
             failed.push(ImportFailure {
                 label: item_label,
-                reason: "未识别到 Codex / Gemini / Windsurf 凭证字段".to_string(),
+                reason: "未识别到 Codex / Gemini / SuperAl 凭证字段".to_string(),
             });
         }
     }
@@ -4611,11 +4716,26 @@ fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
         "codex" => write_codex_auth(&account)?,
         "gemini" => write_gemini_auth(&account)?,
         "windsurf" => {
-            // Windsurf 是 Web 端账号，没有本机配置文件需要写入；仅在数据库中标记为当前。
+            // SuperAl 是 Web 端账号，没有本机配置文件需要写入；仅在数据库中标记为当前。
         }
         other => return Err(format!("不支持的账号类型: {other}")),
     }
     set_account_current_state(&conn, &account.provider, &account.id)
+}
+
+#[tauri::command]
+fn sync_windsurf_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
+    let Some(email) = windsurf_api::last_used_account_email() else {
+        return Ok(Vec::new());
+    };
+    let conn = open_app_db(&app)?;
+    let Some(account) = read_accounts_from_conn(&conn)?
+        .into_iter()
+        .find(|account| account.provider == "windsurf" && account.email.eq_ignore_ascii_case(&email))
+    else {
+        return Ok(Vec::new());
+    };
+    set_account_current_state(&conn, "windsurf", &account.id)
 }
 
 #[tauri::command]
@@ -5070,9 +5190,9 @@ fn set_windsurf_api_default_model(
     Ok(())
 }
 
-/// 把单个 Windsurf 账号转换成 sidecar `/auth/login` 期望的入参。
+/// 把单个 SuperAl 账号转换成 sidecar `/auth/login` 期望的入参。
 ///
-/// WindsurfAPI v2.0.92 的 `/auth/login` 只接受三种凭证：
+/// 上游 sidecar 的 `/auth/login` 只接受三种凭证：
 ///   - `{ api_key, label }`               — 已有 Codeium api_key 或 Devin sessionToken
 ///   - `{ token, label }`                 — windsurf.com show-auth-token 拿到的 ott$/JWT token
 ///   - `{ email, password, label }`       — 完整账号密码（走 Auth1 → PostAuth → sessionToken，目前唯一能拿到付费配额的路径）
@@ -5123,7 +5243,7 @@ fn schedule_windsurf_sync(app: tauri::AppHandle) {
     }
     std::thread::spawn(move || {
         if let Err(error) = sync_windsurf_accounts_to_api(app) {
-            eprintln!("[Windsurf API] 后台同步失败: {error}");
+            eprintln!("[SuperAl API] 后台同步失败: {error}");
         }
     });
 }
@@ -5185,11 +5305,13 @@ pub fn run() {
             start_gemini_oauth,
             complete_gemini_oauth,
             add_windsurf_account_by_password,
+            add_windsurf_accounts_by_batch_keys,
             add_windsurf_account_by_token,
             get_windsurf_api_status,
             start_windsurf_api,
             stop_windsurf_api,
             sync_windsurf_accounts_to_api,
+            sync_windsurf_active_account,
             list_windsurf_api_models,
             set_windsurf_api_default_model,
         ])
@@ -5235,7 +5357,7 @@ pub fn run() {
                                     schedule_windsurf_sync(handle.clone());
                                 }
                                 Err(error) => {
-                                    eprintln!("[Windsurf API] 自启失败: {error}");
+                                    eprintln!("[SuperAl API] 自启失败: {error}");
                                     let _ = handle.emit(
                                         "windsurf-api-error",
                                         serde_json::json!({"phase": "auto_start", "message": error}),
@@ -5244,7 +5366,7 @@ pub fn run() {
                             }
                         }
                         Err(error) => {
-                            eprintln!("[Windsurf API] 读取数据目录失败: {error}");
+                            eprintln!("[SuperAl API] 读取数据目录失败: {error}");
                         }
                     }
                 }

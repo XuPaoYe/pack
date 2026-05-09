@@ -46,7 +46,7 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/windsurfapi",
+      "binaries/superal-api",
       "binaries/language_server"
     ],
     "android": {
