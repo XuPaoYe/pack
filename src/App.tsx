@@ -320,7 +320,6 @@ function WindsurfApiCard({
   onToggleKey,
   onToggleService,
   onCopy,
-  onAddAccount,
 }: {
   status: WindsurfApiStatus | null;
   busy: boolean;
@@ -328,7 +327,6 @@ function WindsurfApiCard({
   onToggleKey: () => void;
   onToggleService: () => void;
   onCopy: (text: string, label: string) => void;
-  onAddAccount: () => void;
 }) {
   const running = Boolean(status?.running);
   const address = status?.address ?? "—";
@@ -339,21 +337,15 @@ function WindsurfApiCard({
     <article className={clsx("account-row windsurf-api-card", running && "running")}>
       <div className="windsurf-api-head">
         <div className="windsurf-api-icon">
-          <Server size={20} strokeWidth={1.7} />
+          <Server size={22} strokeWidth={1.8} />
         </div>
         <div className="windsurf-api-title">
-          <strong>API 服务</strong>
-          <span>本机/局域网</span>
+          <div className="windsurf-api-title-row">
+            <strong>API 服务 (Windsurf)</strong>
+            <div className={clsx("windsurf-api-status-dot", running && "running")} />
+          </div>
+          <span>支持本机与局域网调用</span>
         </div>
-        <button
-          type="button"
-          className={clsx("windsurf-api-toggle", running ? "off" : "on")}
-          onClick={onToggleService}
-          disabled={busy}
-        >
-          <Power size={14} />
-          {busy ? "处理中…" : running ? "已启用" : "已停用"}
-        </button>
       </div>
 
       <dl className="windsurf-api-grid">
@@ -394,25 +386,36 @@ function WindsurfApiCard({
         </dd>
       </dl>
 
-      <p className="windsurf-api-hint">
-        {running
-          ? "正在监听本机与局域网，账号池会按 Windsurf 账号余量自动轮询。"
-          : "将账号添加到 API 服务，点击启动即可，无需其他配置。"}
-      </p>
-
-      <div className="windsurf-api-actions">
-        <button type="button" className="windsurf-api-add" onClick={onAddAccount}>
-          <Plus size={14} />
-          添加账号
-        </button>
-      </div>
-
       {status?.lastError && (
         <p className="windsurf-api-error">
-          <CircleAlert size={13} />
+          <CircleAlert size={14} />
           {status.lastError}
         </p>
       )}
+
+      <div className="windsurf-api-footer">
+        <button
+          type="button"
+          className={clsx("windsurf-api-toggle", running ? "off" : "on")}
+          onClick={onToggleService}
+          disabled={busy}
+        >
+          {busy ? (
+            "处理中..."
+          ) : (
+            <>
+              <Power size={14} />
+              {running ? "停止服务" : "启动 API 服务"}
+            </>
+          )}
+        </button>
+
+        <p className="windsurf-api-hint">
+          {running
+            ? "API 服务运行中。账号池会按 Windsurf 账号可用额度自动轮询请求。"
+            : "启动 API 服务后，你可以通过上方地址和密钥在 IDE 或其他工具中调用。"}
+        </p>
+      </div>
     </article>
   );
 }
@@ -1401,10 +1404,6 @@ function App() {
                       onToggleKey={() => setShowWindsurfApiKey((prev) => !prev)}
                       onToggleService={() => void toggleWindsurfApi()}
                       onCopy={(text, label) => void copyWindsurfApiText(text, label)}
-                      onAddAccount={() => {
-                        setMode(defaultImportModeForProvider("windsurf"));
-                        setIsImportModalOpen(true);
-                      }}
                     />
                   )}
                   {filteredAccounts.length === 0 && activeProvider !== "windsurf" && (

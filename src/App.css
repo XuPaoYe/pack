@@ -2310,40 +2310,47 @@ textarea:focus {
   }
 }
 
-/* Windsurf 本地 API 服务卡片 */
+/* Windsurf 本地 API 服务 card */
 .account-row.windsurf-api-card {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 16px 18px;
-  border: 1px solid var(--border-soft);
-  background: linear-gradient(180deg, rgba(38, 109, 255, 0.06), rgba(38, 109, 255, 0.02));
+  height: 356px; /* 匹配标准卡片高度 */
+  padding: 24px 20px;
+  border: 1px solid var(--line);
+  background: var(--control);
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  transition: all 0.2s;
+  box-sizing: border-box;
 }
 
 .account-row.windsurf-api-card.running {
-  border-color: rgba(60, 165, 92, 0.45);
-  background: linear-gradient(180deg, rgba(60, 165, 92, 0.08), rgba(60, 165, 92, 0.02));
+  border-color: var(--accent);
+  box-shadow: 0 4px 12px rgba(16, 185, 129, 0.06);
 }
 
 .windsurf-api-head {
   display: flex;
   align-items: center;
   gap: 12px;
+  margin-bottom: 4px;
 }
 
 .windsurf-api-icon {
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
   display: grid;
   place-items: center;
-  border-radius: 9px;
-  background: rgba(38, 109, 255, 0.12);
-  color: #2f6dff;
+  border-radius: 12px;
+  background: var(--surface-soft);
+  color: var(--text);
+  border: 1px solid var(--line-soft);
 }
 
 .account-row.windsurf-api-card.running .windsurf-api-icon {
-  background: rgba(60, 165, 92, 0.16);
-  color: #2f8a4d;
+  background: rgba(16, 185, 129, 0.08);
+  color: var(--accent);
+  border-color: rgba(16, 185, 129, 0.15);
 }
 
 .windsurf-api-title {
@@ -2351,67 +2358,118 @@ textarea:focus {
   flex-direction: column;
   gap: 2px;
   flex: 1;
+  min-width: 0;
+}
+
+.windsurf-api-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
 }
 
 .windsurf-api-title strong {
-  font-size: 14px;
+  font-size: 16px;
   font-weight: 600;
+  color: var(--text-strong);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.windsurf-api-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-soft);
+  transition: all 0.3s ease;
+  flex-shrink: 0;
+}
+
+.windsurf-api-status-dot.running {
+  background: var(--accent);
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.1);
+  animation: pulse-green 2s infinite;
+}
+
+@keyframes pulse-green {
+  0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+  70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
 }
 
 .windsurf-api-title span {
-  font-size: 11px;
-  color: var(--text-muted);
+  font-size: 12px;
+  color: var(--text-soft);
+  white-space: nowrap;
+}
+
+.windsurf-api-footer {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
 }
 
 .windsurf-api-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  font-size: 11px;
+  justify-content: center;
+  gap: 8px;
+  min-width: 160px;
+  height: 38px;
+  padding: 0 24px;
+  border-radius: 10px;
+  font-size: 13px;
   font-weight: 600;
-  border: 1px solid transparent;
+  border: 1px solid var(--line);
+  background: var(--control);
+  color: var(--text);
   cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  transition: all 0.2s;
 }
 
 .windsurf-api-toggle.on {
-  background: rgba(38, 109, 255, 0.1);
-  color: #2f6dff;
-  border-color: rgba(38, 109, 255, 0.3);
+  background: var(--text-strong);
+  color: var(--surface);
+  border-color: var(--text-strong);
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.1);
 }
 
 .windsurf-api-toggle.on:hover:not(:disabled) {
-  background: rgba(38, 109, 255, 0.18);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(15, 23, 42, 0.15);
 }
 
 .windsurf-api-toggle.off {
-  background: rgba(60, 165, 92, 0.12);
-  color: #2f8a4d;
-  border-color: rgba(60, 165, 92, 0.3);
+  background: var(--surface-soft);
+  color: #ef4444;
+  border-color: rgba(239, 68, 68, 0.2);
 }
 
 .windsurf-api-toggle.off:hover:not(:disabled) {
-  background: rgba(60, 165, 92, 0.2);
+  background: rgba(239, 68, 68, 0.05);
+  border-color: #ef4444;
 }
 
 .windsurf-api-toggle:disabled {
-  opacity: 0.55;
-  cursor: progress;
+  opacity: 0.5;
+  cursor: wait;
 }
 
 .windsurf-api-grid {
   display: grid;
-  grid-template-columns: 48px 1fr;
+  grid-template-columns: 44px 1fr;
   row-gap: 6px;
   column-gap: 12px;
-  margin: 0;
+  margin: 14px 0 12px;
   font-size: 12px;
 }
 
 .windsurf-api-grid dt {
-  color: var(--text-muted);
+  color: var(--text-soft);
+  font-weight: 500;
   align-self: center;
 }
 
@@ -2421,36 +2479,40 @@ textarea:focus {
   align-items: center;
   gap: 6px;
   min-width: 0;
+  padding: 4px 0;
 }
 
 .windsurf-api-grid code {
   font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Menlo, monospace;
-  font-size: 12px;
-  background: var(--bg-subtle);
-  padding: 3px 8px;
-  border-radius: 6px;
+  font-size: 12.5px;
   color: var(--text-strong);
+  background: transparent;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  letter-spacing: 0.1px;
 }
 
 .windsurf-api-grid .icon-btn {
-  width: 24px;
-  height: 24px;
+  width: 26px;
+  height: 26px;
   display: grid;
   place-items: center;
-  border: 1px solid var(--border-soft);
+  border: 0;
   background: transparent;
   border-radius: 6px;
-  color: var(--text-muted);
+  color: var(--text-soft);
   cursor: pointer;
   transition: background 0.12s, color 0.12s;
+  flex-shrink: 0;
 }
 
 .windsurf-api-grid .icon-btn:hover:not(:disabled) {
-  background: var(--bg-subtle);
+  background: var(--control-hover);
   color: var(--text-strong);
 }
 
@@ -2460,49 +2522,31 @@ textarea:focus {
 }
 
 .windsurf-api-hint {
+  width: 100%;
   margin: 0;
-  padding: 8px 10px;
-  font-size: 12px;
-  color: var(--text-muted);
-  background: var(--bg-subtle);
-  border-radius: 7px;
+  padding: 10px 12px;
+  font-size: 11px;
+  color: var(--text-soft);
+  background: var(--surface-soft);
+  border-radius: 8px;
+  line-height: 1.5;
   text-align: center;
-  line-height: 1.55;
+  box-sizing: border-box;
 }
 
-.windsurf-api-actions {
-  display: flex;
-  justify-content: center;
-}
-
-.windsurf-api-add {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 7px 18px;
-  border-radius: 999px;
-  font-size: 12px;
-  font-weight: 600;
-  background: rgba(38, 109, 255, 0.1);
-  color: #2f6dff;
-  border: 1px solid rgba(38, 109, 255, 0.3);
-  cursor: pointer;
-  transition: background 0.15s;
-}
-
-.windsurf-api-add:hover {
-  background: rgba(38, 109, 255, 0.18);
+.account-row.windsurf-api-card.running .windsurf-api-hint {
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface-soft));
 }
 
 .windsurf-api-error {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin: 0;
-  padding: 6px 10px;
+  padding: 8px 12px;
   font-size: 12px;
-  color: #c0413c;
-  background: rgba(192, 65, 60, 0.08);
-  border: 1px solid rgba(192, 65, 60, 0.25);
-  border-radius: 6px;
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.05);
+  border: 1px solid rgba(239, 68, 68, 0.15);
+  border-radius: 8px;
+  align-self: center;
 }
