@@ -10,6 +10,7 @@
     "tauri:dev": "tauri dev",
     "tauri:build": "node scripts/tauri-build.mjs app",
     "tauri:build:dmg": "node scripts/tauri-build.mjs dmg",
+    "build:sidecar": "bash scripts/build-sidecar.sh",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"

@@ -45,6 +45,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "externalBin": [
+      "binaries/windsurfapi",
+      "binaries/language_server"
+    ],
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }

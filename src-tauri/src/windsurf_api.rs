@@ -1,23 +1,27 @@
-//! Windsurf 本地 API 服务（阶段 1 骨架）
+//! Windsurf 本地 API 服务（阶段 2）
 //!
-//! 暴露 OpenAI 兼容入口，外部工具可通过 `Authorization: Bearer agt_wsf_*`
-//! 访问 `127.0.0.1:<port>/v1/...`。当前实现只做：
-//!   - 服务起停 / 状态查询
-//!   - Bearer 鉴权
-//!   - `GET /v1/models` 返回固定模型列表
-//!   - `POST /v1/chat/completions` 返回 501，等待阶段 3 接入 LS sidecar
+//! 我们对外暴露 OpenAI / Anthropic 兼容入口（`/v1/...`），
+//! 实际由打包进 Tauri 的 `windsurfapi` sidecar（基于上游 WindsurfPoolAPI，bun --compile）+
+//! Windsurf Language Server 二进制处理推理。
 //!
-//! 阶段 2 起会接入 Windsurf Language Server sidecar，再把 chat 协议接通。
+//! 本模块负责：
+//! - 起停服务（spawn sidecar 子进程 + tiny_http 反向代理）
+//! - 双层鉴权：外层 `Bearer agt_wsf_*` 由我们校验，内层 sidecar 用我们生成的 inner key
+//! - 状态查询、自动恢复
+//!
+//! 测试模式（`#[cfg(test)]`）下不 spawn sidecar，只验证 HTTP 服务自身的鉴权与路由占位。
 
-use std::io::Cursor;
+use std::io::{BufRead, BufReader, Cursor};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 /// 默认监听主机：`0.0.0.0` 表示同时监听本机与局域网。
 pub const DEFAULT_HOST: &str = "0.0.0.0";
@@ -25,6 +29,9 @@ pub const DEFAULT_HOST: &str = "0.0.0.0";
 pub const DEFAULT_PORT: u16 = 0;
 /// 默认 API Key 前缀；首次启动会生成 `agt_wsf_<随机串>`。
 pub const API_KEY_PREFIX: &str = "agt_wsf_";
+
+/// sidecar 启动后等待 stdout 报告端口的最长时长。
+const SIDECAR_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,14 +47,60 @@ pub struct WindsurfApiStatus {
     pub last_error: Option<String>,
 }
 
+/// 反向代理目标。生产模式下指向我们 spawn 的 sidecar；测试模式为 None。
+#[derive(Clone)]
+struct ProxyTarget {
+    base_url: String, // e.g. http://127.0.0.1:39721
+    inner_key: String,
+    /// 客户端没指定 model 时填的默认；为空表示不注入。
+    default_model: String,
+}
+
+struct Sidecar {
+    child: Child,
+    /// stdout/stderr 读取线程，sidecar 退出后会自然结束。
+    _stdout_join: Option<JoinHandle<()>>,
+    _stderr_join: Option<JoinHandle<()>>,
+}
+
+impl Drop for Sidecar {
+    fn drop(&mut self) {
+        // 先发 SIGTERM 给 sidecar 一个机会执行自己的 cleanup（含停 LS 子进程）；
+        // 没退出再发 SIGKILL 兜底。Windows 没有 SIGTERM，直接 kill。
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(not(unix))]
+        let _ = self.child.kill();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                _ => {
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 struct Runtime {
     stop_flag: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    accept_join: Option<JoinHandle<()>>,
     bind_host: String,
     bind_port: u16,
     actual_port: u16,
     api_key: String,
     last_error: Option<String>,
+    sidecar: Option<Sidecar>,
+    proxy_target: Option<ProxyTarget>,
 }
 
 static RUNTIME: LazyLock<Mutex<Option<Runtime>>> = LazyLock::new(|| Mutex::new(None));
@@ -61,6 +114,11 @@ pub fn generate_api_key() -> String {
     let bytes: [u8; 24] = rand::random();
     let token = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
     format!("{API_KEY_PREFIX}{token}")
+}
+
+fn generate_inner_key() -> String {
+    let bytes: [u8; 24] = rand::random();
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
 
 /// 构造对外展示的状态。
@@ -99,13 +157,257 @@ fn build_address(host: &str, port: u16) -> String {
     format!("http://{visible}:{port}/v1")
 }
 
-/// 启动服务。重复调用会先停旧实例再启动新的。
-pub fn start(host: &str, port: u16, api_key: &str) -> Result<WindsurfApiStatus, String> {
+// ---------- 平台 / 二进制路径 ----------
+
+fn current_target_triple() -> &'static str {
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "aarch64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "aarch64-unknown-linux-gnu"
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        "x86_64-pc-windows-msvc"
+    } else {
+        ""
+    }
+}
+
+fn binary_filename(name: &str) -> String {
+    let triple = current_target_triple();
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    format!("{name}-{triple}{suffix}")
+}
+
+/// 解析 sidecar / LS 二进制路径。优先 exe 同目录（Tauri externalBin 在 dev 与
+/// 打包中都会把它们放这里），找不到再尝试仓库的 `src-tauri/binaries/`，方便
+/// `cargo run` 这种不走 tauri-cli 的开发场景。
+fn resolve_bundled_binary(name: &str) -> Option<PathBuf> {
+    let filename = binary_filename(name);
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let candidate = parent.join(&filename);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            // 源码仓库 fallback：从 target/debug 往上找到有 src-tauri/binaries 的目录
+            for ancestor in parent.ancestors() {
+                let dev = ancestor.join("src-tauri/binaries").join(&filename);
+                if dev.is_file() {
+                    return Some(dev);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------- sidecar 启动 ----------
+
+fn pick_free_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|error| format!("分配本机空闲端口失败: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("读取本机端口失败: {error}"))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+fn spawn_sidecar(
+    sidecar_bin: &Path,
+    ls_bin: &Path,
+    data_dir: &Path,
+    inner_key: &str,
+) -> Result<(Sidecar, u16), String> {
+    std::fs::create_dir_all(data_dir)
+        .map_err(|error| format!("创建 sidecar 数据目录失败: {error}"))?;
+
+    // 清掉上一次的 accounts.json，让 sidecar 完全以我们 DB 为准重建账号池。
+    let stale_accounts = data_dir.join("accounts.json");
+    if stale_accounts.exists() {
+        let _ = std::fs::remove_file(&stale_accounts);
+    }
+
+    // sidecar 当前版本日志只回显 PORT env，自己 bind 的实际端口拿不到。
+    // 我们预先挑两个空闲端口给它（HTTP 服务 + 内部 LS）。
+    let http_port = pick_free_port()?;
+    let ls_port = pick_free_port()?;
+
+    let mut cmd = Command::new(sidecar_bin);
+    cmd.env("PORT", http_port.to_string())
+        .env("API_KEY", inner_key)
+        .env("LS_BINARY_PATH", ls_bin)
+        .env("LS_PORT", ls_port.to_string())
+        .env("LS_DATA_DIR", data_dir)
+        .env("LOG_LEVEL", "info")
+        .current_dir(data_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| format!("启动 sidecar 失败: {error}"))?;
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+
+    let (port_tx, port_rx) = mpsc::channel::<u16>();
+
+    // stdout 解析端口；同步打到主进程 stderr 便于调试
+    let stdout_join = thread::Builder::new()
+        .name("windsurfapi-stdout".into())
+        .spawn(move || {
+            let reader = BufReader::new(stdout);
+            let mut sent_port = false;
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if !sent_port {
+                    if let Some(port) = parse_listen_port(&line) {
+                        if port_tx.send(port).is_ok() {
+                            sent_port = true;
+                        }
+                    }
+                }
+                eprintln!("[windsurfapi] {line}");
+            }
+        })
+        .map_err(|error| format!("无法启动 stdout 读线程: {error}"))?;
+
+    let stderr_join = thread::Builder::new()
+        .name("windsurfapi-stderr".into())
+        .spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                eprintln!("[windsurfapi:err] {line}");
+            }
+        })
+        .map_err(|error| format!("无法启动 stderr 读线程: {error}"))?;
+
+    // 等 stdout 报告端口；超时则放弃并杀进程
+    let deadline = Instant::now() + SIDECAR_BOOT_TIMEOUT;
+    let port = loop {
+        match port_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(port) => break port,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(Some(status)) = child.try_wait() {
+                    let _ = stdout_join.join();
+                    let _ = stderr_join.join();
+                    return Err(format!("sidecar 启动后立刻退出，code={status}"));
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("等待 sidecar 启动超时（30s）".to_string());
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("sidecar stdout 通道意外关闭".to_string());
+            }
+        }
+    };
+
+    Ok((
+        Sidecar {
+            child,
+            _stdout_join: Some(stdout_join),
+            _stderr_join: Some(stderr_join),
+        },
+        port,
+    ))
+}
+
+/// 从 sidecar 的日志里抓 `Server on http://0.0.0.0:NNNN`。
+fn parse_listen_port(line: &str) -> Option<u16> {
+    let needle = "Server on http://";
+    let idx = line.find(needle)?;
+    let tail = &line[idx + needle.len()..];
+    let after_colon = tail.split(':').nth(1)?;
+    let port_str: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
+    port_str.parse::<u16>().ok()
+}
+
+// ---------- 启停 ----------
+
+/// 生产模式启动：spawn sidecar + 起 HTTP 服务（反向代理）。
+pub fn start(
+    app_data_dir: &Path,
+    host: &str,
+    port: u16,
+    api_key: &str,
+    default_model: &str,
+) -> Result<WindsurfApiStatus, String> {
     if api_key.trim().is_empty() {
         return Err("API Key 为空，无法启动".to_string());
     }
     stop()?;
 
+    let sidecar_bin = resolve_bundled_binary("windsurfapi").ok_or_else(|| {
+        format!(
+            "未找到 sidecar 二进制 {}。请先运行 `npm run build:sidecar`",
+            binary_filename("windsurfapi")
+        )
+    })?;
+    let ls_bin = resolve_bundled_binary("language_server").ok_or_else(|| {
+        format!(
+            "未找到 Windsurf Language Server 二进制 {}。请先运行 `npm run build:sidecar`",
+            binary_filename("language_server")
+        )
+    })?;
+
+    let inner_key = generate_inner_key();
+    let sidecar_data_dir = app_data_dir.join("windsurfapi");
+    let (sidecar, sidecar_port) =
+        spawn_sidecar(&sidecar_bin, &ls_bin, &sidecar_data_dir, &inner_key)?;
+
+    let target = ProxyTarget {
+        base_url: format!("http://127.0.0.1:{sidecar_port}"),
+        inner_key,
+        default_model: default_model.trim().to_string(),
+    };
+
+    start_internal(host, port, api_key, Some(target), Some(sidecar))
+}
+
+/// 更新当前正在跑的服务的默认模型。无运行时返回 Err。
+pub fn update_default_model(model: &str) -> Result<(), String> {
+    let mut guard = lock();
+    let runtime = guard
+        .as_mut()
+        .ok_or_else(|| "API 服务未运行".to_string())?;
+    let target = runtime
+        .proxy_target
+        .as_mut()
+        .ok_or_else(|| "API 服务未挂 sidecar".to_string())?;
+    target.default_model = model.trim().to_string();
+    Ok(())
+}
+
+/// 测试模式启动：只起 HTTP 服务，不 spawn sidecar。
+#[cfg(test)]
+fn start_no_sidecar(host: &str, port: u16, api_key: &str) -> Result<WindsurfApiStatus, String> {
+    if api_key.trim().is_empty() {
+        return Err("API Key 为空，无法启动".to_string());
+    }
+    stop()?;
+    start_internal(host, port, api_key, None, None)
+}
+
+fn start_internal(
+    host: &str,
+    port: u16,
+    api_key: &str,
+    target: Option<ProxyTarget>,
+    sidecar: Option<Sidecar>,
+) -> Result<WindsurfApiStatus, String> {
     let bind = format!("{host}:{port}");
     let server = Server::http(&bind).map_err(|error| format!("绑定 {bind} 失败: {error}"))?;
     let actual_port = server
@@ -118,22 +420,25 @@ pub fn start(host: &str, port: u16, api_key: &str) -> Result<WindsurfApiStatus, 
     let stop_flag_for_thread = stop_flag.clone();
     let api_key_owned = api_key.to_string();
     let host_owned = host.to_string();
+    let target_for_thread = target.clone();
 
-    let join = thread::Builder::new()
+    let accept_join = thread::Builder::new()
         .name("windsurf-api".into())
         .spawn(move || {
-            run_server(server, stop_flag_for_thread, api_key_owned);
+            run_server(server, stop_flag_for_thread, api_key_owned, target_for_thread);
         })
         .map_err(|error| format!("创建服务线程失败: {error}"))?;
 
     *lock() = Some(Runtime {
         stop_flag,
-        join: Some(join),
+        accept_join: Some(accept_join),
         bind_host: host_owned.clone(),
         bind_port: port,
         actual_port,
         api_key: api_key.to_string(),
         last_error: None,
+        sidecar,
+        proxy_target: target,
     });
 
     Ok(WindsurfApiStatus {
@@ -147,6 +452,145 @@ pub fn start(host: &str, port: u16, api_key: &str) -> Result<WindsurfApiStatus, 
     })
 }
 
+/// 列出 sidecar 当前对外提供的所有模型（OpenAI list 形式）。
+pub fn list_models() -> Result<Vec<Value>, String> {
+    let target = clone_target()?;
+    let client = build_inner_client()?;
+    let resp = client
+        .get(format!("{}/v1/models", target.base_url))
+        .header("Authorization", format!("Bearer {}", target.inner_key))
+        .send()
+        .map_err(|error| format!("调用 sidecar /v1/models 失败: {error}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("sidecar /v1/models HTTP {}", resp.status()));
+    }
+    let body: Value = resp
+        .json()
+        .map_err(|error| format!("解析模型列表失败: {error}"))?;
+    Ok(body
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// API 服务是否正在运行且挂了 sidecar。
+pub fn is_running_with_sidecar() -> bool {
+    let guard = lock();
+    guard
+        .as_ref()
+        .is_some_and(|r| r.proxy_target.is_some())
+}
+
+fn clone_target() -> Result<ProxyTarget, String> {
+    let guard = lock();
+    let runtime = guard
+        .as_ref()
+        .ok_or_else(|| "API 服务未运行".to_string())?;
+    runtime
+        .proxy_target
+        .clone()
+        .ok_or_else(|| "API 服务未挂 sidecar，无法同步账号".to_string())
+}
+
+fn build_inner_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|error| format!("初始化 HTTP 客户端失败: {error}"))
+}
+
+/// 让 sidecar 的账号池与传入列表保持一致：
+/// - sidecar 已有但传入没有 → DELETE
+/// - 传入有 sidecar 没有 → POST /auth/login
+///
+/// 用 `label`（即我们的账号 email）做匹配。空 label 的项跳过远端 diff，只 POST。
+pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
+    let target = clone_target()?;
+    let client = build_inner_client()?;
+
+    // 1) 拉 sidecar 当前账号
+    let list_resp = client
+        .get(format!("{}/auth/accounts", target.base_url))
+        .header("Authorization", format!("Bearer {}", target.inner_key))
+        .send()
+        .map_err(|error| format!("调用 sidecar /auth/accounts 失败: {error}"))?;
+    if !list_resp.status().is_success() {
+        return Err(format!(
+            "sidecar /auth/accounts HTTP {}",
+            list_resp.status()
+        ));
+    }
+    let list_body: Value = list_resp
+        .json()
+        .map_err(|error| format!("解析 sidecar 列表失败: {error}"))?;
+    let current = list_body
+        .get("accounts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    // email -> sidecar id（小写归一化）
+    let mut existing: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for entry in &current {
+        let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
+        let email = entry
+            .get("email")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !id.is_empty() && !email.is_empty() {
+            existing.insert(email, id.to_string());
+        }
+    }
+
+    // 期望 email 集合
+    let desired_emails: std::collections::HashSet<String> = desired
+        .iter()
+        .filter_map(|p| p.get("label").and_then(Value::as_str))
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+
+    // 2) 删除 sidecar 多出来的
+    let mut removed = 0usize;
+    for (email, id) in &existing {
+        if !desired_emails.contains(email) {
+            let _ = client
+                .delete(format!("{}/auth/accounts/{}", target.base_url, id))
+                .header("Authorization", format!("Bearer {}", target.inner_key))
+                .send();
+            removed += 1;
+        }
+    }
+
+    // 3) 添加缺失的（sidecar 内部按 apiKey/email 去重，不会重复）
+    let to_add: Vec<Value> = desired
+        .into_iter()
+        .filter(|p| {
+            p.get("label")
+                .and_then(Value::as_str)
+                .map(|l| !existing.contains_key(&l.to_ascii_lowercase()))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    let add_count = to_add.len();
+    if !to_add.is_empty() {
+        let resp = client
+            .post(format!("{}/auth/login", target.base_url))
+            .header("Authorization", format!("Bearer {}", target.inner_key))
+            .json(&json!({ "accounts": to_add }))
+            .send()
+            .map_err(|error| format!("调用 sidecar /auth/login 失败: {error}"))?;
+        if !resp.status().is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(format!("sidecar /auth/login HTTP: {body}"));
+        }
+    }
+
+    Ok(json!({ "added": add_count, "removed": removed, "kept": existing.len().saturating_sub(removed) }))
+}
+
 /// 停止服务（幂等）。
 pub fn stop() -> Result<(), String> {
     let runtime = { lock().take() };
@@ -154,31 +598,51 @@ pub fn stop() -> Result<(), String> {
         return Ok(());
     };
     runtime.stop_flag.store(true, Ordering::SeqCst);
-    if let Some(handle) = runtime.join.take() {
+    if let Some(handle) = runtime.accept_join.take() {
         let _ = handle.join();
     }
+    // sidecar 在 Drop 中被 kill + wait
+    drop(runtime.sidecar.take());
     Ok(())
 }
 
-fn run_server(server: Server, stop_flag: Arc<AtomicBool>, api_key: String) {
+// ---------- 请求路由 ----------
+
+fn run_server(
+    server: Server,
+    stop_flag: Arc<AtomicBool>,
+    api_key: String,
+    target: Option<ProxyTarget>,
+) {
+    let api_key = Arc::new(api_key);
+    let target = target.map(Arc::new);
     while !stop_flag.load(Ordering::SeqCst) {
         match server.recv_timeout(Duration::from_millis(250)) {
-            Ok(Some(request)) => handle_request(request, &api_key),
+            Ok(Some(request)) => {
+                let key = api_key.clone();
+                let target = target.clone();
+                // 每个请求独立线程，避免 SSE 长连接阻塞 accept 循环。
+                let _ = thread::Builder::new()
+                    .name("windsurf-api-req".into())
+                    .spawn(move || handle_request(request, &key, target.as_deref()));
+            }
             Ok(None) => continue,
             Err(_) => break,
         }
     }
 }
 
-fn handle_request(mut request: tiny_http::Request, api_key: &str) {
+fn handle_request(mut request: Request, api_key: &str, target: Option<&ProxyTarget>) {
     // CORS 预检
     if matches!(request.method(), Method::Options) {
         let _ = request.respond(cors_response(204, b""));
         return;
     }
 
-    let path = request.url().split('?').next().unwrap_or("").to_string();
-    let method = request.method().clone();
+    let (path, query) = match request.url().split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (request.url().to_string(), String::new()),
+    };
 
     // 鉴权
     if !is_authorized(&request, api_key) {
@@ -195,12 +659,20 @@ fn handle_request(mut request: tiny_http::Request, api_key: &str) {
         return;
     }
 
-    match (method, path.as_str()) {
+    // 反向代理：所有 /v1/* 与 /auth/* 都转发给 sidecar。
+    if let Some(target) = target {
+        if path.starts_with("/v1/") || path.starts_with("/auth/") || path == "/v1/models" {
+            proxy_to_sidecar(request, target, &path, &query);
+            return;
+        }
+    }
+
+    // 占位模式 / 未挂 sidecar
+    match (request.method().clone(), path.as_str()) {
         (Method::Get, "/v1/models") | (Method::Get, "/v1/models/") => {
-            let _ = request.respond(json_response(200, &models_payload()));
+            let _ = request.respond(json_response(200, &fallback_models_payload()));
         }
         (Method::Post, "/v1/chat/completions") | (Method::Post, "/v1/messages") => {
-            // 占位：阶段 3 接入 LS sidecar 后再实现。
             let mut body = String::new();
             let _ = request.as_reader().read_to_string(&mut body);
             let _ = request.respond(json_response(
@@ -228,7 +700,164 @@ fn handle_request(mut request: tiny_http::Request, api_key: &str) {
     }
 }
 
-fn is_authorized(request: &tiny_http::Request, api_key: &str) -> bool {
+// ---------- 反向代理 ----------
+
+fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, query: &str) {
+    // 读 body
+    let mut body = Vec::new();
+    if let Err(error) = request.as_reader().read_to_end(&mut body) {
+        let _ = request.respond(json_response(
+            400,
+            &json!({"error": {"message": format!("读取请求体失败: {error}"), "type": "bad_request"}}),
+        ));
+        return;
+    }
+
+    // 若是聊天接口且配置了默认模型，body 里 model 缺失/空 时注入默认值。
+    if !target.default_model.is_empty()
+        && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/responses")
+        && !body.is_empty()
+    {
+        if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
+            if let Some(obj) = value.as_object_mut() {
+                let needs_default = match obj.get("model") {
+                    None => true,
+                    Some(Value::Null) => true,
+                    Some(Value::String(s)) => {
+                        let trimmed = s.trim();
+                        trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto")
+                    }
+                    _ => false,
+                };
+                if needs_default {
+                    obj.insert(
+                        "model".to_string(),
+                        Value::String(target.default_model.clone()),
+                    );
+                    if let Ok(new_body) = serde_json::to_vec(&value) {
+                        body = new_body;
+                    }
+                }
+            }
+        }
+    }
+
+    let url = if query.is_empty() {
+        format!("{}{}", target.base_url, path)
+    } else {
+        format!("{}{}?{}", target.base_url, path, query)
+    };
+
+    let method = request.method().clone();
+    let upstream_method = match method {
+        Method::Get => reqwest::Method::GET,
+        Method::Post => reqwest::Method::POST,
+        Method::Put => reqwest::Method::PUT,
+        Method::Delete => reqwest::Method::DELETE,
+        Method::Patch => reqwest::Method::PATCH,
+        Method::Head => reqwest::Method::HEAD,
+        Method::Options => reqwest::Method::OPTIONS,
+        _ => {
+            let _ = request.respond(json_response(
+                405,
+                &json!({"error": {"message": "不支持的方法", "type": "method_not_allowed"}}),
+            ));
+            return;
+        }
+    };
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(None) // SSE 长连接
+        .build()
+    {
+        Ok(c) => c,
+        Err(error) => {
+            let _ = request.respond(json_response(
+                500,
+                &json!({"error": {"message": format!("初始化 HTTP 客户端失败: {error}"), "type": "internal"}}),
+            ));
+            return;
+        }
+    };
+
+    let mut builder = client
+        .request(upstream_method, &url)
+        .header("Authorization", format!("Bearer {}", target.inner_key));
+
+    // 透传 Content-Type / Accept 等，但忽略 hop-by-hop 与外层 Authorization
+    for header in request.headers() {
+        let name = header.field.as_str().as_str().to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "host"
+                | "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailers"
+                | "transfer-encoding"
+                | "upgrade"
+                | "authorization"
+                | "content-length"
+        ) {
+            continue;
+        }
+        builder = builder.header(header.field.as_str().as_str(), header.value.as_str());
+    }
+
+    if !body.is_empty() {
+        builder = builder.body(body);
+    }
+
+    let upstream_resp = match builder.send() {
+        Ok(r) => r,
+        Err(error) => {
+            let _ = request.respond(json_response(
+                502,
+                &json!({"error": {"message": format!("sidecar 不可达: {error}"), "type": "bad_gateway"}}),
+            ));
+            return;
+        }
+    };
+
+    // 收集响应头（除 hop-by-hop 与 Content-Length；body 长度让 tiny_http 自行决定）。
+    let status = upstream_resp.status().as_u16();
+    let mut headers: Vec<Header> = Vec::new();
+    for (k, v) in upstream_resp.headers().iter() {
+        let name_lower = k.as_str().to_ascii_lowercase();
+        if matches!(
+            name_lower.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailers"
+                | "transfer-encoding"
+                | "upgrade"
+                | "content-length"
+        ) {
+            continue;
+        }
+        if let Ok(bytes) = v.to_str() {
+            if let Ok(h) = Header::from_bytes(k.as_str().as_bytes(), bytes.as_bytes()) {
+                headers.push(h);
+            }
+        }
+    }
+    // 始终带 CORS
+    for h in cors_headers(None) {
+        headers.push(h);
+    }
+
+    let response = Response::new(StatusCode(status), headers, upstream_resp, None, None);
+    let _ = request.respond(response);
+}
+
+// ---------- 辅助 ----------
+
+fn is_authorized(request: &Request, api_key: &str) -> bool {
     request
         .headers()
         .iter()
@@ -269,12 +898,12 @@ fn cors_headers(content_type: Option<&str>) -> Vec<Header> {
         Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).expect("cors origin"),
         Header::from_bytes(
             &b"Access-Control-Allow-Methods"[..],
-            &b"GET, POST, OPTIONS"[..],
+            &b"GET, POST, PUT, DELETE, PATCH, OPTIONS"[..],
         )
         .expect("cors methods"),
         Header::from_bytes(
             &b"Access-Control-Allow-Headers"[..],
-            &b"Authorization, Content-Type"[..],
+            &b"Authorization, Content-Type, X-Requested-With"[..],
         )
         .expect("cors headers"),
     ];
@@ -286,20 +915,19 @@ fn cors_headers(content_type: Option<&str>) -> Vec<Header> {
     headers
 }
 
-fn models_payload() -> Value {
+/// 没挂 sidecar 时的占位模型列表（仅在测试或 sidecar 缺失时短暂使用）。
+fn fallback_models_payload() -> Value {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let ids = [
         "windsurf-swe-1",
-        "windsurf-swe-1-lite",
         "claude-3-5-sonnet",
         "claude-3-7-sonnet",
         "claude-sonnet-4",
         "gpt-4o",
         "gpt-4.1",
-        "gpt-5",
         "gemini-2.5-pro",
     ];
     let data: Vec<Value> = ids
@@ -362,37 +990,30 @@ mod tests {
     #[test]
     fn lifecycle_and_routes() {
         let key = "agt_wsf_test_key_12345";
-        let status = start("127.0.0.1", 0, key).expect("start");
+        let status = start_no_sidecar("127.0.0.1", 0, key).expect("start");
         assert!(status.running);
         let port = status.actual_port.expect("actual port");
-        assert!(port > 0);
         let addr = format!("127.0.0.1:{port}");
 
-        // 401 without auth
         let (code, _) = http_get(&addr, "/v1/models", None);
-        assert_eq!(code, 401, "missing auth should be 401");
+        assert_eq!(code, 401);
 
-        // 401 with wrong key
         let (code, _) = http_get(&addr, "/v1/models", Some("wrong"));
-        assert_eq!(code, 401, "wrong key should be 401");
+        assert_eq!(code, 401);
 
-        // 200 with right key
         let (code, body) = http_get(&addr, "/v1/models", Some(key));
         assert_eq!(code, 200);
         assert!(body.contains("\"object\":\"list\""), "body: {body}");
         assert!(body.contains("claude-sonnet-4"), "body: {body}");
 
-        // 404 unknown path
         let (code, _) = http_get(&addr, "/nope", Some(key));
         assert_eq!(code, 404);
 
-        // 501 chat completions placeholder
         let (code, body) =
             http_post(&addr, "/v1/chat/completions", key, r#"{"model":"x","messages":[]}"#);
         assert_eq!(code, 501);
         assert!(body.contains("not_implemented"), "body: {body}");
 
-        // stop is idempotent
         stop().unwrap();
         stop().unwrap();
     }
@@ -400,12 +1021,11 @@ mod tests {
     #[test]
     fn restart_picks_new_port() {
         let key = "agt_wsf_restart_test";
-        let s1 = start("127.0.0.1", 0, key).unwrap();
+        let s1 = start_no_sidecar("127.0.0.1", 0, key).unwrap();
         let p1 = s1.actual_port.unwrap();
-        let s2 = start("127.0.0.1", 0, key).unwrap();
+        let s2 = start_no_sidecar("127.0.0.1", 0, key).unwrap();
         let p2 = s2.actual_port.unwrap();
         assert!(p1 > 0 && p2 > 0);
-        // 重启服务可成功，端口可能相同也可能不同；关键是 RUNTIME 已替换
         let cur = current_status("127.0.0.1", 0, key);
         assert!(cur.running);
         assert_eq!(cur.actual_port, Some(p2));
@@ -414,7 +1034,46 @@ mod tests {
 
     #[test]
     fn empty_key_rejected() {
-        let err = start("127.0.0.1", 0, "").unwrap_err();
+        let err = start_no_sidecar("127.0.0.1", 0, "").unwrap_err();
         assert!(err.contains("API Key"));
+    }
+
+    /// 真跑：spawn sidecar + 反向代理 /v1/models。
+    /// 依赖 src-tauri/binaries/{windsurfapi,language_server}-<triple> 已经构建好；
+    /// 默认忽略，按需 `cargo test windsurf_api -- --ignored --test-threads=1` 跑。
+    #[test]
+    #[ignore = "needs prebuilt sidecar binaries; run with --ignored"]
+    fn e2e_proxy_models() {
+        let key = "agt_wsf_e2e_test_key";
+        let tmp = std::env::temp_dir().join("super-ai-windsurf-e2e");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let status = start(&tmp, "127.0.0.1", 0, key, "").expect("start with sidecar");
+        let port = status.actual_port.expect("port");
+        let addr = format!("127.0.0.1:{port}");
+
+        let (code, body) = http_get(&addr, "/v1/models", Some(key));
+        assert_eq!(code, 200, "body: {body}");
+        // 真实模型清单包含来自 Windsurf catalog 的标识
+        assert!(
+            body.contains("\"object\":\"list\"") && body.contains("claude"),
+            "unexpected body: {body}",
+        );
+
+        stop().unwrap();
+    }
+
+    #[test]
+    fn parse_listen_port_basic() {
+        assert_eq!(
+            parse_listen_port("[INFO] Server on http://0.0.0.0:39001"),
+            Some(39001)
+        );
+        assert_eq!(
+            parse_listen_port("Server on http://127.0.0.1:65530 ready"),
+            Some(65530)
+        );
+        assert_eq!(parse_listen_port("Listening on 39001"), None);
     }
 }

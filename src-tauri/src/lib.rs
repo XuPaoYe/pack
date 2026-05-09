@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{LogicalSize, Manager};
+use tauri::{Emitter, LogicalSize, Manager};
 #[cfg(desktop)]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tiny_http::{Header, Response, Server, StatusCode};
@@ -195,6 +195,8 @@ struct AppSettings {
     windsurf_api_port: u16,
     #[serde(default)]
     windsurf_api_key: String,
+    #[serde(default)]
+    windsurf_api_default_model: String,
 }
 
 fn default_windsurf_api_host() -> String {
@@ -216,6 +218,7 @@ fn default_app_settings() -> AppSettings {
         windsurf_api_host: default_windsurf_api_host(),
         windsurf_api_port: windsurf_api::DEFAULT_PORT,
         windsurf_api_key: String::new(),
+        windsurf_api_default_model: String::new(),
     }
 }
 
@@ -572,6 +575,11 @@ fn upsert_accounts_into_db(
     enforce_single_current_account(&tx)?;
     tx.commit()
         .map_err(|error| format!("提交 SQLite 事务失败: {error}"))?;
+    drop(conn);
+    // 若有 Windsurf 账号且 API 服务正在跑，把账号推送给 sidecar 让它能用最新凭据。
+    if accounts.iter().any(|a| a.provider == "windsurf") {
+        schedule_windsurf_sync(app.clone());
+    }
     Ok(())
 }
 
@@ -4253,7 +4261,10 @@ fn delete_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
     if deleted == 0 {
         return Err("账号不存在，可能已经被删除".to_string());
     }
-    read_accounts_from_conn(&conn)
+    let accounts = read_accounts_from_conn(&conn)?;
+    drop(conn);
+    schedule_windsurf_sync(app);
+    Ok(accounts)
 }
 
 #[tauri::command]
@@ -4371,10 +4382,16 @@ fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), Str
     // 前端不维护 windsurf_api_* 字段，从已有记录里继承，避免被默认值覆盖。
     let mut merged = settings;
     if let Ok(existing) = read_settings_record(&app) {
+        // 前端不维护这两项，从已有记录里继承避免被默认值覆盖。
         merged.windsurf_api_enabled = existing.windsurf_api_enabled;
-        merged.windsurf_api_host = existing.windsurf_api_host;
-        merged.windsurf_api_port = existing.windsurf_api_port;
         merged.windsurf_api_key = existing.windsurf_api_key;
+        // host/port/default_model 现在前端会管，但缺省值（空串/0）继续走旧值，方便前端先不发也能保留。
+        if merged.windsurf_api_host.is_empty() {
+            merged.windsurf_api_host = existing.windsurf_api_host;
+        }
+        if merged.windsurf_api_default_model.is_empty() && !existing.windsurf_api_default_model.is_empty() {
+            merged.windsurf_api_default_model = existing.windsurf_api_default_model;
+        }
     }
     write_settings_record(&app, &merged)
 }
@@ -4652,16 +4669,106 @@ fn start_windsurf_api(
 ) -> Result<windsurf_api::WindsurfApiStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_windsurf_api_key(&app, &mut settings)?;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("读取应用数据目录失败: {error}"))?;
     let status = windsurf_api::start(
+        &data_dir,
         &settings.windsurf_api_host,
         settings.windsurf_api_port,
         &settings.windsurf_api_key,
+        &settings.windsurf_api_default_model,
     )?;
+    // 把启用状态 + 实际端口持久化（持久化端口避免每次重启都换）。
+    let mut needs_write = false;
     if !settings.windsurf_api_enabled {
         settings.windsurf_api_enabled = true;
+        needs_write = true;
+    }
+    if let Some(actual) = status.actual_port {
+        if settings.windsurf_api_port != actual {
+            settings.windsurf_api_port = actual;
+            needs_write = true;
+        }
+    }
+    if needs_write {
         write_settings_record(&app, &settings)?;
     }
+    // 启动后立刻把现有 Windsurf 账号同步给 sidecar，失败只记录不阻断启动。
+    if let Err(error) = sync_windsurf_accounts_to_api(app.clone()) {
+        eprintln!("[Windsurf API] 启动后账号同步失败: {error}");
+    }
     Ok(status)
+}
+
+#[tauri::command]
+fn list_windsurf_api_models() -> Result<Vec<serde_json::Value>, String> {
+    windsurf_api::list_models()
+}
+
+#[tauri::command]
+fn set_windsurf_api_default_model(
+    app: tauri::AppHandle,
+    model: String,
+) -> Result<(), String> {
+    let mut settings = read_settings_record(&app)?;
+    settings.windsurf_api_default_model = model.trim().to_string();
+    write_settings_record(&app, &settings)?;
+    // 在跑就立刻热更，不在跑只持久化等下次启动。
+    let _ = windsurf_api::update_default_model(&settings.windsurf_api_default_model);
+    Ok(())
+}
+
+/// 把单个 Windsurf 账号转换成 sidecar `/auth/login` 期望的入参。
+/// 优先级：refresh_token > auth1_token (api_key) > access_token (Firebase id token)。
+fn windsurf_account_to_sidecar_payload(account: &ManagedAccount) -> Option<serde_json::Value> {
+    if account.provider != "windsurf" {
+        return None;
+    }
+    let label = if !account.email.is_empty() {
+        account.email.clone()
+    } else {
+        account.id.clone()
+    };
+    if let Some(token) = windsurf_payload_string(account, "refresh_token") {
+        return Some(serde_json::json!({ "refresh_token": token, "label": label }));
+    }
+    if let Some(token) = windsurf_payload_string(account, "auth1_token") {
+        return Some(serde_json::json!({ "api_key": token, "label": label }));
+    }
+    if let Some(token) = windsurf_payload_string(account, "access_token") {
+        return Some(serde_json::json!({ "token": token, "label": label }));
+    }
+    None
+}
+
+#[tauri::command]
+fn sync_windsurf_accounts_to_api(app: tauri::AppHandle) -> Result<usize, String> {
+    let accounts = {
+        let conn = open_app_db(&app)?;
+        read_accounts_from_conn(&conn)?
+    };
+    let payloads: Vec<serde_json::Value> = accounts
+        .iter()
+        .filter(|a| a.provider == "windsurf")
+        .filter_map(windsurf_account_to_sidecar_payload)
+        .collect();
+    let count = payloads.len();
+    windsurf_api::reconcile_accounts(payloads)?;
+    Ok(count)
+}
+
+/// 后台线程触发同步，避免阻塞 Tauri 命令。
+fn schedule_windsurf_sync(app: tauri::AppHandle) {
+    if !windsurf_api::is_running_with_sidecar() {
+        return;
+    }
+    std::thread::spawn(move || {
+        if let Err(error) = sync_windsurf_accounts_to_api(app) {
+            eprintln!("[Windsurf API] 后台同步失败: {error}");
+        }
+    });
 }
 
 #[tauri::command]
@@ -4715,6 +4822,9 @@ pub fn run() {
             get_windsurf_api_status,
             start_windsurf_api,
             stop_windsurf_api,
+            sync_windsurf_accounts_to_api,
+            list_windsurf_api_models,
+            set_windsurf_api_default_model,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
@@ -4737,18 +4847,50 @@ pub fn run() {
             if let Ok(mut settings) = read_settings_record(&handle) {
                 let _ = ensure_windsurf_api_key(&handle, &mut settings);
                 if settings.windsurf_api_enabled {
-                    if let Err(error) = windsurf_api::start(
-                        &settings.windsurf_api_host,
-                        settings.windsurf_api_port,
-                        &settings.windsurf_api_key,
-                    ) {
-                        eprintln!("[Windsurf API] 自启失败: {error}");
+                    match handle.path().app_data_dir() {
+                        Ok(data_dir) => {
+                            match windsurf_api::start(
+                                &data_dir,
+                                &settings.windsurf_api_host,
+                                settings.windsurf_api_port,
+                                &settings.windsurf_api_key,
+                                &settings.windsurf_api_default_model,
+                            ) {
+                                Ok(status) => {
+                                    if let Some(actual) = status.actual_port {
+                                        if settings.windsurf_api_port != actual {
+                                            settings.windsurf_api_port = actual;
+                                            let _ = write_settings_record(&handle, &settings);
+                                        }
+                                    }
+                                    schedule_windsurf_sync(handle.clone());
+                                }
+                                Err(error) => {
+                                    eprintln!("[Windsurf API] 自启失败: {error}");
+                                    let _ = handle.emit(
+                                        "windsurf-api-error",
+                                        serde_json::json!({"phase": "auto_start", "message": error}),
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("[Windsurf API] 读取数据目录失败: {error}");
+                        }
                     }
                 }
             }
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_handle, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                let _ = windsurf_api::stop();
+            }
+        });
 }

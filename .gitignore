@@ -37,3 +37,10 @@ settings.local.json
 *.njsproj
 *.sln
 *.sw?
+
+# Sidecar binaries (built locally / shipped via build:sidecar)
+src-tauri/binaries/windsurfapi-*
+src-tauri/binaries/language_server-*
+
+# bun --compile temp files
+.*-*.bun-build

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke, isTauri } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
@@ -8,6 +9,8 @@ import clsx from "clsx";
 import {
   BadgeCheck,
   CalendarDays,
+  Check,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
@@ -68,6 +71,14 @@ type AppSettings = {
   theme: ThemeMode;
   autoLaunch: boolean;
   maskSensitive: boolean;
+  windsurfApiHost: string;
+  windsurfApiPort: number;
+  windsurfApiDefaultModel: string;
+};
+
+type WindsurfApiModel = {
+  id: string;
+  owned_by?: string;
 };
 
 type OAuthStartResult = {
@@ -313,25 +324,324 @@ function mergeAccounts(current: ManagedAccount[], next: ManagedAccount[]) {
   return sortAccountsForView([...map.values()]);
 }
 
+type EffortKey = "low" | "medium" | "high" | "xhigh";
+
+const EFFORT_LABELS: Record<EffortKey, string> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "XHigh",
+};
+
+type ModelFamily = {
+  key: string;
+  label: string;
+  aliases?: string[];
+  /** 该家族支持的 effort 选项；空数组表示无 effort 概念。 */
+  efforts: EffortKey[];
+  /** 默认 effort；若 efforts 为空可省略。 */
+  defaultEffort?: EffortKey;
+  knownAvailable?: boolean;
+  /**
+   * 返回最终 sidecar 模型 id；不可用时返回 null。
+   * effort 为 null 表示无 effort（如 codex 单一变体）。
+   */
+  resolveId: (effort: EffortKey | null) => string | null;
+};
+
+const MODEL_FAMILIES: ModelFamily[] = [
+  {
+    key: "gpt-5.3-codex",
+    label: "GPT-5.3-Codex",
+    aliases: ["GPT-5.3 Codex", "GPT-5.3-Codex"],
+    efforts: [],
+    resolveId: () => "gpt-5.3-codex",
+  },
+  {
+    key: "gpt-5.4",
+    label: "GPT-5.4",
+    aliases: ["GPT-5.4"],
+    efforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "medium",
+    resolveId: (effort) => (effort ? `gpt-5.4-${effort}` : "gpt-5.4-medium"),
+  },
+  {
+    key: "gpt-5.5",
+    label: "GPT-5.5",
+    aliases: ["GPT-5.5", "GPT-5.5 Low Thinking", "GPT-5.5 Medium Thinking", "GPT-5.5 High Thinking"],
+    efforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "medium",
+    knownAvailable: true,
+    resolveId: (effort) => (effort ? `gpt-5.5-${effort}` : "gpt-5.5-medium"),
+  },
+  {
+    key: "claude-opus-4.6",
+    label: "Claude Opus 4.6",
+    aliases: ["Claude Opus 4.6"],
+    efforts: ["medium", "high"],
+    defaultEffort: "medium",
+    resolveId: (effort) =>
+      effort === "high" ? "claude-opus-4.6-thinking" : "claude-opus-4.6",
+  },
+  {
+    key: "claude-opus-4.7",
+    label: "Claude Opus 4.7",
+    aliases: ["Claude Opus 4.7"],
+    efforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "medium",
+    resolveId: (effort) => (effort ? `claude-opus-4.7-${effort}` : "claude-opus-4.7-medium"),
+  },
+  {
+    key: "deepseek-v4",
+    label: "DeepSeek V4",
+    aliases: ["DeepSeek V4", "DeepSeekV4"],
+    efforts: [],
+    knownAvailable: true,
+    resolveId: () => "deepseek-v4",
+  },
+];
+
+const FALLBACK_FAMILY_KEY = "gpt-5.3-codex";
+
+type ApiModelPref = {
+  family: string;
+  effort: EffortKey | null;
+};
+
+function defaultPref(): ApiModelPref {
+  return { family: FALLBACK_FAMILY_KEY, effort: null };
+}
+
+const API_PREF_STORAGE_KEY = "super-ai:windsurf-api-pref";
+
+function loadApiPref(): ApiModelPref {
+  if (typeof window === "undefined") return defaultPref();
+  try {
+    const raw = window.localStorage.getItem(API_PREF_STORAGE_KEY);
+    if (!raw) return defaultPref();
+    const parsed = JSON.parse(raw) as Partial<ApiModelPref>;
+    const fam = MODEL_FAMILIES.find((f) => f.key === parsed.family);
+    if (!fam) return defaultPref();
+    const effort = parsed.effort && fam.efforts.includes(parsed.effort)
+      ? parsed.effort
+      : fam.defaultEffort ?? null;
+    return {
+      family: fam.key,
+      effort: fam.efforts.length === 0 ? null : effort,
+    };
+  } catch {
+    return defaultPref();
+  }
+}
+
+function persistApiPref(pref: ApiModelPref) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(API_PREF_STORAGE_KEY, JSON.stringify(pref));
+  } catch {
+    /* localStorage 不可用就放弃 */
+  }
+}
+
+/** 把 pref 翻译成 sidecar 的 model id，并判断是否在 sidecar 真实可用。 */
+function resolveModelId(pref: ApiModelPref): string | null {
+  const family = MODEL_FAMILIES.find((f) => f.key === pref.family);
+  if (!family) return null;
+  return family.resolveId(pref.effort);
+}
+
+function normalizeModelName(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/\bthinking\b/g, "")
+    .replace(/\bcodex\b/g, "codex")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function modelTokens(family: ModelFamily): string[] {
+  return [
+    family.key,
+    family.label,
+    ...(family.aliases ?? []),
+    family.resolveId(null),
+    ...family.efforts.map((effort) => family.resolveId(effort)),
+  ].filter((value): value is string => Boolean(value));
+}
+
+/** 该家族在当前 sidecar 实际可用（默认 effort 的变体存在）。 */
+function isFamilyAvailable(family: ModelFamily, available: Set<string>): boolean {
+  if (family.knownAvailable) return true;
+  if (available.size === 0) return false;
+  const availableNames = Array.from(available);
+  const normalizedAvailable = availableNames.map(normalizeModelName);
+  return modelTokens(family).some((token) => {
+    const normalizedToken = normalizeModelName(token);
+    return normalizedAvailable.some(
+      (model) => model === normalizedToken || model.includes(normalizedToken) || normalizedToken.includes(model),
+    );
+  });
+}
+
+function ModelSelect({
+  familyKey,
+  availableModels,
+  disabled,
+  loading,
+  emptyHint,
+  onChange,
+}: {
+  familyKey: string;
+  availableModels: WindsurfApiModel[];
+  disabled: boolean;
+  loading: boolean;
+  emptyHint: string;
+  onChange: (familyKey: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const handle = (event: MouseEvent) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(event.target as Node)) setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", handle, true);
+    document.addEventListener("keydown", onKey, true);
+    return () => {
+      document.removeEventListener("mousedown", handle, true);
+      document.removeEventListener("keydown", onKey, true);
+    };
+  }, [open]);
+
+  const availableSet = useMemo(
+    () => new Set(availableModels.map((m) => m.id)),
+    [availableModels],
+  );
+  const selectedFamily = MODEL_FAMILIES.find((f) => f.key === familyKey);
+  const triggerLabel = disabled
+    ? selectedFamily?.label ?? emptyHint
+    : loading
+    ? "加载模型…"
+    : selectedFamily?.label ?? "选择模型";
+
+  const handlePick = (key: string, available: boolean) => {
+    if (!available) return;
+    onChange(key);
+    setOpen(false);
+  };
+
+  return (
+    <div
+      ref={containerRef}
+      className={clsx("model-select", open && "open", disabled && "disabled")}
+    >
+      <button
+        type="button"
+        className="model-select-trigger"
+        disabled={disabled || loading}
+        onClick={() => setOpen((prev) => !prev)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <span className="model-select-value" title={triggerLabel}>
+          {triggerLabel}
+        </span>
+        <ChevronDown size={14} className="model-select-caret" />
+      </button>
+      {open && !disabled && (
+        <div className="model-select-popover" role="listbox">
+          {MODEL_FAMILIES.map((family) => {
+            const available = isFamilyAvailable(family, availableSet);
+            const selected = family.key === familyKey;
+            return (
+              <button
+                type="button"
+                key={family.key}
+                className={clsx(
+                  "model-select-option",
+                  selected && "selected",
+                  !available && "unavailable",
+                )}
+                disabled={!available}
+                onClick={() => handlePick(family.key, available)}
+                title={available ? family.label : "暂未上线"}
+              >
+                <span className="model-select-option-main">
+                  {family.label}
+                  {!available && <em>暂未上线</em>}
+                </span>
+                {selected && available && <Check size={14} />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EffortSegments({
+  options,
+  value,
+  disabled,
+  onChange,
+}: {
+  options: EffortKey[];
+  value: EffortKey | null;
+  disabled: boolean;
+  onChange: (effort: EffortKey) => void;
+}) {
+  return (
+    <div className={clsx("effort-segments", disabled && "disabled")} role="radiogroup">
+      {options.map((effort) => (
+        <button
+          key={effort}
+          type="button"
+          role="radio"
+          aria-checked={value === effort}
+          className={clsx("effort-segment", value === effort && "active")}
+          disabled={disabled}
+          onClick={() => onChange(effort)}
+        >
+          {EFFORT_LABELS[effort]}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function WindsurfApiCard({
   status,
   busy,
   showKey,
+  pref,
   onToggleKey,
   onToggleService,
   onCopy,
+  onOpenConfig,
 }: {
   status: WindsurfApiStatus | null;
   busy: boolean;
   showKey: boolean;
+  pref: ApiModelPref;
   onToggleKey: () => void;
   onToggleService: () => void;
   onCopy: (text: string, label: string) => void;
+  onOpenConfig: () => void;
 }) {
   const running = Boolean(status?.running);
   const address = status?.address ?? "—";
   const apiKey = status?.apiKey ?? "";
   const maskedKey = apiKey ? `${apiKey.slice(0, 9)}${"•".repeat(Math.max(apiKey.length - 9, 4))}` : "—";
+  const family = MODEL_FAMILIES.find((f) => f.key === pref.family) ?? MODEL_FAMILIES[0];
+  const modelSummary = [
+    family.label,
+    pref.effort ? EFFORT_LABELS[pref.effort] : null,
+  ].filter(Boolean).join(" · ");
 
   return (
     <article className={clsx("account-row windsurf-api-card", running && "running")}>
@@ -382,6 +692,20 @@ function WindsurfApiCard({
             <Copy size={14} />
           </button>
         </dd>
+        <dt>配置</dt>
+        <dd className="windsurf-api-config-row">
+          <span className="windsurf-api-config-summary" title={modelSummary}>
+            {modelSummary}
+          </span>
+          <button
+            type="button"
+            className="windsurf-api-config-button"
+            onClick={onOpenConfig}
+          >
+            <Settings size={14} />
+            配置
+          </button>
+        </dd>
       </dl>
 
       {status?.lastError && (
@@ -415,6 +739,60 @@ function WindsurfApiCard({
         </p>
       </div>
     </article>
+  );
+}
+
+function WindsurfApiConfigPanel({
+  running,
+  models,
+  pref,
+  onChangeFamily,
+  onChangeEffort,
+}: {
+  running: boolean;
+  models: WindsurfApiModel[];
+  pref: ApiModelPref;
+  onChangeFamily: (family: string) => void;
+  onChangeEffort: (effort: EffortKey) => void;
+}) {
+  const family = MODEL_FAMILIES.find((f) => f.key === pref.family) ?? MODEL_FAMILIES[0];
+  const showEffort = family.efforts.length > 0;
+
+  return (
+    <div className="api-config-body">
+      <section className="api-config-row">
+        <div className="api-config-copy">
+          <strong>模型</strong>
+          <p>选择 API 服务默认使用的模型家族</p>
+        </div>
+        <ModelSelect
+          familyKey={pref.family}
+          availableModels={models}
+          disabled={!running}
+          loading={running && models.length === 0}
+          emptyHint="服务未启动"
+          onChange={onChangeFamily}
+        />
+      </section>
+
+      <section className="api-config-row">
+        <div className="api-config-copy">
+          <strong>推理强度</strong>
+          <p>{showEffort ? "控制模型思考深度和响应成本" : "当前模型没有推理强度选项"}</p>
+        </div>
+        {showEffort ? (
+          <EffortSegments
+            options={family.efforts}
+            value={pref.effort}
+            disabled={!running}
+            onChange={onChangeEffort}
+          />
+        ) : (
+          <span className="api-config-muted">不支持</span>
+        )}
+      </section>
+
+    </div>
   );
 }
 
@@ -525,6 +903,7 @@ function App() {
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
+  const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
   const [isBusy, setIsBusy] = useState(false);
@@ -543,7 +922,12 @@ function App() {
     theme: "system",
     autoLaunch: false,
     maskSensitive: false,
+    windsurfApiHost: "0.0.0.0",
+    windsurfApiPort: 0,
+    windsurfApiDefaultModel: "",
   });
+  const [windsurfApiModels, setWindsurfApiModels] = useState<WindsurfApiModel[]>([]);
+  const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const accountListRef = useRef<HTMLDivElement | null>(null);
   const oauthPollTimers = useRef<Partial<Record<OAuthProvider, number>>>({});
@@ -1260,6 +1644,40 @@ function App() {
       .catch(() => undefined);
   }, []);
 
+  // 服务在跑就拉一次 sidecar 的模型清单。
+  useEffect(() => {
+    if (!isTauri() || !windsurfApi?.running) {
+      setWindsurfApiModels([]);
+      return;
+    }
+    let cancelled = false;
+    invoke<WindsurfApiModel[]>("list_windsurf_api_models")
+      .then((list) => {
+        if (!cancelled) setWindsurfApiModels(list ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setWindsurfApiModels([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [windsurfApi?.running, windsurfApi?.actualPort]);
+
+  // 自启失败的事件 → toast。
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    void listen<{ phase?: string; message?: string }>("windsurf-api-error", (event) => {
+      const message = event.payload?.message ?? "未知错误";
+      showNotice("error", `Windsurf API 服务异常：${message}`);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [showNotice]);
+
   const toggleWindsurfApi = useCallback(async () => {
     if (isWindsurfApiBusy) return;
     setIsWindsurfApiBusy(true);
@@ -1277,6 +1695,51 @@ function App() {
       setIsWindsurfApiBusy(false);
     }
   }, [isWindsurfApiBusy, showNotice, windsurfApi?.running]);
+
+  const applyApiPref = useCallback(
+    (updater: (prev: ApiModelPref) => ApiModelPref) => {
+      setApiPrefState((prev) => {
+        const next = updater(prev);
+        persistApiPref(next);
+        const modelId = resolveModelId(next) ?? "";
+        if (isTauri()) {
+          invoke("set_windsurf_api_default_model", { model: modelId }).catch((error) => {
+            showNotice("error", `设置默认模型失败：${String(error)}`);
+          });
+        }
+        return next;
+      });
+    },
+    [showNotice],
+  );
+
+  const handleChangeFamily = useCallback(
+    (familyKey: string) => {
+      applyApiPref((prev) => {
+        const fam = MODEL_FAMILIES.find((f) => f.key === familyKey);
+        if (!fam) return prev;
+        return {
+          family: fam.key,
+          effort: fam.efforts.length === 0 ? null : fam.defaultEffort ?? fam.efforts[0],
+        };
+      });
+    },
+    [applyApiPref],
+  );
+
+  const handleChangeEffort = useCallback(
+    (effort: EffortKey) => {
+      applyApiPref((prev) => ({ ...prev, effort }));
+    },
+    [applyApiPref],
+  );
+
+  // 服务启动后，确保 sidecar 用的 default_model 和 UI 当前选择一致。
+  useEffect(() => {
+    if (!isTauri() || !windsurfApi?.running) return;
+    const modelId = resolveModelId(apiPref) ?? "";
+    invoke("set_windsurf_api_default_model", { model: modelId }).catch(() => undefined);
+  }, [windsurfApi?.running, apiPref]);
 
   const copyWindsurfApiText = useCallback(
     async (text: string, label: string) => {
@@ -1313,7 +1776,7 @@ function App() {
       className={clsx(
         "shell",
         settings.maskSensitive && "privacy-mask",
-        (isImportModalOpen || isSettingsOpen || isLogsOpen || exportPreview || pendingDeleteAccount || forceUpdate) && "modal-active",
+        (isImportModalOpen || isSettingsOpen || isLogsOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || forceUpdate) && "modal-active",
       )}
       onMouseDownCapture={handleShellTopDrag}
     >
@@ -1399,9 +1862,11 @@ function App() {
                       status={windsurfApi}
                       busy={isWindsurfApiBusy}
                       showKey={showWindsurfApiKey}
+                      pref={apiPref}
                       onToggleKey={() => setShowWindsurfApiKey((prev) => !prev)}
                       onToggleService={() => void toggleWindsurfApi()}
                       onCopy={(text, label) => void copyWindsurfApiText(text, label)}
+                      onOpenConfig={() => setIsApiConfigOpen(true)}
                     />
                   )}
                   {filteredAccounts.length === 0 && activeProvider !== "windsurf" && (
@@ -1642,6 +2107,24 @@ function App() {
         </AppModal>
       )}
 
+      {isApiConfigOpen && (
+        <AppModal
+          title="API 服务配置"
+          description="调整默认模型与推理强度"
+          closeLabel="关闭 API 服务配置"
+          className="api-config-panel"
+          onClose={() => setIsApiConfigOpen(false)}
+        >
+          <WindsurfApiConfigPanel
+            running={Boolean(windsurfApi?.running)}
+            models={windsurfApiModels}
+            pref={apiPref}
+            onChangeFamily={handleChangeFamily}
+            onChangeEffort={handleChangeEffort}
+          />
+        </AppModal>
+      )}
+
       {isSettingsOpen && (
         <AppModal
           title="设置"
@@ -1692,6 +2175,40 @@ function App() {
                 >
                   <i />
                 </button>
+              </section>
+
+              <section className="setting-row">
+                <div className="setting-copy">
+                  <Server size={18} />
+                  <div>
+                    <strong>API 服务监听</strong>
+                    <p>地址 0.0.0.0 同时监听本机与局域网；端口 0 表示首次启动随机分配，之后会保持。</p>
+                  </div>
+                </div>
+                <div className="setting-inline-fields">
+                  <label className="setting-inline-field">
+                    <span>地址</span>
+                    <input
+                      type="text"
+                      value={settings.windsurfApiHost}
+                      onChange={(event) => updateSetting("windsurfApiHost", event.target.value)}
+                      placeholder="0.0.0.0"
+                    />
+                  </label>
+                  <label className="setting-inline-field">
+                    <span>端口</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={65535}
+                      value={settings.windsurfApiPort}
+                      onChange={(event) => {
+                        const next = Number(event.target.value);
+                        updateSetting("windsurfApiPort", Number.isFinite(next) ? next : 0);
+                      }}
+                    />
+                  </label>
+                </div>
               </section>
 
               <section className="setting-row">
