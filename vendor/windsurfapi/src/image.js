@@ -1,164 +1,196 @@
-/**
- * Image handling utilities for multimodal requests.
- *
- * Supports:
- *   - Inline base64 data URLs (data:image/png;base64,...)
- *   - HTTP/HTTPS image URL fetching with size/redirect/SSRF limits
- *
- * Security:
- *   - Private/loopback addresses are rejected (SSRF protection)
- *   - Maximum redirect depth to prevent redirect loops
- *   - Maximum image size to prevent memory exhaustion
- *
- * Output format matches what buildSendCascadeMessageRequest expects in
- * field 6 (CascadeImageAttachment): { mimeType, base64 }.
- */
-
-import http from 'http';
-import https from 'https';
-import { URL } from 'url';
+import https from 'node:https';
+import http from 'node:http';
+import { lookup as dnsLookup } from 'node:dns';
 import { log } from './config.js';
+import { tryExtractPdf } from './pdf.js';
+import { isPrivateIp, resolvePublicAddresses } from './net-safety.js';
 
-const MAX_SIZE = 5 * 1024 * 1024;   // 5 MB
+const MAX_SIZE = 5 * 1024 * 1024; // 5 MB
+const MAX_BASE64_LEN = Math.ceil(MAX_SIZE * 4 / 3) + 100;
 const MAX_REDIRECTS = 3;
-const FETCH_TIMEOUT_MS = 15_000;
-
-// ─── SSRF protection ──────────────────────────────────────
-
-const PRIVATE_RANGES = [
-  /^127\./,
-  /^10\./,
-  /^172\.(1[6-9]|2\d|3[01])\./,
-  /^192\.168\./,
-  /^0\./,
-  /^169\.254\./,
-  /^::1$/,
-  /^fc00:/i,
-  /^fe80:/i,
-  /^fd/i,
-  /^localhost$/i,
-];
-
-function isPrivateHost(hostname) {
-  return PRIVATE_RANGES.some(re => re.test(hostname));
-}
-
-/**
- * Validate that a URL is safe to fetch. Throws on private addresses,
- * unsupported schemes, or suspicious hostnames.
- */
-export function validateImageUrl(urlStr) {
-  let url;
-  try { url = new URL(urlStr); } catch { throw new Error('Invalid image URL'); }
-  if (!['http:', 'https:'].includes(url.protocol)) throw new Error(`Unsupported protocol: ${url.protocol}`);
-  if (isPrivateHost(url.hostname)) throw new Error(`Private/loopback address rejected: ${url.hostname}`);
-  return url;
-}
-
-// ─── Fetch image from URL ──────────────────────────────────
-
-function fetchImageUrl(urlStr, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    if (redirects > MAX_REDIRECTS) return reject(new Error('Too many redirects'));
-    const url = validateImageUrl(urlStr);
-    const mod = url.protocol === 'https:' ? https : http;
-
-    const req = mod.get(url, { timeout: FETCH_TIMEOUT_MS }, (res) => {
-      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-        const loc = res.headers.location;
-        if (!loc) return reject(new Error('Redirect without Location header'));
-        res.resume();
-        return resolve(fetchImageUrl(new URL(loc, url).href, redirects + 1));
+const MIME_OK = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+// http/https `lookup` hook: runs in place of the default DNS resolution.
+// Rejecting here means the request never opens a socket to the internal
+// address, closing the DNS-rebinding gap in the string-based host check.
+function safeLookup(hostname, options, callback) {
+  dnsLookup(hostname, options, (err, address, family) => {
+    if (err) return callback(err);
+    const addrs = Array.isArray(address) ? address : [{ address, family }];
+    for (const a of addrs) {
+      if (isPrivateIp(a.address)) {
+        return callback(new Error(`Image URL resolves to private address: ${a.address}`));
       }
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        res.resume();
-        return reject(new Error(`HTTP ${res.statusCode} fetching image`));
-      }
-      const contentLength = parseInt(res.headers['content-length'], 10);
-      if (contentLength > MAX_SIZE) {
-        res.resume();
-        return reject(new Error(`Image too large: ${contentLength} bytes (max ${MAX_SIZE})`));
-      }
-      const buffers = [];
-      let size = 0;
-      res.on('data', (chunk) => {
-        size += chunk.length;
-        if (size > MAX_SIZE) {
-          res.destroy();
-          return reject(new Error(`Image exceeds ${MAX_SIZE} bytes`));
-        }
-        buffers.push(chunk);
-      });
-      res.on('end', () => {
-        const data = Buffer.concat(buffers);
-        const ct = (res.headers['content-type'] || '').split(';')[0].trim() || 'image/png';
-        resolve({ mimeType: ct, base64: data.toString('base64') });
-      });
-      res.on('error', reject);
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('Image fetch timeout')); });
+    }
+    callback(null, address, family);
   });
 }
 
-// ─── Parse data URL ────────────────────────────────────────
-
-function parseDataUrl(dataUrl) {
-  const match = dataUrl.match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
-  if (!match) return null;
-  return { mimeType: match[1], base64: match[2] };
+function validateImageUrl(url) {
+  let parsed;
+  try { parsed = new URL(url); } catch { throw new Error('Invalid image URL'); }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')
+    throw new Error('Image URL must be http or https');
+  if (String(parsed.hostname).toLowerCase() === 'localhost' || isPrivateIp(parsed.hostname))
+    throw new Error('Image URL targets a private/internal address');
+  return parsed;
 }
 
-// ─── Extract images from OpenAI content blocks ─────────────
+export function parseDataUrl(url) {
+  const clean = url.replace(/\s/g, '');
+  const m = clean.match(/^data:(image\/[a-z+]+);base64,(.+)$/i);
+  if (!m) return null;
+  if (m[2].length > MAX_BASE64_LEN) throw new Error(`Image data URL exceeds ${MAX_SIZE} byte limit`);
+  return { base64_data: m[2], mime_type: m[1].toLowerCase() };
+}
 
-/**
- * Given an OpenAI message `content` (string or content array), extract
- * all images and return { text, images }.
- *
- * Images are returned as [{ mimeType, base64 }] for proto field 6.
- * Text blocks are concatenated into a single string.
- */
-export async function extractImages(content) {
-  if (typeof content === 'string') return { text: content, images: [] };
-  if (!Array.isArray(content)) return { text: String(content ?? ''), images: [] };
+// Extract base64 body from a data URL of any mime type. Used for PDF
+// payloads which don't match parseDataUrl's image-only regex.
+export function parseGenericDataUrl(url) {
+  const clean = url.replace(/\s/g, '');
+  const m = clean.match(/^data:([a-z0-9][a-z0-9.+/-]+);base64,(.+)$/i);
+  if (!m) return null;
+  if (m[2].length > MAX_BASE64_LEN) throw new Error(`Data URL exceeds ${MAX_SIZE} byte limit`);
+  return { base64_data: m[2], mime_type: m[1].toLowerCase() };
+}
 
-  const textParts = [];
+export async function assertPublicUrlHost(urlOrHost, lookupFn = dnsLookup) {
+  let host = urlOrHost;
+  try { host = new URL(urlOrHost).hostname; } catch {}
+  return resolvePublicAddresses(host, lookupFn);
+}
+
+export function fetchImageUrl(url, timeoutMs = 8000, _depth = 0) {
+  if (_depth > MAX_REDIRECTS) return Promise.reject(new Error('Too many image redirects'));
+  validateImageUrl(url);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, val) => { if (!settled) { settled = true; fn(val); } };
+
+    const mod = url.startsWith('https') ? https : http;
+    const req = mod.get(url, { timeout: timeoutMs, headers: { 'Accept': 'image/*' }, lookup: safeLookup }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        return fetchImageUrl(res.headers.location, timeoutMs, _depth + 1).then(
+          v => done(resolve, v), e => done(reject, e)
+        );
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return done(reject, new Error(`Image fetch HTTP ${res.statusCode}`));
+      }
+      const mime = (res.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+      if (!MIME_OK.has(mime)) {
+        res.resume();
+        return done(reject, new Error(`Unsupported image type: ${mime}`));
+      }
+      const chunks = [];
+      let size = 0;
+      res.on('data', (d) => {
+        if (settled) return;
+        size += d.length;
+        if (size > MAX_SIZE) { res.destroy(); done(reject, new Error(`Image exceeds ${MAX_SIZE} bytes`)); }
+        else chunks.push(d);
+      });
+      res.on('end', () => done(resolve, { base64_data: Buffer.concat(chunks).toString('base64'), mime_type: mime }));
+      res.on('error', (e) => done(reject, e));
+    });
+    req.on('error', (e) => done(reject, e));
+    req.on('timeout', () => { req.destroy(); done(reject, new Error('Image fetch timeout')); });
+  });
+}
+
+export async function extractImages(contentBlocks) {
+  if (!Array.isArray(contentBlocks)) return { text: String(contentBlocks ?? ''), images: [] };
+
+  let text = '';
   const images = [];
 
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue;
+  for (const block of contentBlocks) {
+    if (!block || typeof block === 'string') { text += block || ''; continue; }
 
-    if (block.type === 'text' && typeof block.text === 'string') {
-      textParts.push(block.text);
-      continue;
-    }
-
-    if (block.type === 'image_url' && block.image_url?.url) {
-      const url = block.image_url.url;
+    if (block.type === 'text') {
+      text += block.text || '';
+    } else if (block.type === 'document') {
+      const src = block.source || {};
+      const mime = (src.media_type || '').toLowerCase();
+      if (mime === 'application/pdf' && src.data) {
+        const pdf = tryExtractPdf(src.data);
+        if (pdf?.text) {
+          text += `\n[PDF Document — ${pdf.pageCount} page(s)]\n${pdf.text}\n`;
+          log.info(`PDF extracted: ${pdf.pageCount} pages, ${pdf.text.length} chars`);
+        } else {
+          text += '\n[PDF Document — no extractable text (scanned/image-only PDF)]\n';
+        }
+      }
+    } else if (block.type === 'image') {
+      const src = block.source || {};
+      const mime = (src.media_type || '').toLowerCase();
+      if (mime === 'application/pdf' && src.data) {
+        const pdf = tryExtractPdf(src.data);
+        if (pdf?.text) {
+          text += `\n[PDF Document — ${pdf.pageCount} page(s)]\n${pdf.text}\n`;
+        }
+        continue;
+      }
+      try {
+        if ((src.type === 'base64' || !src.type) && src.data) {
+          if (src.data.length > MAX_BASE64_LEN) { log.warn('Image base64 exceeds size limit, skipping'); continue; }
+          images.push({ base64_data: src.data, mime_type: src.media_type || 'image/png' });
+        } else if (src.type === 'url' && src.url) {
+          images.push(await fetchImageUrl(src.url));
+        }
+      } catch (e) { log.warn(`Image extraction failed: ${e.message}`); }
+    } else if (block.type === 'image_url') {
+      const url = block.image_url?.url || '';
       try {
         if (url.startsWith('data:')) {
+          // PDF-as-data-URL: let the model "see" it via text extraction
+          // rather than treating it as an unsupported image type.
+          const lower = url.slice(0, 40).toLowerCase();
+          if (lower.startsWith('data:application/pdf')) {
+            const g = parseGenericDataUrl(url);
+            if (g?.base64_data) {
+              const pdf = tryExtractPdf(g.base64_data);
+              if (pdf?.text) {
+                text += `\n[PDF Document — ${pdf.pageCount} page(s)]\n${pdf.text}\n`;
+                log.info(`PDF extracted (image_url data URL): ${pdf.pageCount} pages, ${pdf.text.length} chars`);
+              } else {
+                text += '\n[PDF Document — no extractable text (scanned/image-only PDF)]\n';
+              }
+            }
+            continue;
+          }
           const parsed = parseDataUrl(url);
           if (parsed) images.push(parsed);
-          else log.warn('Image: failed to parse data URL');
-        } else {
-          const fetched = await fetchImageUrl(url);
-          images.push(fetched);
+        } else if (url.startsWith('https://') || url.startsWith('http://')) {
+          images.push(await fetchImageUrl(url));
         }
-      } catch (e) {
-        log.warn(`Image: failed to process ${url.slice(0, 80)}: ${e.message}`);
+      } catch (e) { log.warn(`Image fetch failed: ${e.message}`); }
+    } else if (block.type === 'file' || block.type === 'input_file') {
+      // OpenAI PDF input: { type:'file', file:{ filename, file_data:'data:application/pdf;base64,...' } }
+      // or file_id (uploaded via Files API — we can't fetch, so ignore).
+      const file = block.file || {};
+      const dataUrl = file.file_data || file.url || '';
+      if (dataUrl.startsWith('data:application/pdf')) {
+        const g = parseGenericDataUrl(dataUrl);
+        if (g?.base64_data) {
+          const pdf = tryExtractPdf(g.base64_data);
+          if (pdf?.text) {
+            const label = file.filename ? ` "${file.filename}"` : '';
+            text += `\n[PDF Document${label} — ${pdf.pageCount} page(s)]\n${pdf.text}\n`;
+            log.info(`PDF extracted (OpenAI file block): ${pdf.pageCount} pages, ${pdf.text.length} chars`);
+          } else {
+            text += '\n[PDF Document — no extractable text (scanned/image-only PDF)]\n';
+          }
+        }
+      } else if (dataUrl && !file.file_id) {
+        log.warn(`Unsupported file block data URL: ${dataUrl.slice(0, 40)}...`);
+      } else if (file.file_id) {
+        log.warn(`File block references file_id=${file.file_id} — upload API not supported, skipping`);
       }
-      continue;
-    }
-
-    // Anthropic-style image block (from /v1/messages translation)
-    if (block.type === 'image' && block.source?.type === 'base64') {
-      images.push({
-        mimeType: block.source.media_type || 'image/png',
-        base64: block.source.data,
-      });
-      continue;
     }
   }
 
-  return { text: textParts.join('\n'), images };
+  return { text, images };
 }

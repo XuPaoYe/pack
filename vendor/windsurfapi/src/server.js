@@ -2,7 +2,7 @@
  * OpenAI-compatible HTTP server with multi-account management.
  *
  *   POST /v1/chat/completions       — chat completions
- *   POST /v1/responses              — OpenAI Responses API
+ *   POST /v1/responses              - OpenAI Responses API
  *   GET  /v1/models                 — list models
  *   POST /auth/login                — add account (email+password / token / api_key)
  *   GET  /auth/accounts             — list all accounts
@@ -12,41 +12,69 @@
  */
 
 import http from 'http';
-import { readFileSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { readFileSync, existsSync } from 'fs';
+import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import {
   validateApiKey, isAuthenticated, getAccountList, getAccountCount,
-  addAccountByEmail, addAccountByToken, addAccountByKey, addAccountByRefreshToken, removeAccount,
+  addAccountByEmail, addAccountByToken, addAccountByKey, removeAccount,
+  configureBindHost, emitNoAuthWarnings, getDroughtSummary,
 } from './auth.js';
 import { handleChatCompletions } from './handlers/chat.js';
-import { handleModels } from './handlers/models.js';
 import { handleMessages } from './handlers/messages.js';
 import { handleResponses } from './handlers/responses.js';
+import { handleModels } from './handlers/models.js';
 import { handleDashboardApi } from './dashboard/api.js';
 import { config, log } from './config.js';
-import { callerKeyFromRequest } from './caller-key.js';
 import { VERSION } from './version.js';
+import { callerKeyFromRequest } from './caller-key.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(__dirname, '..');
+
+const VERSION_INFO = (() => {
+  let commit = '', commitMessage = '', commitDate = '', branch = 'unknown';
+  if (existsSync(join(REPO_ROOT, '.git'))) {
+    try { commit = execSync('git rev-parse --short HEAD', { cwd: REPO_ROOT, timeout: 2000 }).toString().trim(); } catch {}
+    try { commitMessage = execSync('git log -1 --pretty=format:%s', { cwd: REPO_ROOT, timeout: 2000 }).toString().trim(); } catch {}
+    try { commitDate = execSync('git log -1 --pretty=format:%cI', { cwd: REPO_ROOT, timeout: 2000 }).toString().trim(); } catch {}
+    try { branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: REPO_ROOT, timeout: 2000 }).toString().trim(); } catch {}
+  }
+  return { version: VERSION, commit, commitMessage, commitDate, branch };
+})();
+
+// 10 MB is way above any realistic chat-completions payload while still
+// bounding worst-case memory from a malicious/broken client.
+const MAX_BODY_SIZE = 10 * 1024 * 1024;
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', c => chunks.push(c));
+    let size = 0;
+    req.on('data', c => {
+      size += c.length;
+      if (size > MAX_BODY_SIZE) {
+        req.destroy();
+        reject(Object.assign(new Error('Request body too large'), { statusCode: 413 }));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
     req.on('error', reject);
   });
 }
 
-function extractToken(req) {
-  // Support both OpenAI-style `Authorization: Bearer <key>` and Anthropic-style
-  // `x-api-key: <key>` header. Claude Code sends the latter when ANTHROPIC_BASE_URL
-  // is set, so /v1/messages MUST accept it for the drop-in UX to work.
-  const xApiKey = req.headers['x-api-key'];
-  if (xApiKey && typeof xApiKey === 'string') return xApiKey;
-  const h = req.headers['authorization'] || '';
-  return h.startsWith('Bearer ') ? h.slice(7) : h;
+export function extractToken(req) {
+  // Anthropic SDK + OAI SDK compatibility: accept either header.
+  const authHeader = String(req.headers['authorization'] || '').trim();
+  if (authHeader && authHeader.includes(',')) return '';
+  const m = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (m) return m[1].trim();
+  const xApiKey = req.headers['x-api-key'] || '';
+  return xApiKey;
 }
 
 function json(res, status, body) {
@@ -55,35 +83,82 @@ function json(res, status, body) {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // Per-request dynamic responses must not be cached by intermediaries.
+    // Some upstream aggregators (e.g. sub2api, #97) priority-cache responses
+    // when they don't see an explicit Cache-Control directive and serve
+    // stale content for fresh requests.
+    'Cache-Control': 'no-store',
   });
   res.end(data);
 }
 
 async function route(req, res) {
   const { method } = req;
-  const path = req.url.split('?')[0];
+  let path = req.url.split('?')[0];
 
-  if (method === 'OPTIONS') return json(res, 204, '');
+  if (method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version',
+    });
+    return res.end();
+  }
   if (path === '/health') {
     const counts = getAccountCount();
-    return json(res, 200, {
+    const body = {
       status: 'ok',
-      provider: 'WindsurfPoolAPI',
-      version: VERSION,
+      provider: 'WindsurfAPI bydwgx1337',
+      version: VERSION_INFO.version,
+      commit: VERSION_INFO.commit,
+      commitMessage: VERSION_INFO.commitMessage,
+      commitDate: VERSION_INFO.commitDate,
+      branch: VERSION_INFO.branch,
       uptime: Math.round(process.uptime()),
       accounts: counts,
-    });
+    };
+    const qs = new URL(req.url, 'http://localhost').searchParams;
+    if (qs.get('verbose') === '1' && validateApiKey(extractToken(req))) {
+      try {
+        const { poolStats } = await import('./conversation-pool.js');
+        const { cacheStats } = await import('./cache.js');
+        const { getLsStatus } = await import('./langserver.js');
+        body.conversationPool = poolStats();
+        body.cache = cacheStats();
+        body.lsPool = getLsStatus();
+        // v2.0.57 Fix 5 — drought summary so monitoring can page on
+        // "all accounts < 5% weekly" without screen-scraping per-account
+        // credit dumps.
+        body.drought = getDroughtSummary();
+      } catch {}
+    }
+    return json(res, 200, body);
   }
 
-  // ─── Dashboard ─────────────────────────────────────
-  // Silent 204 for favicon — browsers request it from every page; otherwise
-  // the later Bearer-token check produces noise in the dashboard console.
-  if (path === '/favicon.ico') { res.writeHead(204); return res.end(); }
+  // ─── Dashboard ─────────────────────────────────────────
+  if (path === '/favicon.ico') {
+    res.writeHead(204);
+    return res.end();
+  }
   if (path === '/dashboard' || path === '/dashboard/') {
     try {
-      const html = readFileSync(join(__dirname, 'dashboard', 'index.html'));
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      // Cookie-based skin selection. `dashboard_skin=sketch` serves the
+      // experimental hand-drawn console; anything else (or no cookie)
+      // serves the default UI. Each UI sets/unsets the cookie via its own
+      // settings toggle, then reloads — server picks the right file based
+      // on the next request's cookie. Vary: Cookie keeps intermediaries
+      // from poisoning one user's skin onto another.
+      const cookie = String(req.headers.cookie || '');
+      const m = cookie.match(/(?:^|;\s*)dashboard_skin=([^;]+)/);
+      const skin = m ? decodeURIComponent(m[1]) : '';
+      const file = skin === 'sketch' ? 'index-sketch.html' : 'index.html';
+      const html = readFileSync(join(__dirname, 'dashboard', file));
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Vary': 'Cookie',
+        'Cache-Control': 'no-cache',
+      });
       return res.end(html);
     } catch {
       return json(res, 500, { error: 'Dashboard not found' });
@@ -99,7 +174,57 @@ async function route(req, res) {
     return handleDashboardApi(method, subpath, body, req, res);
   }
 
-  // ─── Auth management (no API key required) ─────────────
+  // ─── Dashboard i18n locale files ────────────────────────
+  if (path.startsWith('/dashboard/i18n/')) {
+    try {
+      const localeFile = path.slice('/dashboard/i18n/'.length);
+      // Security: only allow .json files with alphanumeric/hyphen names
+      if (!localeFile.match(/^[a-zA-Z0-9\-]+\.json$/)) {
+        return json(res, 400, { error: 'Invalid locale file' });
+      }
+      const filePath = join(__dirname, 'dashboard', 'i18n', localeFile);
+      const content = readFileSync(filePath);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(content);
+    } catch {
+      return json(res, 404, { error: 'Locale file not found' });
+    }
+  }
+
+  // ─── Dashboard data files (contributors, etc.) ──────────
+  // Same shape as i18n: tight regex on the basename, served as JSON.
+  // Used by both default and sketch UIs as the single source of truth
+  // for hand-maintained roster data so the two skins stay in sync.
+  if (path.startsWith('/dashboard/data/')) {
+    try {
+      const dataFile = path.slice('/dashboard/data/'.length);
+      if (!dataFile.match(/^[a-zA-Z0-9\-]+\.json$/)) {
+        return json(res, 400, { error: 'Invalid data file' });
+      }
+      const filePath = join(__dirname, 'dashboard', 'data', dataFile);
+      const content = readFileSync(filePath);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(content);
+    } catch {
+      return json(res, 404, { error: 'Data file not found' });
+    }
+  }
+
+  // ─── API endpoints (require API key) ────────────────────
+
+  if (!validateApiKey(extractToken(req))) {
+    // v2.0.61 (#110): clearer error so operators know the issue is
+    // configuration (no API_KEY set on a public-bind instance) rather
+    // than a bad client header. The chat client side rarely shows a
+    // verbose error so we cram the diagnosis into the message itself.
+    const tokenSent = !!extractToken(req);
+    const message = tokenSent
+      ? 'Invalid API key. Either the key is wrong, or the server has API_KEY configured to a different value than the one your client sent.'
+      : 'Missing API key. This server runs in fail-closed mode: requests must include `Authorization: Bearer <key>` (or `x-api-key: <key>`) matching the configured API_KEY env var. If you intend to run open (no auth), bind the server to localhost (HOST=127.0.0.1).';
+    return json(res, 401, { error: { message, type: 'auth_error' } });
+  }
+
+  // ─── Auth management (admin — gated by API key above) ──
 
   if (path === '/auth/status') {
     return json(res, 200, { authenticated: isAuthenticated(), ...getAccountCount() });
@@ -133,8 +258,6 @@ async function route(req, res) {
               result = addAccountByKey(acct.api_key, acct.label);
             } else if (acct.token) {
               result = await addAccountByToken(acct.token, acct.label);
-            } else if (acct.refresh_token) {
-              result = await addAccountByRefreshToken(acct.refresh_token, acct.label);
             } else if (acct.email && acct.password) {
               result = await addAccountByEmail(acct.email, acct.password);
             } else {
@@ -155,12 +278,10 @@ async function route(req, res) {
         account = addAccountByKey(body.api_key, body.label);
       } else if (body.token) {
         account = await addAccountByToken(body.token, body.label);
-      } else if (body.refresh_token) {
-        account = await addAccountByRefreshToken(body.refresh_token, body.label);
       } else if (body.email && body.password) {
         account = await addAccountByEmail(body.email, body.password);
       } else {
-        return json(res, 400, { error: 'Provide api_key, token, refresh_token, or email+password' });
+        return json(res, 400, { error: 'Provide api_key, token, or email+password' });
       }
 
       return json(res, 200, {
@@ -172,14 +293,6 @@ async function route(req, res) {
       log.error('Login failed:', err.message);
       return json(res, 401, { error: err.message });
     }
-  }
-
-  // ─── API endpoints (require API key) ────────────────────
-
-  const callerToken = extractToken(req);
-  const callerKey = callerKeyFromRequest(req, callerToken);
-  if (!validateApiKey(callerToken)) {
-    return json(res, 401, { error: { message: 'Invalid API key', type: 'auth_error' } });
   }
 
   if (path === '/v1/models' && method === 'GET') {
@@ -204,24 +317,39 @@ async function route(req, res) {
       return json(res, 400, { error: { message: 'messages must contain at least 1 item', type: 'invalid_request' } });
     }
 
-    body._source = 'POST /v1/chat/completions';
-    const result = await handleChatCompletions(body, { callerKey });
+    const reqStartedAt = Date.now();
+    const result = await handleChatCompletions(body, { callerKey: callerKeyFromRequest(req, extractToken(req), body) });
+    const processingMs = Date.now() - reqStartedAt;
+    const modelHeaders = {
+      'x-request-id': 'req-' + randomUUID(),
+      'openai-model': body.model || '',
+      // Actual upstream processing time — hvoy.ai and similar verifiers
+      // treat a flat "0" as a fingerprint of a faking proxy.
+      'openai-processing-ms': String(processingMs),
+      'openai-version': '2020-10-01',
+      // OpenAI always returns an organization header. We don't have a real
+      // org id, but a stable synthetic one keeps the shape consistent so
+      // the signature check doesn't pick up on the missing field.
+      'openai-organization': 'org-windsurf-proxy',
+    };
     if (result.stream) {
-      // Streaming tuning: keep the socket hot and unblock the first byte.
-      //   setNoDelay — disable Nagle so small SSE deltas aren't coalesced (40ms win)
-      //   setKeepAlive + setTimeout(0) — survive long thinking pauses w/o RST
-      //   flushHeaders — push HTTP response line + headers to the client NOW,
-      //     so SSE clients (esp. CC) exit their "connecting" state immediately
-      req.socket?.setKeepAlive(true);
-      req.setTimeout(0);
-      res.socket?.setNoDelay(true);
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
-      res.flushHeaders?.();
+      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers });
       await result.handler(res);
     } else {
+      for (const [k, v] of Object.entries(modelHeaders)) res.setHeader(k, v);
+      if (result.headers) {
+        for (const [k, v] of Object.entries(result.headers)) res.setHeader(k, v);
+      }
       json(res, result.status, result.body);
     }
     return;
+  }
+
+  // v2.0.71 (#121 keh4l): some clients send `/v1/response` (singular)
+  // by mistake — this exact alias avoids a confusing 404 and routes to
+  // the canonical handler. The plural `/v1/responses` is the spec form.
+  if (path === '/v1/response' && method === 'POST') {
+    path = '/v1/responses';
   }
 
   if (path === '/v1/responses' && method === 'POST') {
@@ -235,25 +363,37 @@ async function route(req, res) {
     try { body = JSON.parse(await readBody(req)); } catch {
       return json(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request' } });
     }
-    const result = await handleResponses(body, { context: { callerKey } });
+    if (body.input == null) {
+      return json(res, 400, { error: { message: 'input is required', type: 'invalid_request' } });
+    }
+
+    const reqStartedAt = Date.now();
+    const result = await handleResponses(body, { context: { callerKey: callerKeyFromRequest(req, extractToken(req), body) } });
+    const processingMs = Date.now() - reqStartedAt;
+    const modelHeaders = {
+      'x-request-id': 'req-' + randomUUID(),
+      'openai-model': body.model || '',
+      'openai-processing-ms': String(processingMs),
+      'openai-version': '2020-10-01',
+      'openai-organization': 'org-windsurf-proxy',
+    };
     if (result.stream) {
-      req.socket?.setKeepAlive(true);
-      req.setTimeout(0);
-      res.socket?.setNoDelay(true);
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
-      res.flushHeaders?.();
+      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers });
       await result.handler(res);
     } else {
+      for (const [k, v] of Object.entries(modelHeaders)) res.setHeader(k, v);
+      if (result.headers) {
+        for (const [k, v] of Object.entries(result.headers)) res.setHeader(k, v);
+      }
       json(res, result.status, result.body);
     }
     return;
   }
 
-  // Anthropic Messages API — /v1/messages. Lets Claude Code and any Anthropic
-  // SDK point ANTHROPIC_BASE_URL at us directly, no protocol translator required.
+  // Anthropic Messages API — Claude Code compatibility
   if (path === '/v1/messages' && method === 'POST') {
     if (!isAuthenticated()) {
-      return json(res, 503, { type: 'error', error: { type: 'authentication_error', message: 'No active accounts. POST /auth/login to add accounts.' } });
+      return json(res, 503, { type: 'error', error: { type: 'api_error', message: 'No active accounts' } });
     }
     let body;
     try { body = JSON.parse(await readBody(req)); } catch {
@@ -262,16 +402,16 @@ async function route(req, res) {
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages must be a non-empty array' } });
     }
-    const result = await handleMessages(body, { callerKey });
+    const result = await handleMessages(body, { callerKey: callerKeyFromRequest(req, extractToken(req), body) });
+    const anthropicHeaders = {
+      'request-id': 'req-' + randomUUID(),
+      'anthropic-model': body.model || '',
+    };
     if (result.stream) {
-      // Same streaming tuning as /v1/chat/completions — see comment above.
-      req.socket?.setKeepAlive(true);
-      req.setTimeout(0);
-      res.socket?.setNoDelay(true);
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
-      res.flushHeaders?.();
+      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...anthropicHeaders, ...result.headers });
       await result.handler(res);
     } else {
+      for (const [k, v] of Object.entries(anthropicHeaders)) res.setHeader(k, v);
       json(res, result.status, result.body);
     }
     return;
@@ -282,6 +422,9 @@ async function route(req, res) {
 
 export function startServer() {
   const activeRequests = new Set();
+  const bindHost = config.host || '0.0.0.0';
+  configureBindHost(bindHost);
+  emitNoAuthWarnings(bindHost);
 
   const server = http.createServer(async (req, res) => {
     activeRequests.add(res);
@@ -308,7 +451,7 @@ export function startServer() {
         process.exit(1);
       }
       log.warn(`Port ${config.port} in use, retry ${retryCount}/${maxRetries} in 3s...`);
-      setTimeout(() => server.listen(config.port, '0.0.0.0'), 3000);
+      setTimeout(() => server.listen(config.port, bindHost), 3000);
     } else {
       log.error('Server error:', err);
     }
@@ -316,15 +459,14 @@ export function startServer() {
 
   server.getActiveRequests = () => activeRequests.size;
 
-  server.listen({ port: config.port, host: '0.0.0.0' }, () => {
-    log.info(`Server on http://0.0.0.0:${config.port}`);
-    log.info('  POST /v1/chat/completions  (OpenAI format)');
-    log.info('  POST /v1/responses         (OpenAI Responses format)');
-    log.info('  POST /v1/messages          (Anthropic format — Claude Code native)');
+  server.listen({ port: config.port, host: bindHost }, () => {
+    log.info(`Server on http://${bindHost}:${config.port}`);
+    log.info('  POST /v1/chat/completions');
+    log.info('  POST /v1/responses');
     log.info('  GET  /v1/models');
-    log.info('  POST /auth/login           (add account)');
-    log.info('  GET  /auth/accounts        (list accounts)');
-    log.info('  DELETE /auth/accounts/:id  (remove account)');
+    log.info('  POST /auth/login          (add account)');
+    log.info('  GET  /auth/accounts       (list accounts)');
+    log.info('  DELETE /auth/accounts/:id (remove account)');
   });
   return server;
 }

@@ -1,0 +1,1077 @@
+{
+  "_meta": {
+    "name": "English",
+    "code": "en"
+  },
+
+  "brand": {
+    "sub": "Control Panel"
+  },
+
+  "nav": {
+    "group": {
+      "overview": "Overview",
+      "account": "Accounts",
+      "system": "System",
+      "about": "About"
+    },
+    "overview": "Dashboard",
+    "stats": "Statistics",
+    "windsurf-login": "Account Login",
+    "accounts": "Account Pool",
+    "bans": "Health Check",
+    "models": "Model Control",
+    "proxy": "Proxy",
+    "logs": "Logs",
+    "experimental": "Experimental",
+    "credits": "Credits"
+  },
+
+  "page": {
+    "overview": "Dashboard",
+    "stats": "Statistics",
+    "windsurf-login": "Account Login",
+    "accounts": "Account Pool",
+    "bans": "Health Check",
+    "models": "Model Control",
+    "proxy": "Proxy Config",
+    "logs": "Runtime Logs",
+    "experimental": "Experimental Features",
+    "credits": "Credits"
+  },
+
+  "pageTitle": {
+    "main": "WindsurfAPI bydwgx1337 Control Panel"
+  },
+
+  "pageSubtitle": {
+    "overview": "System status and key metrics overview",
+    "windsurf-login": "Login to Windsurf via Google / GitHub / Email to get API Key",
+    "accounts": "Manage account pool, probe subscription tiers and available models",
+    "models": "Configure model access policies, limit available model scope",
+    "proxy": "Configure global or per-account exit proxies; each dedicated proxy spawns an independent Language Server instance",
+    "logs": "Receive server logs in real-time via SSE streaming",
+    "stats": "Request volume, success rate, latency percentiles and account/model dimension stats",
+    "bans": "Track error accounts and abnormal status",
+    "experimental": "Unstable optimizations; disable anytime if issues occur",
+    "credits": "Thanks to contributors who submitted PRs / audited code / reported issues"
+  },
+
+  "button": {
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "forceOverride": "Force Overwrite & Update",
+    "save": "Save",
+    "restart": "Restart",
+    "updateAndRestart": "Update and Restart"
+  },
+
+  "action": {
+    "checkUpdate": "Check Update",
+    "applyUpdate": "Update & Restart",
+    "updateLsBinary": "Update LS",
+    "restart": "Restart",
+    "reset": "Reset",
+    "save": "Save",
+    "clearPool": "Clear Pool",
+    "login": "Login",
+    "clear": "Clear",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "delete": "Delete",
+    "refresh": "Refresh",
+    "runNow": "Run now",
+    "probe": "Probe",
+    "probeTitle": "Probe capabilities",
+    "enable": "Enable",
+    "disable": "Disable",
+    "copy": "Copy",
+    "copyTitle": "Click to copy",
+    "configure": "Configure",
+    "test": "Test",
+    "readClipboard": "Read Clipboard",
+    "batchImport": "Batch Import & Login",
+    "paste": "Paste",
+    "add": "Add",
+    "close": "Close",
+    "edit": "Edit",
+    "selectAll": "Select All",
+    "selectNone": "Select None",
+    "invert": "Invert",
+    "showPassword": "Show/Hide Password",
+    "revealKey": "Click to reveal and copy full API key",
+    "importLocal": "Import from local Windsurf"
+  },
+
+  "status": {
+    "active": "Active",
+    "disabled": "Disabled",
+    "error": "Error",
+    "running": "Running",
+    "stopped": "Stopped",
+    "success": "Success",
+    "failed": "Failed",
+    "pending": "Pending",
+    "unknown": "Unknown",
+    "rateLimited": "Rate Limited",
+    "loading": "Loading...",
+    "saving": "Saving...",
+    "testing": "Testing...",
+    "updateAndRestartHint": "Update and restart the service",
+    "proxySuccess": "✓ Connected. Egress IP {{ip}} · {{latency}}ms",
+    "proxyFailed": "✗ Failed: {{error}} · {{latency}}ms",
+    "checkingUpdate": "Checking for updates...",
+    "updateAvailable": "Update available",
+    "currentVersion": "Current:",
+    "remoteVersion": "Remote:",
+    "upToDate": "✓ Up to date ({{commit}}) · {{message}}",
+    "pullingRestarting": "Pulling + restarting...",
+    "cancelled": "Cancelled",
+    "noUpdateNeeded": "Already up to date, no update needed",
+    "updateComplete": "Update complete {{before}} → {{after}}",
+    "restarting": "Service restarting in background, page will auto-refresh in ~8 seconds...",
+    "notGitRepo": "Not a git repository",
+    "notGitRepoHint": "Ensure .git directory is present for one-click updates",
+    "selfUpdateUnavailable": "One-click update is unavailable in this deployment",
+    "selfUpdateDockerHint": "Run docker compose pull && docker compose up -d on the host to update. To enable in-dashboard one-click updates for Docker deployments, mount /var/run/docker.sock into the windsurf-api service in docker-compose.yml (note: this grants the container host-root privileges; assess the security tradeoff first).",
+    "dockerSelfUpdateBlocked": "Dashboard docker update currently blocked: {{reason}} {{detail}}",
+    "dockerReady": "Docker self-update ready",
+    "dockerImage": "Image:",
+    "dockerProject": "Compose project:",
+    "dockerUpdating": "Update started: pulling {{image}}; deployer sidecar will recreate the container in ~{{delay}}s…",
+    "dockerSidecarStarted": "Deployer container {{id}} started; this page will auto-refresh",
+    "workingDirDirty": "Working directory has local changes",
+    "workingDirDirtyHint": "The following files have local changes:<br>{{files}}<br>Continue will overwrite with remote version.",
+    "notFetched": "Not fetched",
+    "fetchFailed": "Fetch failed",
+    "clickToEditTier": "Click to manually edit tier (use when probe fails)"
+  },
+
+  "tier": {
+    "pro": "PRO",
+    "free": "FREE",
+    "expired": "Expired",
+    "unknown": "Unknown",
+    "expiredLabel": "Expired"
+  },
+
+  "creditsBar": {
+    "daily": "Daily Quota",
+    "weekly": "Weekly Quota",
+    "monthly": "Monthly Quota",
+    "prompt": "Prompt Credits",
+    "dailyShort": "D",
+    "weeklyShort": "W",
+    "promptShort": "P",
+    "columnTitle": "Quota Usage",
+    "columnTooltip": "Two bars indicate:\nD — Daily premium-request remaining %\nW — Weekly premium-request remaining % (main signal for Trial accounts)\n\nHigher = more left = safer\nHover each bar for reset time",
+    "dailyDetail": "Daily {{pct}}% remaining (resets {{reset}})",
+    "weeklyDetail": "Weekly {{pct}}% remaining (resets {{reset}})",
+    "promptDetail": "Prompt credits {{remain}} / {{limit}} remaining ({{pct}}%)",
+    "dailyNA": "Windsurf returned no daily-quota data",
+    "weeklyNA": "Windsurf returned no weekly-quota data",
+    "promptNA": "No prompt-credit data for this account",
+    "noResetTime": "reset time unknown"
+  },
+
+  "section": {
+    "banStatus": {
+      "title": "Health Status"
+    },
+    "lsStatus": {
+      "title": "Language Server",
+      "desc": "Language Server instance status"
+    },
+    "oauthLogin": {
+      "title": "Quick Login (Recommended)",
+      "desc": "Login to Windsurf directly with your Google or GitHub account — no password needed"
+    },
+    "emailLogin": {
+      "title": "Email & Password Login",
+      "desc": "For accounts registered with email+password only. Third-party login please use buttons above. Supports single login or batch import in \"[proxy] email password\" format."
+    },
+    "loginProxy": {
+      "title": "Login Proxy (Optional)",
+      "desc": "Specify a proxy for this login session; leave empty to use global proxy. When proxy takes effect, subsequent chat requests will also egress through this proxy."
+    },
+    "loginHistory": {
+      "title": "Login History",
+      "desc": "Local record of last 50 login operations"
+    },
+    "addAccount": {
+      "title": "Add Account",
+      "desc": "Supports both API Key and Auth Token methods",
+      "hint": "Recommended: Use Token method. Visit {{link}} after logging in, copy the Token and paste below. Works with all login methods (Email/Google/GitHub)."
+    },
+    "accountList": {
+      "title": "Account List",
+      "desc": "Click probe button to update capability info for a specific account"
+    },
+    "modelPolicy": {
+      "title": "Access Policy",
+      "desc": "Choose \"Allow All\" for no restrictions; \"Allowlist\" only permits listed models; \"Blocklist\" blocks listed models"
+    },
+    "modelList": {
+      "title": "Model List",
+      "titleAllow": "Allowed Models",
+      "titleBlock": "Blocked Models",
+      "descAllow": "Only selected models are allowed; unselected models return 403 error",
+      "descBlock": "Selected models will be blocked; unselected models work normally",
+      "search": "Search models...",
+      "provider": "Provider"
+    },
+    "globalProxy": {
+      "title": "Global Proxy",
+      "desc": "Accounts without dedicated proxy will use this configuration"
+    },
+    "accountProxy": {
+      "title": "Per-Account Proxy",
+      "desc": "Set dedicated proxy for specific accounts; each dedicated proxy spawns an independent LS instance"
+    },
+    "identityInjection": {
+      "title": "Model Identity Injection",
+      "desc": "When enabled, injects a system prompt at the start of each request, overriding Cascade's built-in Windsurf identity; each provider's template below can be customized and takes effect immediately after saving."
+    },
+    "cascadeReuse": {
+      "title": "Cascade Conversation Reuse",
+      "desc": "Reuse the same cascade_id across multi-turn conversations, only sending the latest user message to Windsurf. Let the server maintain context cache. Significantly reduces TTFB and upload volume on cache hits; automatically falls back to new session on cache miss or account/LS change. Requires client to retain full history and append in order (e.g., new-api, OpenWebUI). Note: this toggle only governs cascade_id reuse across requests — it does NOT control whether Cascade is used. Tool-emulated requests (Claude Code / Cline / Cursor) auto-skip reuse because each turn's content changes, regardless of this setting.",
+      "enable": "Enable Cascade Conversation Reuse",
+      "hint": "Enabled by default. When disabled, Cascade is still used but a fresh session is created per turn. Takes effect immediately on current conversation pool."
+    },
+    "identityPrompt": {
+      "title": "Model Identity Prompt",
+      "desc": "Inject model identity system prompt at the start of each request.",
+      "enable": "Enable Model Identity Injection",
+      "hint": "Enabled by default; templates below won't work when disabled.",
+      "templateHint": "Each provider's template is editable. {{model}} placeholder will be replaced with the requested model name."
+    },
+    "systemPrompts": {
+      "title": "System Prompts",
+      "desc": "Tool injection, conversation mode and other built-in prompt templates. Changes take effect immediately; click \"Reset\" to restore defaults."
+    },
+    "credentials": {
+      "title": "Credentials",
+      "desc": "Rotate API_KEY and the dashboard password at runtime. Saved into runtime-config.json and applied immediately — no container restart or .env reload needed. Next request must use the new value; the current session will be asked to re-login."
+    },
+    "quietWindow": {
+      "title": "Auto-update on quiet window",
+      "desc": "Watches per-minute request rate; if it stays at or below the threshold for the full window, auto-runs `docker compose pull && up -d`. 10-min cold-start grace; 24h cooldown after success; failure doesn't trigger cooldown. Requires /var/run/docker.sock mounted into the container (default docker-compose already does).",
+      "enable": "Enable quiet-window auto-update",
+      "hint": "Off by default. Current status: "
+    },
+    "droughtRestrict": {
+      "title": "Block premium models during drought",
+      "desc": "When every active account is below 5% weekly quota, premium model requests (claude-opus / claude-sonnet etc.) are refused with a clean 503 instead of burning the last bit of quota on an upstream 429. Free-tier models (gemini-2.5-flash etc.) still go through. Disable to forward premium requests anyway and accept the upstream rate-limit.",
+      "enable": "Enable drought-mode premium block",
+      "hint": "Default ON. Drought state is auto-detected from the account pool (GET /dashboard/api/drought for live state)."
+    },
+    "skin": {
+      "title": "Interface Style",
+      "desc": "Dashboard appearance. Modern is the default; sketch is an experimental simplified layout. The page refreshes after switching."
+    },
+    "lsPool": {
+      "title": "Language Server Pool",
+      "desc": "{{count}} LS instances · one process per dedicated proxy",
+      "sectionTitle": "Language Server Pool",
+      "sectionDesc": "Dedicated Language Server instances per proxy",
+      "port": "Port",
+      "defaultInstance": "Default Instance",
+      "noProxy": "No proxy"
+    },
+    "modelStats": {
+      "title": "Model Usage Statistics",
+      "desc": "Aggregated by model: requests, success count, error count, success rate, avg duration and p50/p95 latency percentiles"
+    },
+    "accountStats": {
+      "title": "Account Dimension Statistics",
+      "desc": "Request volume and success rate per account ID (first 8 chars)"
+    },
+    "accountHealth": {
+      "title": "Account Health Status"
+    },
+    "requestChart": {
+      "title": "Request Volume Time Series",
+      "subtitle": "Switch chart type and time range · hover for exact values",
+      "typeArea": "Area",
+      "typeLine": "Line",
+      "typeBar": "Bar",
+      "typeStacked": "Stacked",
+      "metricAll": "All Metrics",
+      "metricRequests": "Requests",
+      "metricErrors": "Errors",
+      "metricSuccess": "Success",
+      "legendRequests": "Requests",
+      "legendSuccess": "Success",
+      "legendErrors": "Errors",
+      "tooltipTime": "Time",
+      "tooltipRequests": "Requests",
+      "tooltipErrors": "Errors",
+      "tooltipSuccess": "Success",
+      "tooltipRate": "Success Rate"
+    },
+    "modelPie": {
+      "title": "Model Request Distribution",
+      "desc": "Share of requests for top 8 models"
+    }
+  },
+
+  "help": {
+    "token": "Recommended: Use Token method. Visit {{link}} after logging in, copy the Token and paste below. Works with all login methods (Email/Google/GitHub).",
+    "tokenGuide": "Recommended: Use Token method. Visit ",
+    "tokenGuideEnd": " after logging in, copy the Token and paste below. Works with all login methods (Email/Google/GitHub)."
+  },
+
+  "skin": {
+    "modern": "Modern",
+    "sketch": "Sketch (Experimental)",
+    "hint": "Saved to cookie and refreshed immediately"
+  },
+
+  "field": {
+    "email": {
+      "label": "Email",
+      "placeholder": "your-email@example.com"
+    },
+    "password": {
+      "label": "Password",
+      "placeholder": "••••••••"
+    },
+    "type": {
+      "label": "Type"
+    },
+    "tier": {
+      "label": "Tier"
+    },
+    "provider": {
+      "label": "Provider",
+      "all": "All Providers"
+    },
+    "searchModel": {
+      "label": "Search Model",
+      "placeholder": "Enter model name to filter..."
+    },
+    "proxyUser": {
+      "placeholder": "Proxy auth username"
+    },
+    "proxyPass": {
+      "placeholder": "Proxy auth password"
+    },
+    "searchProvider": {
+      "placeholder": "Search providers..."
+    },
+    "host": {
+      "label": "Host",
+      "placeholder": "proxy.example.com"
+    },
+    "port": {
+      "label": "Port",
+      "placeholder": "8080"
+    },
+    "username": {
+      "label": "Username",
+      "placeholder": "Optional"
+    },
+    "passwordProxy": {
+      "label": "Password",
+      "placeholder": "Optional"
+    },
+    "key": {
+      "label": "Key / Token",
+      "placeholder": "Paste Auth Token (from windsurf.com/show-auth-token)"
+    },
+    "label": {
+      "label": "Label",
+      "placeholder": "Optional"
+    },
+    "proxy": {
+      "label": "Proxy",
+      "placeholder": "http://proxy:8080 or socks5://user:pass@host:port (optional)",
+      "hint": "Leave empty to use global proxy settings"
+    },
+    "batchInput": {
+      "label": "Batch Import",
+      "hint": "One account per line. Format: [proxy] email password. Proxy is optional, supports http/socks5. Proxy will be automatically bound to corresponding account."
+    },
+    "proxyType": {
+      "label": "Type"
+    },
+    "proxyHost": {
+      "label": "Host",
+      "placeholder": "Leave empty = use global"
+    },
+    "providerFilter": {
+      "label": "Provider"
+    },
+    "logLevel": {
+      "label": "Log Level"
+    },
+    "identitySearch": {
+      "placeholder": "Search providers..."
+    },
+    "search": {
+      "label": "Search",
+      "placeholder": "Search..."
+    },
+    "autoScroll": "Auto-scroll",
+    "autoAdd": "Auto-add to pool after login"
+  },
+
+  "table": {
+    "header": {
+      "time": "Time",
+      "email": "Email",
+      "status": "Status",
+      "proxy": "Proxy",
+      "action": "Action",
+      "id": "ID",
+      "label": "Label",
+      "tier": "Tier",
+      "rpm": "RPM",
+      "credits": "Credits",
+      "models": "Available Models",
+      "error": "Error",
+      "lastUsed": "Last Used",
+      "key": "Key",
+      "accountId": "Account ID",
+      "account": "Account",
+      "requests": "Requests",
+      "success": "Success",
+      "errors": "Errors",
+      "successRate": "Success Rate",
+      "avg": "Avg",
+      "p50": "p50",
+      "p95": "p95",
+      "errorCount": "Error Count",
+      "model": "Model",
+      "note": "Note"
+    },
+    "empty": {
+      "loginHistory": "No login records",
+      "accounts": "No accounts yet, please add one first",
+      "accountsProxy": "No accounts",
+      "modelStats": "No model statistics available",
+      "accountStats": "No account statistics available",
+      "banList": "No abnormal accounts",
+      "models": "No matching models",
+      "credits": "Loading...",
+      "accountNotFound": "Account not found",
+      "noValidAccounts": "No valid accounts available for routing",
+      "probeFailed": "Probe failed",
+      "noRequestData": "No request data",
+      "noAccountRequestData": "No account-level request data",
+      "noData": "No data"
+    }
+  },
+
+  "card": {
+    "activeAccounts": {
+      "title": "Active Accounts",
+      "subtitle": "{{total}} total · {{error}} abnormal"
+    },
+    "totalRequests": {
+      "title": "Total Requests",
+      "subtitle": "{{rate}}% success rate"
+    },
+    "uptime": {
+      "title": "Uptime",
+      "subtitle": "Started at {{time}}"
+    },
+    "languageServer": {
+      "title": "Language Server",
+      "running": "Running",
+      "stopped": "Stopped",
+      "subtitle": "{{count}} instances · Port {{port}}"
+    },
+    "responseCache": {
+      "title": "Response Cache",
+      "subtitle": "{{hits}} hit / {{misses}} miss · {{size}}/{{max}} entries"
+    },
+    "tokens": {
+      "title": "Token usage breakdown",
+      "subtitle": {
+        "empty": "no usage data yet"
+      }
+    },
+    "banStats": {
+      "title": "Health Overview"
+    },
+    "abnormalAccounts": {
+      "title": "Abnormal Accounts",
+      "subtitle": "Total {{count}} accounts"
+    },
+    "disabled": {
+      "title": "Disabled",
+      "subtitle": "Auto-disabled due to errors"
+    },
+    "rateLimit": {
+      "title": "Rate Limited",
+      "badge": "Rate Limited",
+      "subtitle": "Temporarily excluded from scheduling"
+    },
+    "stats": {
+      "title": "Total Requests",
+      "subtitle": "Running {{time}}"
+    },
+    "success": {
+      "title": "Success",
+      "subtitle": "{{rate}}% success rate"
+    },
+    "errors": {
+      "title": "Errors",
+      "subtitle": "{{rate}}% failure rate"
+    },
+    "p95Latency": {
+      "title": "Avg p95 Latency",
+      "subtitle": "{{count}} models"
+    },
+    "hitRate": {
+      "title": "Hit Rate",
+      "subtitle": "{{hits}} hit / {{misses}} miss"
+    },
+    "poolSize": {
+      "title": "Pool Size",
+      "subtitle": "Max {{max}} · TTL {{ttl}} min"
+    },
+    "stores": {
+      "title": "Stores",
+      "subtitle": "Expired {{expired}} · Evicted {{evicted}}"
+    },
+    "defaultInstance": "Default Instance",
+    "noProxy": "No proxy",
+    "restarts": "restarts",
+    "custom": "Customized"
+  },
+
+  "login": {
+    "title": "Control Panel Login",
+    "subtitle": "Please enter the admin password to continue",
+    "passwordPlaceholder": "Dashboard Password",
+    "lockedTitle": "Dashboard locked",
+    "lockedDesc": "Server bound to public host without <code>DASHBOARD_PASSWORD</code>. v2.0.55 fail-closed: API_KEY no longer doubles as the dashboard password.",
+    "lockedFix": "Fix:",
+    "lockedDocs": "See",
+    "button": "Login",
+    "checking": "Checking…",
+    "wrong": "Wrong password",
+    "empty": "Password required",
+    "locked": "Backend has no password configured — set DASHBOARD_PASSWORD or API_KEY env and restart",
+    "networkError": "Cannot reach server"
+  },
+
+  "range": {
+    "6h": "6h",
+    "24h": "24h",
+    "72h": "72h",
+    "7d": "7d",
+    "30d": "30d",
+    "all": "All",
+    "custom": "Custom",
+    "customTitle": "Custom Date Range",
+    "customStart": "Start Date",
+    "customEnd": "End Date",
+    "customApply": "Apply",
+    "customCancel": "Cancel",
+    "customHint": "Showing up to last 30 days"
+  },
+
+  "credits": {
+    "contributors": "Core Contributors",
+    "history": "Contributions · {{count}}",
+    "contributionDetails": "Details",
+    "cta": {
+      "title": "Want to join this list?",
+      "desc": "Open an issue or pull request on GitHub — bug fixes, new models, UI improvements, or security findings all get recognised here.",
+      "issue": "Open Issue",
+      "pr": "Open PR"
+    }
+  },
+
+  "experimental": {
+    "enable": "Enable",
+    "disable": "Disable",
+    "cascadeReuse": {
+      "title": "Enable Cascade Conversation Reuse",
+      "desc": "Disabled by default. When enabled, takes effect immediately on current conversation pool.",
+      "enable": "Enable Cascade Conversation Reuse",
+      "hint": "Disabled by default. When enabled, takes effect immediately on current conversation pool."
+    },
+    "identityPrompt": {
+      "title": "Enable Model Identity Injection",
+      "desc": "Enabled by default; templates below won't work when disabled."
+    },
+    "templateHint": "Each provider's template is editable. {{model}} placeholder will be replaced with the requested model name (e.g., claude-opus-4.6).",
+    "clearPool": "Clear Conversation Pool",
+    "refresh": "Refresh",
+    "noMatch": "No matches",
+    "restoreDefault": "Restore Default",
+    "save": "Save",
+    "default": "Default",
+    "toolReinforcement": "Tool Call Format Guide",
+    "communicationWithTools": "Communication with Tools",
+    "communicationNoTools": "Communication without Tools",
+    "promptEmpty": "Template cannot be empty",
+    "missingPlaceholder": "Missing {model} placeholder",
+    "missingPlaceholderDesc": "After saving, the provider's model name won't be replaced in the prompt. Continue?",
+    "restored": "restored"
+  },
+
+  "drought": {
+    "title": "Quota drought:",
+    "body": "Every active account is below the weekly quota threshold — add accounts or wait for reset"
+  },
+
+  "credentials": {
+    "apiKey": "API_KEY",
+    "dashboardPassword": "Dashboard Password",
+    "apiKeyPlaceholder": "New API_KEY (≥ 8 chars; leave blank to clear runtime override)",
+    "dashboardPwPlaceholder": "New dashboard password (≥ 8 chars; leave blank to clear runtime override)",
+    "show": "Show / Hide",
+    "save": "Save",
+    "saved": "Saved",
+    "set": "set",
+    "unset": "unset",
+    "apiKeyHint": "After saving, every chat client must use the new KEY; the old KEY stops working immediately.",
+    "dashboardPwHint": "Stored as a scrypt hash; the current session will be signed out and you'll need to log in again with the new password.",
+    "bruteForceHint": "Brute-force guard: same IP gets locked for 30 minutes after 5 failed dashboard logins (since v2.0.56).",
+    "confirmSave": "After saving, the old value stops working immediately. Continue?",
+    "confirmClear": "Clear the runtime override and fall back to the .env value?"
+  },
+
+  "confirm": {
+    "restartTitle": "Restart Language Server",
+    "restartDesc": "In-progress requests will fail. Continue?",
+    "updateLsTitle": "Update LS Binary",
+    "updateLsDesc": "Download the latest language_server from the WindsurfAPI / Exafunction GitHub release and restart the LS pool. In-flight requests will fail once.",
+    "updateLsButton": "Update",
+    "restoreDefaultDesc": "restore to default?",
+    "clearPoolDesc": "All active Cascade sessions will be cleared. Continue?"
+  },
+
+  "modal": {
+    "blockedModels": {
+      "title": "Edit Available Models — {{email}}",
+      "hint": "Checked = available; Uncheck = disabled for this account",
+      "enabled": "Enabled",
+      "saved": "Saved: enabled {{enabled}} / disabled {{disabled}}",
+      "saving": "Saving...",
+      "total": "Total"
+    },
+    "restartLS": {
+      "title": "Restart Language Server",
+      "desc": "In-progress requests will fail. Continue?"
+    },
+    "deleteAccount": {
+      "title": "Delete Account",
+      "desc": "This action cannot be undone. Delete this account?"
+    },
+    "resetStats": {
+      "title": "Reset Statistics",
+      "desc": "Clear all statistics data?"
+    },
+    "overrideTier": {
+      "title": "Manually Set Account Tier",
+      "desc": "Current: {{current}}. The proxy routes by Windsurf's upstream cascade_allowed_models_config (per-account — free accounts often include GLM / SWE / Kimi etc.). When the Pro trial mis-detects (issue #8), manually set to pro to force-unlock every model.",
+      "options": {
+        "pro": "Pro (force-unlock all models)",
+        "free": "Free (route by upstream allowlist)",
+        "unknown": "Unknown (let system re-evaluate)"
+      }
+    },
+    "applyUpdate": {
+      "title": "Update & Restart",
+      "desc": "Will execute git pull and restart PM2. Dashboard will be briefly unavailable during restart (about 5-10 seconds). Continue?"
+    },
+    "dirtyWorktree": {
+      "title": "Local Changes in Working Directory",
+      "desc": "The following files have been modified but not committed:<br><br><code>{{files}}</code><br>Continuing will overwrite local changes with remote version. For non-git deployments (SFTP / zip), click force overwrite.",
+      "forceUpdate": "Force Overwrite & Update"
+    },
+    "configureProxy": {
+      "title": "Configure Account Proxy",
+      "desc": "Set dedicated proxy for account {{label}}"
+    }
+  },
+
+  "oauth": {
+    "tryAnotherWay": "Try Another Way",
+    "google": "Google Login",
+    "github": "GitHub Login",
+    "copyAuthToken": "Copy Auth Token",
+    "pasteToken": "Paste Token in Account Management",
+    "inlineTokenTitle": "Or paste Auth Token directly (recommended for OAuth-only accounts)",
+    "inlineTokenDesc": "Click the left button to open windsurf.com in a new tab → sign in with Google/GitHub → page shows Auth Token → copy and paste into the input on the right → click Add",
+    "openWindsurfToken": "Open windsurf.com for Token",
+    "tokenPlaceholder": "Paste Auth Token...",
+    "addWithToken": "Add via Token",
+    "status": {
+      "loading": "Logging in via {{provider}}...",
+      "success": "Login successful! {{email}} added to pool",
+      "codeium": "{{provider}} auth successful, registering with Codeium...",
+      "firebaseError": "Firebase SDK failed to load, please refresh and retry",
+      "loggingIn": "Logging in via {{label}}...",
+      "codeiumRegistering": "{{label}} auth success, registering Codeium...",
+      "loginSuccess": "Login successful {{email}} added to pool",
+      "loginFailed": "{{label}} login failed: {{error}}"
+    }
+  },
+
+  "update": {
+    "checking": "Checking for updates...",
+    "newVersion": "New version found",
+    "current": "Current",
+    "remote": "Remote",
+    "latest": "Already up to date",
+    "applying": "Pulling + restarting...",
+    "complete": "Update complete",
+    "restarting": "Service restarting in background, page will auto-refresh in ~8 seconds...",
+    "cancelled": "Cancelled",
+    "notGit": "Not a git deployment — one-click update unavailable",
+    "notGitDesc": "If you deployed via git clone, ensure .git directory is with WindsurfAPI source. For SFTP / zip uploads, manually replace files and pm2 restart.",
+    "upToDate": "Already up to date, no update needed"
+  },
+
+  "proxy": {
+    "test": {
+      "button": "Test Proxy",
+      "result": "Result"
+    },
+    "none": "None (use global)",
+    "direct": "Direct",
+    "global": "Global",
+    "current": "Current",
+    "notConfigured": "No global proxy configured",
+    "placeholderSaved": "Saved (leave empty to keep)",
+    "placeholderPassword": "Proxy auth password",
+    "auth": "Auth"
+  },
+
+  "localImport": {
+    "scanning": "Scanning local Windsurf client…",
+    "empty": "No logged-in local Windsurf credentials found",
+    "scannedPaths": "Scanned paths",
+    "found": "credential(s)",
+    "foundCount": "Found {{count}} local account(s) — review and click Import",
+    "account": "Account",
+    "key": "API Key",
+    "source": "Source",
+    "importBtn": "Import",
+    "importSuccess": "Imported {{email}}",
+    "unavailable": "Available only on localhost deployments — \"local Windsurf\" on a remote server belongs to someone else's machine, not yours."
+  },
+
+  "account": {
+    "addSuccess": "Account added",
+    "deleteSuccess": "Account deleted",
+    "enableSuccess": "Account enabled",
+    "disableSuccess": "Account disabled",
+    "resetErrors": "Errors reset",
+    "tierSet": "Tier set to {{tier}}",
+    "editModels": "Edit available models",
+    "probe": {
+      "doing": "Probing, takes about 10-30 seconds...",
+      "complete": "Probe complete: {{result}}",
+      "allDoing": "Probing all accounts, takes 1-3 minutes depending on count...",
+      "allComplete": "Probe complete: {{summary}}",
+      "probeAllComplete": "Probe complete: {{summary}}",
+      "probeComplete": "Probe complete: {{tier}}"
+    },
+    "credits": {
+      "refreshTitle": "Refresh credits",
+      "refreshed": "Credits refreshed",
+      "refreshFailed": "Refresh failed",
+      "allRefreshed": "All account credits refreshed: {{ok}} success / {{fail}} failed",
+      "refreshing": "Refreshing all account credits...",
+      "refreshingAll": "Refreshing all account credits..."
+    },
+    "ls": {
+      "restarting": "Language Server restarting..."
+    },
+    "detail": {
+      "toggle": "Expand / collapse details",
+      "ago": "ago",
+      "resetAt": "resets",
+      "creditPerCall": "Credits charged per call",
+      "creditUnit": "",
+      "plan": {
+        "title": "Subscription",
+        "name": "Plan",
+        "tier": "Tier",
+        "start": "Start",
+        "end": "End",
+        "overage": "Overage balance"
+      },
+      "quota": {
+        "title": "Quota Usage",
+        "daily": "Daily",
+        "weekly": "Weekly",
+        "promptCredits": "Prompt credits",
+        "flexCredits": "Flex credits",
+        "used": "used",
+        "fetchedAt": "Fetched",
+        "notApplicable": "Not applicable to this plan"
+      },
+      "models": {
+        "title": "Available Models",
+        "available": "available",
+        "blocked": "blocked"
+      },
+      "runtime": {
+        "title": "Runtime",
+        "status": "Status",
+        "errors": "Errors",
+        "rpm": "RPM",
+        "lastUsed": "Last used",
+        "lastProbed": "Last probed",
+        "creditsFetched": "Credits refreshed",
+        "accountId": "Account ID",
+        "apiKey": "API Key",
+        "lastError": "Last error"
+      }
+    }
+  },
+
+  "batch": {
+    "pasteFirst": "Please paste batch accounts first",
+    "importing": "Importing...",
+    "importingDesc": "{{count}} lines, please wait",
+    "complete": "Batch import complete",
+    "importFailed": "Batch import failed",
+    "importComplete": "Batch import complete: success {{success}} / failed {{fail}}",
+    "success": "Success",
+    "fail": "Fail",
+    "formatError": "Line {{line}} format error"
+  },
+
+  "quietWindow": {
+    "status": {
+      "disabled": "disabled",
+      "coldStart": "cold-start grace",
+      "cooldown": "cooldown",
+      "busy": "busy",
+      "eligible": "quiet · eligible"
+    },
+    "never": "never",
+    "lastUpdate": "last update",
+    "loadFailed": "load failed",
+    "triggered": "triggered",
+    "triggerFailed": "trigger failed"
+  },
+
+  "toast": {
+    "copied": "Copied",
+    "saved": "Saved",
+    "cleared": "Cleared",
+    "refresh": "Refresh",
+    "error": "Error",
+    "loading": "Loading...",
+    "exportOk": "Downloaded {{filename}}",
+    "exportFailed": "Export failed",
+    "enterHostPort": "Please enter host and port first",
+    "experimentalEnabled": "Experimental feature enabled",
+    "experimentalDisabled": "Experimental feature disabled",
+    "toggleFailed": "Toggle failed: {{error}}",
+    "modeUpdated": "Mode updated",
+    "noTierModels": "No models available for this account tier",
+    "loginSuccess": "{{label}} login successful",
+    "loginFailed": "{{label}} login failed: {{error}}",
+    "loginSuccessAdded": "Login successful, account added to pool",
+    "clipboardRead": "Clipboard read",
+    "clipboardEmpty": "Clipboard is empty",
+    "clipboardUnsupported": "Current environment doesn't support auto clipboard read, please paste manually",
+    "clipboardError": "Failed to read clipboard: {{error}}",
+    "apiKeyCopied": "API Key copied",
+    "copyFailed": "Copy failed, please select manually",
+    "copyFailedError": "Copy failed: {{error}}",
+    "enterEmailPassword": "Please enter email and password",
+    "restarting": "Language Server restarting...",
+    "lsBinaryUpdating": "Updating LS binary…",
+    "lsBinaryUpdated": "LS binary updated ({{before}} → {{after}}), restarted {{count}} instance(s)",
+    "lsBinaryUpdatedColdPool": "LS binary updated ({{before}} → {{after}}), no running instances; new binary loads on next request",
+    "lsBinaryUpdatedWithErrors": "LS binary updated ({{before}} → {{after}}), restarted {{count}} instance(s) ({{errors}} failed)",
+    "lsBinaryAlreadyCurrent": "LS binary already current (sha:{{sha}}), no update needed",
+    "lsBinaryUpdateFailed": "LS update failed: {{error}}",
+    "lsBinaryUpdateRequestFailed": "LS update request failed: {{error}}",
+    "lsBinaryUnreadable": "LS binary unreadable: {{error}}",
+    "lsBinaryReadFailed": "Failed to read LS info: {{error}}",
+    "lsBinaryStat": "{{path}} · {{sizeMb}} MB · sha256:{{sha}} · installed {{age}}d ago",
+    "proxyConfigured": "Account proxy configured",
+    "proxyCleared": "Account proxy cleared",
+    "globalProxySaved": "Global proxy saved",
+    "globalProxyCleared": "Global proxy cleared",
+    "enterProxyHost": "Please enter proxy host",
+    "statsReset": "Statistics reset",
+    "enterKeyOrToken": "Please enter Key or Token",
+    "addFailed": "Add failed",
+    "probe": {
+      "doing": "Probing, takes about 10-30 seconds...",
+      "probeComplete": "Probe complete: {{tier}}",
+      "allDoing": "Probing all accounts, takes 1-3 minutes depending on count...",
+      "probeAllComplete": "Probe complete: {{summary}}"
+    },
+    "probeComplete": "Probe complete: {{tier}}",
+    "probeAllComplete": "Probe complete: {{summary}}",
+    "credits": {
+      "refreshed": "Credits refreshed",
+      "refreshFailed": "Failed to refresh credits",
+      "refreshing": "Refreshing credits...",
+      "allRefreshed": "All account credits refreshed: {{ok}} success / {{fail}} failed"
+    }
+  },
+
+  "log": {
+    "level": {
+      "all": "All Levels",
+      "debug": "Debug",
+      "info": "Info",
+      "warn": "Warn",
+      "error": "Error"
+    },
+    "searchPlaceholder": "Search log content...",
+    "clearView": "Clear View",
+    "viaSSE": "via SSE real-time streaming",
+    "export": {
+      "all": "All logs",
+      "api": "API request logs",
+      "system": "System runtime logs",
+      "txt": "Plain text",
+      "btn": "Download logs"
+    }
+  },
+
+  "model": {
+    "mode": {
+      "all": "Allow All",
+      "allowlist": "Allowlist",
+      "blocklist": "Blocklist"
+    },
+    "provider": {
+      "all": "All Providers",
+      "anthropic": "Anthropic",
+      "openai": "OpenAI",
+      "google": "Google",
+      "deepseek": "DeepSeek",
+      "xai": "xAI",
+      "alibaba": "Alibaba",
+      "moonshot": "Moonshot",
+      "windsurf": "Windsurf"
+    },
+    "list": {
+      "current": "Current List ({{count}})",
+      "empty": "List is empty"
+    }
+  },
+
+  "error": {
+    "generic": "An error occurred",
+    "unknown": "Unknown error",
+    "updateFailed": "Update failed",
+    "apiError": "API error",
+    "loadFailed": "Failed to load",
+    "probeFailed": "Probe failed",
+    "accountNotFound": "Account not found",
+    "openFailed": "Failed to open",
+    "saveFailed": "Save failed",
+    "deleteFailed": "Delete failed",
+    "networkError": "Network error",
+    "authRequired": "Please login first",
+    "clipboardNotSupported": "Current environment doesn't support clipboard auto-read, please paste manually",
+    "clipboardEmpty": "Clipboard is empty",
+    "clipboardReadFailed": "Failed to read clipboard",
+    "firebaseLoadFailed": "Firebase SDK failed to load, please refresh and retry",
+    "ERR_EMAIL_PASSWORD_REQUIRED": "Email and password are required",
+    "ERR_HOST_PORT_REQUIRED": "Host and port are required",
+    "ERR_SELF_UPDATE_UNAVAILABLE": "One-click update is unavailable for this deployment",
+    "pull-failed": "Failed to pull image",
+    "deployer-pull-failed": "Failed to pull deployer image (docker:24-cli)",
+    "deployer-create-failed": "Failed to create deployer container",
+    "deployer-create-no-id": "Deployer container created but no ID returned",
+    "deployer-start-failed": "Failed to start deployer container",
+    "ERR_UNCOMMITTED_CHANGES": "Working directory has uncommitted changes. Force overwrite?",
+    "ERR_ACCOUNTS_REQUIRED": "Accounts array is required",
+    "ERR_TEXT_REQUIRED": "Text field is required",
+    "ERR_NO_VALID_LINES": "No valid lines found",
+    "ERR_FORMAT_INVALID": "Invalid format. Expected: [proxy] email password",
+    "ERR_IDTOKEN_REQUIRED": "ID token is required",
+    "ERR_PROXY_PRIVATE_IP": "Proxy cannot point to private/local address",
+    "ERR_PROXY_FORMAT_INVALID": "Invalid proxy format. Expected: protocol://[user:pass@]host:port",
+    "ERR_PROXY_HTTP_ERROR": "Proxy returned HTTP error",
+    "ERR_PROXY_PRIVATE_HOST": "Private/local host is not allowed",
+    "ERR_CONNECTION_FAILED": "Connection failed",
+    "ERR_TIMEOUT": "Timeout (10s)",
+    "ERR_TLS_TUNNEL_ERROR": "TLS tunnel established but returned abnormal content",
+    "ERR_TLS_FAILED": "TLS failed",
+    "ERR_LOGIN_FAILED": "Login failed",
+    "ERR_EMAIL_NOT_FOUND": "Email not registered for password login. If registered via Google/GitHub OAuth, use OAuth buttons or visit windsurf.com/show-auth-token to copy Auth Token",
+    "ERR_INVALID_PASSWORD": "Invalid password",
+    "ERR_INVALID_CREDENTIALS": "Invalid email or password",
+    "ERR_NO_PASSWORD_SET": "No password set for this account. Use Google/GitHub OAuth or visit windsurf.com/show-auth-token to copy Auth Token",
+    "ERR_USER_DISABLED": "Account has been disabled",
+    "ERR_TOO_MANY_ATTEMPTS": "Too many attempts. Please try again later",
+    "ERR_INVALID_EMAIL": "Invalid email format",
+    "ERR_CODEIUM_REGISTER_FAILED": "Codeium registration failed",
+    "ERR_AUTH1_TOKEN_MISSING": "Auth1 response missing token",
+    "ERR_POSTAUTH_FAILED": "Windsurf PostAuth failed",
+    "ERR_TOKEN_FETCH_FAILED": "Failed to fetch one-time auth token",
+    "ERR_FIREBASE_TOKEN_MISSING": "Firebase response missing idToken",
+    "ERR_LOCAL_IMPORT_LOOPBACK_ONLY": "Local import only available from 127.0.0.1 — open the dashboard from the host machine itself, not via a public domain",
+    "ERR_LOCAL_IMPORT_FAILED": "Failed to scan local Windsurf credentials"
+  },
+
+  "footer": {
+    "version": "Version",
+    "langToggle": "Switch language",
+    "langToggleToEn": "Switch to English",
+    "langToggleToZh": "切换到中文"
+  },
+
+  "placeholder": {
+    "noProxy": "No proxy"
+  },
+
+  "loginResult": {
+    "success": "✓ Login Successful",
+    "apiKeyGenerated": "API Key generated{{autoAdd}}",
+    "fail": "✗ Login Failed",
+    "batchComplete": "Batch Import Complete",
+    "batchDesc": "Total {{total}} accounts, {{success}} success, {{fail}} fail{{autoAdd}}",
+    "tryOther": "Try Another Way",
+    "oauthHint": "If Google/GitHub OAuth was used to register, password login won't work. Use the Google/GitHub buttons above, or visit {{link}} to copy Auth Token then manually add in Account Pool page.",
+    "fields": {
+      "email": "Email",
+      "name": "Name",
+      "apiKey": "API Key",
+      "accountId": "Account ID"
+    },
+    "successTitle": "Login Success",
+    "addedToPool": "and added to account pool"
+  },
+
+  "timeRange": {
+    "minutesAgo": "{{count}}m ago",
+    "hoursAgo": "{{count}}h ago",
+    "daysAgo": "{{count}}d ago"
+  },
+
+  "time": {
+    "day": "d",
+    "hour": "h",
+    "minute": "m",
+    "second": "s"
+  },
+
+  "prompt": {
+    "editor": {
+      "reset": "Reset",
+      "search": "Search providers...",
+      "templateHint": "{{model}} placeholder will be replaced with the requested model name."
+    }
+  },
+
+  "ls": {
+    "defaultInstance": "Default Instance",
+    "noProxy": "No proxy",
+    "port": "Port",
+    "pid": "PID",
+    "restartCount": "Restarts"
+  }
+}

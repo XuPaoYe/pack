@@ -1,5 +1,5 @@
-import { readFileSync, existsSync } from 'fs';
-import { resolve, dirname } from 'path';
+import { readFileSync, existsSync, mkdirSync } from 'fs';
+import { resolve, dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -19,6 +19,10 @@ function loadEnv() {
     let val = trimmed.slice(eqIdx + 1).trim();
     if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
       val = val.slice(1, -1);
+    } else {
+      // Strip inline comments for unquoted values: PORT=3003 # port → 3003
+      const commentIdx = val.indexOf(' #');
+      if (commentIdx !== -1) val = val.slice(0, commentIdx).trim();
     }
     if (!process.env[key]) {
       process.env[key] = val;
@@ -28,28 +32,36 @@ function loadEnv() {
 
 loadEnv();
 
-// Derive the default Language Server binary path from the host platform/arch.
-// Windsurf ships these filenames inside its tarball. Users can override with
-// LS_BINARY_PATH if they keep the binary elsewhere.
-function defaultLsBinaryPath() {
-  const dir = '/opt/windsurf';
-  const { platform, arch } = process;
-  // macOS: binaries ship with the .app bundle, but people commonly symlink
-  // them to /opt/windsurf as well. Fall through to linux-x64 only if the user
-  // didn't vendor the darwin binary.
-  if (platform === 'darwin') {
-    return `${dir}/language_server_macos_${arch === 'arm64' ? 'arm' : 'x64'}`;
+// `sharedDataDir` is the cluster-shared root: a single accounts.json lives
+// here so add-account writes from any replica are visible to every replica
+// after restart. `dataDir` is replica-local under REPLICA_ISOLATE=1 and is
+// safe to use for telemetry that does not need cross-replica visibility.
+// See issue #67 — when the two were collapsed into one path, every
+// docker-compose upgrade orphaned the user's accounts.json under a stale
+// `replica-${HOSTNAME}` subdir.
+const sharedDataDir = process.env.DATA_DIR ? resolve(ROOT, process.env.DATA_DIR) : ROOT;
+const dataDir = (() => {
+  let base = sharedDataDir;
+  if (process.env.REPLICA_ISOLATE === '1' && process.env.HOSTNAME) {
+    base = join(base, `replica-${process.env.HOSTNAME}`);
   }
-  if (platform === 'win32') {
-    return `${dir}\\language_server_windows_x64.exe`;
-  }
-  // Linux (and anything else unixy)
-  return `${dir}/language_server_linux_${arch === 'arm64' ? 'arm' : 'x64'}`;
-}
+  return base;
+})();
+
+try {
+  mkdirSync(sharedDataDir, { recursive: true });
+  mkdirSync(dataDir, { recursive: true });
+} catch {}
 
 export const config = {
   port: parseInt(process.env.PORT || '3003', 10),
+  // Bind host. Defaults to all interfaces. Set HOST=127.0.0.1 (or BIND_HOST=)
+  // for localhost-only deployments — when bound non-locally, missing API_KEY /
+  // DASHBOARD_PASSWORD switches to fail-closed instead of default-allow.
+  host: process.env.HOST || process.env.BIND_HOST || '0.0.0.0',
   apiKey: process.env.API_KEY || '',
+  dataDir,
+  sharedDataDir,
 
   codeiumAuthToken: process.env.CODEIUM_AUTH_TOKEN || '',
   codeiumApiKey: process.env.CODEIUM_API_KEY || '',
@@ -61,14 +73,19 @@ export const config = {
   maxTokens: parseInt(process.env.MAX_TOKENS || '8192', 10),
   logLevel: process.env.LOG_LEVEL || 'info',
 
-  // Language server — auto-detect default binary name by platform/arch so
-  // Windsurf's per-OS LS binaries just work out of the box. User can always
-  // override with LS_BINARY_PATH env var.
-  lsBinaryPath: process.env.LS_BINARY_PATH || defaultLsBinaryPath(),
+  // Language server
+  lsBinaryPath: process.env.LS_BINARY_PATH || (
+    process.platform === 'darwin'
+      ? `${process.env.HOME}/.windsurf/language_server_macos_${process.arch === 'arm64' ? 'arm' : 'x64'}`
+      : '/opt/windsurf/language_server_linux_x64'
+  ),
   lsPort: parseInt(process.env.LS_PORT || '42100', 10),
 
   // Dashboard
   dashboardPassword: process.env.DASHBOARD_PASSWORD || '',
+
+  // Proxy testing
+  allowPrivateProxyHosts: process.env.ALLOW_PRIVATE_PROXY_HOSTS === '1',
 };
 
 const levels = { debug: 0, info: 1, warn: 2, error: 3 };

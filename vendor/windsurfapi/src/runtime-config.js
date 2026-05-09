@@ -3,45 +3,84 @@
  * the dashboard at runtime without a restart or editing .env. Backed by a
  * small JSON file next to the project root so it survives redeploys.
  *
- * Currently hosts the "experimental" feature flags. Keep this tiny: anything
- * that needs a restart should stay in config.js / .env.
+ * Currently hosts the "experimental" feature flags + system prompts +
+ * runtime-rotatable credentials (v2.0.56: API_KEY / DASHBOARD_PASSWORD can
+ * be changed from the dashboard without redeploying / editing .env). Keep
+ * this tiny: anything that needs a restart should stay in config.js / .env.
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { resolve, dirname } from 'path';
-import { fileURLToPath } from 'url';
-import { log } from './config.js';
+import { readFileSync, existsSync } from 'fs';
+import { scryptSync, randomBytes, timingSafeEqual } from 'crypto';
+import { writeJsonAtomic } from './fs-atomic.js';
+import { resolve } from 'path';
+import { config, log } from './config.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const FILE = resolve(__dirname, '..', 'runtime-config.json');
-
-export const DEFAULT_IDENTITY_PROMPTS = {
-  anthropic: 'You are {model}, a large language model created by Anthropic. You are helpful, harmless, and honest. When asked about your identity or which model you are, you respond that you are {model}, made by Anthropic.',
-  openai:    'You are {model}, a large language model created by OpenAI. When asked about your identity, you respond that you are {model}, made by OpenAI.',
-  google:    'You are {model}, a large language model created by Google. When asked about your identity, you respond that you are {model}, made by Google.',
-  deepseek:  'You are {model}, a large language model created by DeepSeek. When asked about your identity, you respond that you are {model}, made by DeepSeek.',
-  xai:       'You are {model}, a large language model created by xAI. When asked about your identity, you respond that you are {model}, made by xAI.',
-  alibaba:   'You are {model}, a large language model created by Alibaba. When asked about your identity, you respond that you are {model}, made by Alibaba.',
-  moonshot:  'You are {model}, a large language model created by Moonshot AI. When asked about your identity, you respond that you are {model}, made by Moonshot AI.',
-  zhipu:     'You are {model}, a large language model created by Zhipu AI. When asked about your identity, you respond that you are {model}, made by Zhipu AI.',
-  minimax:   'You are {model}, a large language model created by MiniMax. When asked about your identity, you respond that you are {model}, made by MiniMax.',
-  windsurf:  'You are {model}, a coding assistant model by Windsurf. When asked about your identity, you respond that you are {model}, made by Windsurf.',
-};
+const FILE = resolve(config.dataDir, 'runtime-config.json');
 
 const DEFAULTS = {
   experimental: {
+    // Reuse Cascade cascade_id across multi-turn requests when the history
+    // fingerprint matches. Big latency win for long conversations but relies
+    // on Windsurf keeping the cascade alive — off by default.
     cascadeConversationReuse: true,
-    modelIdentityPrompt: true,
+    // Pre-flight rate limit check via server.codeium.com before sending a
+    // chat request. Reduces wasted attempts when the account has no message
+    // capacity. Adds one network round-trip per attempt so off by default.
     preflightRateLimit: false,
+    // v2.0.58 — Drought mode: when every active account has weekly% < 5,
+    // block premium models from routing (free-tier models still go
+    // through). Default ON so the proxy stops burning upstream calls
+    // that would 429 anyway. Can be turned off if operator prefers
+    // graceful degradation over hard refusal.
+    droughtRestrictPremium: true,
+    // v2.0.67 (#112) — Auto-pull docker self-update during traffic lulls.
+    // When ON the proxy watches per-minute request rate; if it stays
+    // under `autoUpdateQuietWindow.thresholdRequests` for the full
+    // `windowMinutes` window, runs the existing docker self-update
+    // flow (pulls latest image + spawns deployer sidecar to recreate
+    // the container). Default OFF — only useful for self-hosted boxes
+    // that mount /var/run/docker.sock and run via docker-compose.
+    autoUpdateQuietWindow: false,
   },
-  identityPrompts: { ...DEFAULT_IDENTITY_PROMPTS },
+  // v2.0.67 (#112) — Tunables for the quiet-window auto-updater.
+  // Not under `experimental` because they're not boolean flags.
+  // Keys correspond 1:1 with src/dashboard/quiet-window-updater.js DEFAULTS.
+  autoUpdateQuietWindow: {
+    windowMinutes: 5,
+    thresholdRequests: 5,
+    cooldownHours: 24,
+    coldStartGraceMs: 600000,
+  },
+  // System-level prompt templates injected into Cascade proto fields.
+  // Editable from Dashboard so users can tune without code changes.
+  systemPrompts: {
+    toolReinforcement: 'The functions listed above are available and callable. When the user\'s request can be answered by calling a function, emit a <tool_call> block as described. Use this exact format: <tool_call>{"name":"...","arguments":{...}}</tool_call>',
+    communicationWithTools: 'You are accessed via API. When asked about your identity, describe your actual underlying model name and provider accurately. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation). Use the functions above when relevant.',
+    communicationNoTools: 'You are accessed via API. When asked about your identity, describe your actual underlying model name and provider accurately. Answer directly. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation).',
+  },
+  // v2.0.56 — runtime-rotatable credentials. When set, override the
+  // corresponding env value (API_KEY / DASHBOARD_PASSWORD) without
+  // requiring a container restart. apiKey is plaintext (chat clients send
+  // it raw and we compare via constant-time hash). dashboardPasswordHash
+  // is scrypt-derived and verified with timingSafeEqual — the dashboard
+  // posts plaintext over the same TLS-or-localhost channel as the rest of
+  // the management API. CLIProxyAPI uses bcrypt for the same purpose; we
+  // pick scrypt because it ships in node:crypto with zero deps.
+  credentials: {
+    apiKey: '',
+    dashboardPasswordHash: '',
+  },
 };
+
+const SYSTEM_PROMPT_KEYS = new Set(Object.keys(DEFAULTS.systemPrompts));
 
 function deepMerge(base, override) {
   if (!override || typeof override !== 'object') return base;
   const out = { ...base };
   for (const [k, v] of Object.entries(override)) {
-    // Skip prototype-polluting keys
+    // Skip prototype-polluting keys — the JSON loaded here is user-writable
+    // via the dashboard, and a crafted key would otherwise corrupt every
+    // object in the process.
     if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       out[k] = deepMerge(base[k] || {}, v);
@@ -66,7 +105,7 @@ function load() {
 
 function persist() {
   try {
-    writeFileSync(FILE, JSON.stringify(_state, null, 2));
+    writeJsonAtomic(FILE, _state);
   } catch (e) {
     log.warn(`runtime-config: failed to persist: ${e.message}`);
   }
@@ -89,6 +128,8 @@ export function isExperimentalEnabled(key) {
 export function setExperimental(patch) {
   if (!patch || typeof patch !== 'object') return getExperimental();
   _state.experimental = { ...(_state.experimental || {}), ...patch };
+  // Coerce to booleans — the dashboard ships JSON but we never want truthy
+  // strings sneaking in as "true".
   for (const k of Object.keys(_state.experimental)) {
     _state.experimental[k] = !!_state.experimental[k];
   }
@@ -96,33 +137,159 @@ export function setExperimental(patch) {
   return getExperimental();
 }
 
-export function getIdentityPrompts() {
-  return { ...DEFAULT_IDENTITY_PROMPTS, ...(_state.identityPrompts || {}) };
+export function getSystemPrompts() {
+  const out = { ...DEFAULTS.systemPrompts };
+  for (const key of SYSTEM_PROMPT_KEYS) {
+    if (typeof _state.systemPrompts?.[key] === 'string') {
+      out[key] = _state.systemPrompts[key];
+    }
+  }
+  return out;
 }
 
-export function getIdentityPromptFor(provider) {
-  const all = getIdentityPrompts();
-  return all[provider] || null;
-}
-
-export function setIdentityPrompts(patch) {
-  if (!patch || typeof patch !== 'object') return getIdentityPrompts();
-  const current = _state.identityPrompts || {};
+export function setSystemPrompts(patch) {
+  if (!patch || typeof patch !== 'object') return getSystemPrompts();
+  const current = _state.systemPrompts || {};
   for (const [k, v] of Object.entries(patch)) {
+    if (!SYSTEM_PROMPT_KEYS.has(k)) continue;
     if (typeof v !== 'string') continue;
     current[k] = v.trim();
   }
-  _state.identityPrompts = current;
+  _state.systemPrompts = current;
   persist();
-  return getIdentityPrompts();
+  return getSystemPrompts();
 }
 
-export function resetIdentityPrompt(provider) {
-  if (provider && _state.identityPrompts) {
-    delete _state.identityPrompts[provider];
+export function resetSystemPrompt(key) {
+  if (key) {
+    if (_state.systemPrompts && SYSTEM_PROMPT_KEYS.has(key)) delete _state.systemPrompts[key];
   } else {
-    _state.identityPrompts = {};
+    _state.systemPrompts = {};
   }
   persist();
-  return getIdentityPrompts();
+  return getSystemPrompts();
 }
+
+// ─── Credentials (v2.0.56 runtime rotation) ────────────────────────────
+
+const SCRYPT_N = 2 ** 14;   // 16384 — bcrypt-equivalent CPU cost
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+const SCRYPT_KEYLEN = 32;
+
+/**
+ * Hash a plaintext password using scrypt with a random 16-byte salt.
+ * Returned format: `scrypt$<N>$<r>$<p>$<base64-salt>$<base64-hash>` so we
+ * can verify even if the cost parameters get bumped in a future release.
+ */
+export function hashPassword(plain) {
+  const s = String(plain ?? '');
+  if (!s) return '';
+  const salt = randomBytes(16);
+  const hash = scryptSync(s, salt, SCRYPT_KEYLEN, { N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P });
+  return `scrypt$${SCRYPT_N}$${SCRYPT_R}$${SCRYPT_P}$${salt.toString('base64')}$${hash.toString('base64')}`;
+}
+
+/**
+ * Verify a plaintext password against a stored value.
+ * Falls back to plaintext comparison when the stored value doesn't carry
+ * the `scrypt$` prefix — that path is for env-supplied
+ * `DASHBOARD_PASSWORD=...` which we never hash to keep the env contract
+ * intact. Always uses constant-time comparison on the final byte buffers.
+ */
+export function verifyPassword(plain, stored) {
+  if (typeof stored !== 'string' || !stored) return false;
+  const sPlain = String(plain ?? '');
+  if (!stored.startsWith('scrypt$')) {
+    // Plaintext compare via timingSafeEqual on equal-length sha256 digests
+    // — matches src/auth.js safeEqualString semantics so the env-mode
+    // dashboard password doesn't leak length via early return.
+    if (!sPlain) return false;
+    const a = Buffer.from(sPlain, 'utf8');
+    const b = Buffer.from(stored, 'utf8');
+    if (a.length !== b.length) {
+      // Burn a comparable amount of cycles so the timing remains close
+      // to the equal-length branch. Reject regardless.
+      try { timingSafeEqual(Buffer.alloc(b.length), Buffer.alloc(b.length)); } catch {}
+      return false;
+    }
+    return timingSafeEqual(a, b);
+  }
+  const parts = stored.split('$');
+  if (parts.length !== 6) return false;
+  const N = parseInt(parts[1], 10);
+  const r = parseInt(parts[2], 10);
+  const p = parseInt(parts[3], 10);
+  if (!Number.isFinite(N) || !Number.isFinite(r) || !Number.isFinite(p)) return false;
+  let salt, expected;
+  try {
+    salt = Buffer.from(parts[4], 'base64');
+    expected = Buffer.from(parts[5], 'base64');
+  } catch { return false; }
+  if (!salt.length || !expected.length) return false;
+  const actual = scryptSync(sPlain, salt, expected.length, { N, r, p });
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+
+export function getCredentials() {
+  return {
+    apiKey: _state.credentials?.apiKey || '',
+    dashboardPasswordHash: _state.credentials?.dashboardPasswordHash || '',
+  };
+}
+
+/**
+ * Set the runtime API key. Empty string clears the runtime override and
+ * lets `config.apiKey` fall back to the env value at call sites.
+ */
+export function setRuntimeApiKey(plain) {
+  const v = typeof plain === 'string' ? plain.trim() : '';
+  if (!_state.credentials) _state.credentials = {};
+  _state.credentials.apiKey = v;
+  persist();
+  return getCredentials();
+}
+
+/**
+ * Set the runtime dashboard password (plaintext input → scrypt hash on
+ * disk). Empty string clears the runtime override.
+ */
+export function setRuntimeDashboardPassword(plain) {
+  const v = typeof plain === 'string' ? plain : '';
+  if (!_state.credentials) _state.credentials = {};
+  _state.credentials.dashboardPasswordHash = v ? hashPassword(v) : '';
+  persist();
+  return getCredentials();
+}
+
+/**
+ * Resolve the effective API key: runtime override wins over env. Returned
+ * value is the plaintext key the chat client must send.
+ */
+export function getEffectiveApiKey() {
+  const runtime = _state.credentials?.apiKey || '';
+  return runtime || config.apiKey || '';
+}
+
+/**
+ * Resolve the effective dashboard password's stored form. Returned string
+ * is either a `scrypt$...` hash (runtime-set) or the plaintext env value;
+ * verifyPassword() handles both.
+ */
+export function getEffectiveDashboardPasswordStored() {
+  const runtime = _state.credentials?.dashboardPasswordHash || '';
+  return runtime || config.dashboardPassword || '';
+}
+
+// Wire the auth module's pluggable API-key resolver so validateApiKey()
+// sees runtime overrides without a cyclic import. Done at module-load
+// time after `load()` so the file-backed value is honoured immediately.
+import('./auth.js').then(m => {
+  if (typeof m.setApiKeyResolver === 'function') m.setApiKeyResolver(getEffectiveApiKey);
+  // v2.0.58: same hook for drought-mode premium restriction so toggling
+  // the flag from the dashboard takes effect without a restart.
+  if (typeof m.setDroughtRestrictResolver === 'function') {
+    m.setDroughtRestrictResolver(() => isExperimentalEnabled('droughtRestrictPremium'));
+  }
+}).catch(() => { /* auth not yet ready, validateApiKey falls back to env */ });
+

@@ -4,26 +4,86 @@
  */
 
 import { config, log } from '../config.js';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   getAccountList, getAccountCount, addAccountByKey, addAccountByToken,
   removeAccount, setAccountStatus, resetAccountErrors, updateAccountLabel,
   isAuthenticated, probeAccount, ensureLsForAccount,
   refreshCredits, refreshAllCredits,
-  setAccountBlockedModels, fetchAndMergeModelCatalog,
-  setAccountTokens,
+  setAccountBlockedModels, setAccountTokens, setAccountTier,
+  getAccountInternal, isLocalBindHost, maskApiKey, safeEqualString,
+  checkLockout, failedAuthAttempt, successfulAuthAttempt,
+  getDroughtSummary,
 } from '../auth.js';
 import { restartLsForProxy } from '../langserver.js';
 import { getLsStatus, stopLanguageServer, startLanguageServer, isLanguageServerRunning } from '../langserver.js';
-import { getStats, resetStats, recordRequest, getUsageSnapshot, exportUsage, importUsage, pruneDetails, pruneDays } from './stats.js';
+import { getStats, resetStats, recordRequest } from './stats.js';
 import { cacheStats, cacheClear } from '../cache.js';
-import { getExperimental, setExperimental, getIdentityPrompts, setIdentityPrompts, resetIdentityPrompt } from '../runtime-config.js';
+import {
+  getExperimental, setExperimental, getSystemPrompts, setSystemPrompts, resetSystemPrompt,
+  getCredentials, setRuntimeApiKey, setRuntimeDashboardPassword,
+  verifyPassword, getEffectiveApiKey, getEffectiveDashboardPasswordStored,
+} from '../runtime-config.js';
 import { poolStats as convPoolStats, poolClear as convPoolClear } from '../conversation-pool.js';
 import { getLogs, subscribeToLogs, unsubscribeFromLogs } from './logger.js';
-import { getProxyConfig, setGlobalProxy, setAccountProxy, removeProxy, getEffectiveProxy } from './proxy-config.js';
+import { getProxyConfig, getProxyConfigMasked, setGlobalProxy, setAccountProxy, removeProxy, getEffectiveProxy } from './proxy-config.js';
 import { MODELS, MODEL_TIER_ACCESS as _TIER_TABLE, getTierModels as _getTierModels } from '../models.js';
 import { windsurfLogin, refreshFirebaseToken, reRegisterWithCodeium } from './windsurf-login.js';
 import { getModelAccessConfig, setModelAccessMode, setModelAccessList, addModelToList, removeModelFromList } from './model-access.js';
 import { checkMessageRateLimit } from '../windsurf-api.js';
+import { assertPublicUrlHost } from '../image.js';
+import { validateHostFormat } from '../net-safety.js';
+import { discoverWindsurfCredentials, isLoopbackAddress } from './local-windsurf.js';
+import { detectDockerSelfUpdate, runDockerSelfUpdate } from './docker-self-update.js';
+import {
+  getStatus as getQuietWindowStatus,
+  setEnabled as setQuietWindowEnabled,
+  _runOneTick as runQuietWindowTickNow,
+} from './quiet-window-updater.js';
+
+export function parseProxyUrl(proxy) {
+  // Normalize whitespace so "socks5 127.0.0.1   1089" and
+  // "socks5://127.0.0.1:1089" both parse correctly.
+  const s = String(proxy).replace(/\s+/g, ' ').trim();
+  // Try canonical URL form first: protocol://[user:pass@]host:port
+  // Host must not contain spaces — otherwise "http 1.2.3.4:8080" would
+  // greedily capture "http 1.2.3.4" as the host.
+  let m = s.match(/^(?:(\w+):\/\/)?(?:([^\s:]+):([^\s@]+)@)?([^\s:]+):(\d+)$/);
+  // Fallback: "type host port" (space-separated, no :// and no colon)
+  if (!m) m = s.match(/^(\w+)\s+([^\s:]+)\s+(\d+)$/);
+  // Fallback: "type host:port" (type prefix, no ://)
+  if (!m) m = s.match(/^(\w+)\s+([^\s:]+):(\d+)$/);
+  if (!m) return null;
+  if (m.length === 4) {
+    // space-or-type-separated form: [type] host port
+    return {
+      type: m[1],
+      host: m[2],
+      port: parseInt(m[3]),
+      username: '',
+      password: '',
+    };
+  }
+  return {
+    type: m[1] || 'http',
+    host: m[4],
+    port: parseInt(m[5]),
+    username: m[2] || '',
+    password: m[3] || '',
+  };
+}
+
+export function buildBatchProxyBinding(result, proxy) {
+  const accountId = result?.account?.id || null;
+  if (!result?.success || !proxy || !accountId) return null;
+  const parsed = parseProxyUrl(proxy);
+  if (!parsed) return null;
+  return {
+    accountId,
+    proxy: parsed,
+  };
+}
 
 function json(res, status, body) {
   const data = JSON.stringify(body);
@@ -36,14 +96,91 @@ function json(res, status, body) {
   res.end(data);
 }
 
+// v2.0.56: client IP extraction. Mirrors caller-key.js TRUST_PROXY_XFF
+// — we only honour X-Forwarded-For when the operator opts in. Default is
+// `socket.remoteAddress` so a rogue dashboard caller can't dodge the
+// brute-force lockout by spoofing XFF and ending up on a fresh bucket.
+function dashboardClientIp(req) {
+  const remote = req?.socket?.remoteAddress || req?.connection?.remoteAddress || '';
+  if (process.env.TRUST_PROXY_X_FORWARDED_FOR !== '1') return remote;
+  const fwd = String(req?.headers?.['x-forwarded-for'] || '').split(',')[0].trim();
+  return fwd || remote;
+}
+
 function checkAuth(req) {
+  // Header-only auth. logs/stream switched from EventSource to fetch +
+  // ReadableStream months ago, so the EventSource exception is gone and
+  // ?pwd= query passwords would only leak into URL access logs and
+  // browser history without any callers needing them.
+  //
+  // v2.0.55 (audit H1): on non-local binds we no longer fall back to
+  // `config.apiKey` as the dashboard password. That fallback turned
+  // every chat-API caller into a service operator (list accounts,
+  // reveal-key, change proxy, trigger LS / docker self-update). Public
+  // bind WITHOUT DASHBOARD_PASSWORD now fails closed; operators must
+  // set DASHBOARD_PASSWORD explicitly. Localhost-only deployments keep
+  // the convenience fallback so single-user `docker-compose up` doesn't
+  // suddenly require an extra env.
+  //
+  // v2.0.56: dashboardPassword now comes from runtime-config (settable
+  // from the dashboard) before falling back to env. apiKey fallback
+  // (localhost only) also honours the runtime override.
   const pw = req.headers['x-dashboard-password'] || '';
-  // If dashboard password is set, use it
-  if (config.dashboardPassword) return pw === config.dashboardPassword;
-  // Otherwise fall back to API key (if set)
-  if (config.apiKey) return pw === config.apiKey;
-  // No password and no API key = open access
-  return true;
+  const storedDashboardPw = getEffectiveDashboardPasswordStored();
+  if (storedDashboardPw) return verifyPassword(pw, storedDashboardPw);
+  if (isLocalBindHost()) {
+    const effectiveApiKey = getEffectiveApiKey();
+    if (effectiveApiKey) return safeEqualString(pw, effectiveApiKey);
+    return true;
+  }
+  return false;
+}
+
+async function processWindsurfLogin({ email, password, loginProxy, autoAdd }) {
+  if (!email || !password) {
+    const err = new Error('ERR_EMAIL_PASSWORD_REQUIRED');
+    err.statusCode = 400;
+    err.code = 'ERR_EMAIL_PASSWORD_REQUIRED';
+    throw err;
+  }
+
+  // Use provided proxy, or global proxy
+  const proxy = loginProxy?.host ? loginProxy : getProxyConfig().global;
+  const result = await windsurfLogin(email, password, proxy);
+
+  // Auto-add to account pool if requested
+  let account = null;
+  if (autoAdd !== false) {
+    account = addAccountByKey(result.apiKey, result.name || email);
+    // Persist refresh token via the setter so it survives restart and
+    // the background Firebase-renewal loop can find it.
+    if (result.refreshToken) {
+      setAccountTokens(account.id, { refreshToken: result.refreshToken, idToken: result.idToken });
+    }
+    // Persist the per-account proxy we used for login so chat requests
+    // also egress through the same IP, then warm up a matching LS.
+    if (loginProxy?.host) setAccountProxy(account.id, loginProxy);
+    ensureLsForAccount(account.id)
+      .then(() => probeAccount(account.id))
+      .catch(e => log.warn(`Auto-probe failed: ${e.message}`));
+  }
+
+  return {
+    success: true,
+    // When autoAdd:false, the caller is doing a one-time login to retrieve the
+    // upstream key without storing it (e.g. external tooling that wants the
+    // raw key) — they need the full apiKey. When autoAdd is true, the key is
+    // already persisted in the pool and the response only echoes a masked
+    // form (the dashboard never needs the raw key in the listing path; the
+    // explicit reveal-key endpoint covers the rare per-account export case).
+    ...(autoAdd === false
+      ? { apiKey: result.apiKey }
+      : { apiKey_masked: maskApiKey(result.apiKey) }),
+    name: result.name,
+    email: result.email,
+    apiServerUrl: result.apiServerUrl,
+    account: account ? { id: account.id, email: account.email, status: account.status } : null,
+  };
 }
 
 /**
@@ -52,16 +189,48 @@ function checkAuth(req) {
 export async function handleDashboardApi(method, subpath, body, req, res) {
   if (method === 'OPTIONS') return json(res, 204, '');
 
+  // v2.0.56: brute-force lockout — apply BEFORE the auth check so the
+  // password comparison itself can't be used as an oracle once the IP is
+  // banned. /auth route is exempt (unauthenticated probe used by the UI
+  // to learn whether auth is required) but still feeds the lockout when
+  // it serves as a credential-verification endpoint.
+  const clientIp = dashboardClientIp(req);
+  const lock = checkLockout(clientIp);
+  if (lock.blocked) {
+    res.setHeader?.('Retry-After', String(Math.ceil(lock.retryAfterMs / 1000)));
+    return json(res, 429, {
+      error: `Too many failed attempts. IP banned for ${Math.ceil(lock.retryAfterMs / 1000)}s.`,
+      retryAfterMs: lock.retryAfterMs,
+    });
+  }
+
   // Auth check (except for auth verification endpoint)
   if (subpath !== '/auth' && !checkAuth(req)) {
+    failedAuthAttempt(clientIp);
     return json(res, 401, { error: 'Unauthorized. Set X-Dashboard-Password header.' });
   }
+  if (subpath !== '/auth') successfulAuthAttempt(clientIp);
 
   // ─── Auth ─────────────────────────────────────────────
   if (subpath === '/auth') {
-    const needsAuth = !!(config.dashboardPassword || config.apiKey);
-    if (!needsAuth) return json(res, 200, { required: false });
-    return json(res, 200, { required: true, valid: checkAuth(req) });
+    const storedPw = getEffectiveDashboardPasswordStored();
+    const effectiveApiKey = getEffectiveApiKey();
+    const hasSecret = !!(storedPw || effectiveApiKey);
+    if (hasSecret) {
+      const ok = checkAuth(req);
+      // /auth is the credential-probe endpoint dashboards call before
+      // showing the rest of the UI — count failures here so a brute-force
+      // script doesn't get unlimited attempts via /auth alone.
+      if (ok) successfulAuthAttempt(clientIp);
+      else if (req.headers['x-dashboard-password']) failedAuthAttempt(clientIp);
+      return json(res, 200, { required: true, valid: ok });
+    }
+    // No secret configured. On localhost binds the dashboard is open; on
+    // public binds checkAuth fails closed (see Fix 1 / Fix 3) so the UI must
+    // know auth is required-but-unconfigurable so it can prompt the operator
+    // to set DASHBOARD_PASSWORD or API_KEY rather than show a useless prompt.
+    if (isLocalBindHost()) return json(res, 200, { required: false });
+    return json(res, 200, { required: true, valid: false, locked: true });
   }
 
   // ─── Overview ─────────────────────────────────────────
@@ -99,18 +268,180 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     return json(res, 200, { success: true, cleared: n });
   }
 
-  // ─── Identity prompts ──────────────────────────────
-  if (subpath === '/identity-prompts' && method === 'GET') {
-    return json(res, 200, getIdentityPrompts());
+  // ─── System prompts (tool reinforcement, communication) ──
+  if (subpath === '/system-prompts' && method === 'GET') {
+    return json(res, 200, { prompts: getSystemPrompts() });
   }
-  if (subpath === '/identity-prompts' && method === 'PUT') {
-    const prompts = setIdentityPrompts(body || {});
+  if (subpath === '/system-prompts' && method === 'PUT') {
+    const prompts = setSystemPrompts(body || {});
     return json(res, 200, { success: true, prompts });
   }
-  if (subpath === '/identity-prompts' && method === 'DELETE') {
-    const provider = body?.provider || null;
-    const prompts = resetIdentityPrompt(provider);
+  if (subpath.match(/^\/system-prompts\/[^/]+$/) && method === 'DELETE') {
+    const key = subpath.split('/').pop();
+    const prompts = resetSystemPrompt(key);
     return json(res, 200, { success: true, prompts });
+  }
+
+  // ─── Proxy test — try an HTTP CONNECT through the given proxy ──
+  if (subpath === '/test-proxy' && method === 'POST') {
+    const { host, port, username, password, type = 'http' } = body || {};
+    if (!host || !port) return json(res, 400, { ok: false, error: 'ERR_HOST_PORT_REQUIRED' });
+    const startTime = Date.now();
+    try {
+      const result = await testProxy({ host, port: Number(port), username, password, type });
+      return json(res, 200, { ok: true, ...result, latencyMs: Date.now() - startTime });
+    } catch (err) {
+      return json(res, 200, { ok: false, error: err.message, latencyMs: Date.now() - startTime });
+    }
+  }
+
+  // ─── v2.0.67 (#112) — Quiet-window auto-update ────────
+  if (subpath === '/auto-update/quiet-window' && method === 'GET') {
+    return json(res, 200, { ok: true, ...getQuietWindowStatus() });
+  }
+  if (subpath === '/auto-update/quiet-window' && method === 'PUT') {
+    const enabled = !!body?.enabled;
+    return json(res, 200, { ok: true, ...setQuietWindowEnabled(enabled) });
+  }
+  if (subpath === '/auto-update/quiet-window/run' && method === 'POST') {
+    // Force one tick now (operator wants to test the path without
+    // waiting for the next minute boundary). Honours the same gates as
+    // the periodic tick — disabled / cold-start / cooldown / busy will
+    // still short-circuit.
+    try {
+      const result = await runQuietWindowTickNow();
+      return json(res, 200, { ok: true, result });
+    } catch (e) {
+      return json(res, 500, { ok: false, error: e.message });
+    }
+  }
+
+  // ─── Self-update: pull latest code + restart PM2 ──────
+  if (subpath === '/self-update/check' && method === 'GET') {
+    try {
+      const info = await gitStatus();
+      return json(res, 200, { ok: true, mode: 'git', ...info });
+    } catch (err) {
+      if (isSelfUpdateUnavailableError(err)) {
+        // Git path is unavailable (most often docker). Fall back to
+        // docker self-update via /var/run/docker.sock if the user
+        // mounted it into the container; otherwise report the same
+        // "manual command" hint we did before.
+        const docker = await detectDockerSelfUpdate();
+        if (docker.available) {
+          return json(res, 200, {
+            ok: true,
+            mode: 'docker',
+            image: docker.image,
+            project: docker.project,
+            workingDir: docker.workingDir,
+          });
+        }
+        return json(res, 200, {
+          ok: false,
+          available: false,
+          reason: err.reason,
+          error: err.code,
+          dockerReason: docker.reason,
+          dockerDetail: docker.detail,
+        });
+      }
+      return json(res, 200, { ok: false, error: err.message });
+    }
+  }
+  if (subpath === '/self-update' && method === 'POST') {
+    try {
+      const before = await gitStatus();
+      // Guard: working tree must be clean (ignoring untracked files like
+      // accounts.json, stats.json, runtime-config.json which live in the
+      // repo root but aren't checked in). If the tracked files were edited
+      // manually (or pushed via SFTP without a corresponding commit),
+      // `git pull --ff-only` would refuse — surface a friendly error
+      // instead of a raw git message.
+      const dirty = (await runGit(['status', '--porcelain', '-uno'])).trim();
+      if (dirty) {
+        const allowForce = !!(body && body.forceReset);
+        if (!allowForce) {
+          return json(res, 200, {
+            ok: false,
+            dirty: true,
+            error: 'ERR_UNCOMMITTED_CHANGES',
+            dirtyFiles: dirty.split('\n').slice(0, 20),
+          });
+        }
+        // branch comes from `git rev-parse --abbrev-ref HEAD`; execFile
+        // doesn't spawn a shell so metacharacters can't break out — the
+        // regex is kept as defence-in-depth so a malformed ref can't feed
+        // a bogus `origin/xxx` spec to `git fetch`.
+        const safeBranch = /^[\w.\-\/]+$/.test(before.branch || '') ? before.branch : 'master';
+        await runGit(['fetch', 'origin', safeBranch]);
+        await runGit(['reset', '--hard', `origin/${safeBranch}`]);
+      }
+      const safeBranch = /^[\w.\-\/]+$/.test(before.branch || '') ? before.branch : 'master';
+      // execFile can't do `2>&1`; use child_process stderr merge via
+      // combining stdout+stderr explicitly. runGit already pipes stderr
+      // into the Error message on failure, so for success we get just
+      // stdout, which is what the UI displays.
+      const pull = dirty ? 'hard-reset applied' : await runGit(['pull', 'origin', safeBranch, '--ff-only']);
+      const after = await gitStatus();
+      const changed = before.commit !== after.commit;
+      // Schedule process exit so PM2 auto-restarts us. This is far simpler
+      // and port/env-agnostic compared to spawning update.sh (which hardcodes
+      // PORT=3003 default). Requires PM2 autorestart: true (the default).
+      //
+      // v2.0.85 (#127 123cek): graceful-stop the LS pool before exit so
+      // SIGKILL from PM2 doesn't leave orphan language_server_linux_x64
+      // processes holding ports. Startup-time cleanup also runs as a
+      // backstop, but stopping cleanly here means the next process won't
+      // even need cleanup most of the time.
+      if (changed) {
+        setTimeout(async () => {
+          log.info('self-update: stopping LS pool before exit');
+          try {
+            // v2.0.88 (audit H-4): use the await-and-wait variant so
+            // SIGTERM has time to land before process.exit reparents
+            // surviving children to init. Otherwise the new PM2-spawned
+            // process races with an orphan LS holding the same port.
+            const m = await import('../langserver.js');
+            await m.stopLanguageServerAndWait({ perProcessTimeoutMs: 1500 });
+          } catch (e) {
+            log.warn(`self-update: stopLanguageServer failed: ${e.message}`);
+          }
+          log.info('self-update: exiting for PM2 auto-restart');
+          process.exit(0);
+        }, 800);
+      }
+      return json(res, 200, {
+        ok: true,
+        changed,
+        before: before.commit,
+        after: after.commit,
+        pullOutput: pull.trim(),
+        restarting: changed,
+      });
+    } catch (err) {
+      if (isSelfUpdateUnavailableError(err)) {
+        // Same fallback as /self-update/check: when git is unavailable
+        // (docker), try the docker socket path. The dashboard may already
+        // have called /self-update/check first and routed the user
+        // straight to a docker-mode confirmation, but supporting fallback
+        // here too keeps `POST /self-update` self-contained for scripts.
+        const docker = await detectDockerSelfUpdate();
+        if (docker.available) {
+          const result = await runDockerSelfUpdate();
+          return json(res, 200, { mode: 'docker', ...result });
+        }
+        return json(res, 200, {
+          ok: false,
+          available: false,
+          reason: err.reason,
+          error: err.code,
+          dockerReason: docker.reason,
+          dockerDetail: docker.detail,
+        });
+      }
+      return json(res, 200, { ok: false, error: err.message });
+    }
   }
 
   // ─── Cache ────────────────────────────────────────────
@@ -129,14 +460,36 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
   if (subpath === '/accounts' && method === 'POST') {
     try {
-      let account;
-      if (body.api_key) {
-        account = addAccountByKey(body.api_key, body.label);
-      } else if (body.token) {
-        account = await addAccountByToken(body.token, body.label);
-      } else {
+      if (!body.api_key && !body.token) {
         return json(res, 400, { error: 'Provide api_key or token' });
       }
+
+      let parsedProxy = null;
+      if (body.proxy) {
+        parsedProxy = parseProxyUrl(body.proxy);
+        if (!parsedProxy) {
+          return json(res, 400, { error: 'ERR_PROXY_FORMAT_INVALID' });
+        }
+        try {
+          if (config.allowPrivateProxyHosts) {
+            await validateHostFormat(parsedProxy.host);
+          } else {
+            await assertPublicUrlHost(parsedProxy.host);
+          }
+        } catch (e) {
+          return json(res, 400, { error: e.message || 'ERR_PROXY_INVALID' });
+        }
+      }
+
+      const account = body.api_key
+        ? addAccountByKey(body.api_key, body.label)
+        : await addAccountByToken(body.token, body.label);
+
+      if (parsedProxy) {
+        setAccountProxy(account.id, parsedProxy);
+        ensureLsForAccount(account.id).catch(e => log.warn(`LS ensure failed: ${e.message}`));
+      }
+
       // Fire-and-forget probe so the UI gets tier info shortly after add
       probeAccount(account.id).catch(e => log.warn(`Auto-probe failed: ${e.message}`));
       return json(res, 200, {
@@ -146,6 +499,75 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
       });
     } catch (err) {
       return json(res, 400, { error: err.message });
+    }
+  }
+
+  // GET /accounts/import-local-availability — v2.0.60: cheap probe so the
+  // dashboard can hide / disable the "Import from local Windsurf" button on
+  // public binds *before* the user clicks it. Returns the same gates the
+  // import endpoint enforces, plus a friendly explanation.
+  if (subpath === '/accounts/import-local-availability' && method === 'GET') {
+    const remote = req?.socket?.remoteAddress || '';
+    const localBind = isLocalBindHost();
+    const loopback = isLoopbackAddress(remote);
+    let available = true;
+    let reason = '';
+    if (!localBind) {
+      available = false;
+      reason = 'public_bind';
+    } else if (!loopback) {
+      available = false;
+      reason = 'non_loopback_caller';
+    }
+    return json(res, 200, {
+      available,
+      reason,
+      bindHost: process.env.HOST || process.env.BIND_HOST || '0.0.0.0',
+      remoteAddress: remote,
+      hint: available
+        ? ''
+        : (reason === 'public_bind'
+          ? '此实例绑定在公网/0.0.0.0 上 — "本地" Windsurf 是远端服务器上的，不是你电脑里的，所以这个功能被拒绝（设计如此）。要导入本机 Windsurf 凭证请用 localhost 部署。'
+          : '只接受来自 127.0.0.1 的请求；当前调用来自 ' + (remote || '?') + '。'),
+    });
+  }
+
+  // GET /accounts/import-local — discover Windsurf desktop client credentials
+  // Local-only hardening: must be bound to loopback host and remote socket
+  // must also be loopback, so reverse proxies on public binds cannot
+  // expose local desktop credentials.
+  if (subpath === '/accounts/import-local' && method === 'GET') {
+    if (!isLocalBindHost()) {
+      log.warn('local-windsurf import refused: dashboard not bound to loopback host');
+      return json(res, 403, { error: 'ERR_LOCAL_IMPORT_NOT_AVAILABLE_PUBLIC_BIND' });
+    }
+    const remote = req?.socket?.remoteAddress;
+    if (!isLoopbackAddress(remote)) {
+      log.warn(`local-windsurf import refused: non-loopback caller ${remote}`);
+      return json(res, 403, { error: 'ERR_LOCAL_IMPORT_LOOPBACK_ONLY', message: 'Local Windsurf import only available from 127.0.0.1' });
+    }
+    try {
+      const result = await discoverWindsurfCredentials();
+      log.info(`local-windsurf import: found ${result.accounts.length} account(s) across ${result.sources.filter(s => s.ok).length} source(s)`);
+      return json(res, 200, {
+        success: true,
+        accounts: result.accounts.map(a => ({
+          method: a.method,
+          apiKey: a.apiKey,
+          apiKeyMasked: a.apiKeyMasked,
+          email: a.email,
+          name: a.name,
+          apiServerUrl: a.apiServerUrl,
+          label: a.label,
+          source: a.source,
+        })),
+        sources: result.sources,
+        sqliteSupport: result.sqliteSupport,
+        platform: result.platform,
+      });
+    } catch (e) {
+      log.warn(`local-windsurf import failed: ${e.message}`);
+      return json(res, 500, { error: 'ERR_LOCAL_IMPORT_FAILED', message: e.message });
     }
   }
 
@@ -189,19 +611,6 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     return json(res, r.ok ? 200 : 400, r);
   }
 
-  // POST /accounts/batch-status — batch enable/disable
-  if (subpath === '/accounts/batch-status' && method === 'POST') {
-    const { ids, status } = body;
-    if (!Array.isArray(ids) || !['active', 'disabled'].includes(status)) {
-      return json(res, 400, { error: 'Provide ids[] and status (active|disabled)' });
-    }
-    const results = ids.map(id => {
-      const ok = setAccountStatus(id, status);
-      return { id, ok };
-    });
-    return json(res, 200, { success: true, results });
-  }
-
   // PATCH /accounts/:id
   const accountPatch = subpath.match(/^\/accounts\/([^/]+)$/);
   if (accountPatch && method === 'PATCH') {
@@ -210,6 +619,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     if (body.label) updateAccountLabel(id, body.label);
     if (body.resetErrors) resetAccountErrors(id);
     if (Array.isArray(body.blockedModels)) setAccountBlockedModels(id, body.blockedModels);
+    if (body.tier) setAccountTier(id, body.tier);
     return json(res, 200, { success: true });
   }
 
@@ -243,61 +653,66 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     return json(res, 200, { success: true });
   }
 
-  // ─── Usage (CLIProxyAPI-compatible schema) ───────────
-  // GET /usage — aggregated snapshot
-  if (subpath === '/usage' && method === 'GET') {
-    const snap = getUsageSnapshot();
-    return json(res, 200, { usage: snap, failed_requests: snap.failure_count });
-  }
-
-  // GET /usage/export — downloadable backup blob (version + exported_at + usage)
-  if (subpath === '/usage/export' && method === 'GET') {
-    const payload = exportUsage();
-    const filename = `windsurfapi-usage-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`;
-    res.writeHead(200, {
-      'Content-Type': 'application/json',
-      'Content-Disposition': `attachment; filename="${filename}"`,
-      'Access-Control-Allow-Origin': '*',
-    });
-    return res.end(JSON.stringify(payload, null, 2));
-  }
-
-  // POST /usage/import — merge a snapshot with dedup; body is the full
-  // { version, exported_at, usage } envelope OR a bare snapshot object.
-  if (subpath === '/usage/import' && method === 'POST') {
-    const result = importUsage(body);
-    log.info(`Usage import: added=${result.added} skipped=${result.skipped} total=${result.total_requests}`);
-    return json(res, 200, result);
-  }
-
-  // POST /usage/reset — alias of DELETE /stats for parity with CLIProxyAPI
-  if (subpath === '/usage/reset' && method === 'POST') {
-    resetStats();
-    return json(res, 200, { success: true });
-  }
-
-  // DELETE /usage/details?days=30 — drop per-request details older than N days
-  if (subpath === '/usage/details' && method === 'DELETE') {
-    const url = new URL(req.url, 'http://localhost');
-    const days = Math.max(1, parseInt(url.searchParams.get('days') || '30', 10));
-    const r = pruneDetails(days * 24 * 3600 * 1000);
-    return json(res, 200, { success: true, removed: r.removed, olderThanDays: days });
-  }
-
-  // DELETE /usage/days?days=90 — drop day aggregate buckets older than N days
-  if (subpath === '/usage/days' && method === 'DELETE') {
-    const url = new URL(req.url, 'http://localhost');
-    const days = Math.max(1, parseInt(url.searchParams.get('days') || '90', 10));
-    const r = pruneDays(days * 24 * 3600 * 1000);
-    return json(res, 200, { success: true, removed: r.removed, olderThanDays: days });
-  }
-
   // ─── Logs ─────────────────────────────────────────────
   if (subpath === '/logs' && method === 'GET') {
     const url = new URL(req.url, 'http://localhost');
     const since = parseInt(url.searchParams.get('since') || '0', 10);
     const level = url.searchParams.get('level') || null;
     return json(res, 200, { logs: getLogs(since, level) });
+  }
+
+  // GET /logs/export — v2.0.60: download recent logs as JSONL or
+  // pretty-text. Filterable by `type` (all / system / api), `level`
+  // (debug/info/warn/error/all), `since` (unix ms). Designed for the
+  // "give me logs to attach to a GitHub issue" flow so users don't have
+  // to copy-paste from the streaming view. Returns Content-Disposition
+  // so browsers download instead of preview.
+  if (subpath === '/logs/export' && method === 'GET') {
+    const url = new URL(req.url, 'http://localhost');
+    const type = (url.searchParams.get('type') || 'all').toLowerCase();
+    const level = url.searchParams.get('level') || null;
+    const since = parseInt(url.searchParams.get('since') || '0', 10);
+    const fmt = (url.searchParams.get('format') || 'jsonl').toLowerCase();
+
+    let entries = getLogs(since, level);
+    if (type === 'api') {
+      // API path: any log emitted by request handlers — Probe[id] / Chat[id]
+      // / Cascade / ToolGuard / drought etc., plus any entry with a ctx
+      // requestId. This is the "what happened to my request" view.
+      entries = entries.filter(e => {
+        if (e.ctx && (e.ctx.requestId || e.ctx.reqId)) return true;
+        const m = e.msg || '';
+        return /^(?:Probe|Chat|Cascade|ToolGuard|ToolParser|drought|Workspace|Settings):|\[Probe |\[Chat /i.test(m);
+      });
+    } else if (type === 'system') {
+      // System path: everything that's NOT obviously per-request — auth
+      // pool, LS lifecycle, cron jobs, etc.
+      entries = entries.filter(e => {
+        if (e.ctx && (e.ctx.requestId || e.ctx.reqId)) return false;
+        const m = e.msg || '';
+        return !/^(?:Probe|Chat|Cascade|ToolGuard|ToolParser):|\[Probe |\[Chat /i.test(m);
+      });
+    }
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = `windsurf-api-logs-${type}-${stamp}.${fmt === 'txt' ? 'log' : 'jsonl'}`;
+    let body;
+    if (fmt === 'txt' || fmt === 'log') {
+      body = entries.map(e => {
+        const ts = new Date(e.ts).toISOString();
+        const ctx = e.ctx ? ' ' + Object.entries(e.ctx).map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`).join(' ') : '';
+        return `${ts} [${e.level.toUpperCase()}] ${e.msg}${ctx}`;
+      }).join('\n') + '\n';
+    } else {
+      body = entries.map(e => JSON.stringify(e)).join('\n') + '\n';
+    }
+    res.writeHead(200, {
+      'Content-Type': fmt === 'txt' || fmt === 'log' ? 'text/plain; charset=utf-8' : 'application/x-ndjson; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Cache-Control': 'no-store',
+    });
+    res.end(body);
+    return;
   }
 
   if (subpath === '/logs/stream' && method === 'GET') {
@@ -335,13 +750,160 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   }
 
   // ─── Proxy ────────────────────────────────────────────
+  // Always return the masked view over the API — plaintext passwords
+  // would otherwise end up in dashboard network logs, HAR files, proxy
+  // access logs, etc. The UI posts the sentinel back to preserve the
+  // stored password when editing other fields (see mergePassword).
+  // ─── Drought summary (v2.0.57 Fix 5) ──────────────────
+  if (subpath === '/drought' && method === 'GET') {
+    return json(res, 200, getDroughtSummary());
+  }
+
+  // ─── Upstream endpoints (v2.0.60 — show migration status) ──
+  // Surfaces which Windsurf upstream paths the proxy is currently
+  // wired to talk to. Lets the operator confirm at a glance that we're
+  // on the new register.windsurf.com / windsurf.com/_backend hosts and
+  // that the legacy fallbacks are still in place. Read-only — the
+  // actual switching happens automatically per-request based on
+  // network success / 5xx response.
+  if (subpath === '/upstream-endpoints' && method === 'GET') {
+    return json(res, 200, {
+      registerUser: {
+        primary: 'register.windsurf.com/exa.seat_management_pb.SeatManagementService/RegisterUser',
+        fallback: 'api.codeium.com/register_user/',
+        protocol: 'Connect-RPC (primary) / REST (fallback)',
+        migratedSince: 'v2.0.57',
+      },
+      postAuth: {
+        primary: 'windsurf.com/_backend/exa.seat_management_pb.SeatManagementService/WindsurfPostAuth',
+        fallback: 'server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService/WindsurfPostAuth',
+        protocol: 'Connect-RPC',
+        migratedSince: 'v2.0.57',
+      },
+      oneTimeAuthToken: {
+        primary: 'windsurf.com/_backend/exa.seat_management_pb.SeatManagementService/GetOneTimeAuthToken',
+        fallback: 'server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService/GetOneTimeAuthToken',
+        protocol: 'Connect-RPC',
+        migratedSince: 'v2.0.57',
+      },
+      checkUserLoginMethod: {
+        primary: 'windsurf.com/_backend/exa.seat_management_pb.SeatManagementService/CheckUserLoginMethod',
+        fallback: 'windsurf.com/_devin-auth/connections',
+        protocol: 'Connect-RPC',
+        migratedSince: 'v2.0.39',
+      },
+      getUserStatus: {
+        primary: 'server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus',
+        fallback: 'server.self-serve.windsurf.com/exa.seat_management_pb.SeatManagementService/GetUserStatus',
+        protocol: 'Connect-RPC',
+        note: '内置 daily/weekly% 解析；wam-bundle 用的 GetPlanStatus 是同一 service 的另一个 RPC，返回字段被 GetUserStatus.planStatus 嵌套覆盖。',
+      },
+      getCascadeModelConfigs: {
+        primary: 'server.codeium.com/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs',
+        fallback: 'server.self-serve.windsurf.com/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs',
+        protocol: 'Connect-RPC',
+      },
+      firebaseAuth: {
+        primary: 'identitytoolkit.googleapis.com/v1/accounts:signInWithPassword',
+        refreshUrl: 'securetoken.googleapis.com/v1/token',
+        note: 'Windsurf project Firebase API key 直连 — 同 WindsurfSwitch / wam-bundle 路径。',
+      },
+    });
+  }
+
+  // ─── Credentials (v2.0.56 — runtime-rotatable API_KEY + DASHBOARD_PASSWORD) ─────
+  // GET /settings/credentials — masked snapshot. The plaintext API key is
+  // never returned (use revealApiKey if/when added), but we expose
+  // - source: 'runtime' | 'env' | 'unset'
+  // - masked: 'sk-12...3456' for the API key
+  // - dashboardPasswordSet: bool
+  // - dashboardPasswordSource: 'runtime' | 'env' | 'unset'
+  if (subpath === '/settings/credentials' && method === 'GET') {
+    const creds = getCredentials();
+    const effectiveApiKey = getEffectiveApiKey();
+    const apiKeySource = creds.apiKey ? 'runtime' : (config.apiKey ? 'env' : 'unset');
+    const dashboardPasswordSource = creds.dashboardPasswordHash
+      ? 'runtime'
+      : (config.dashboardPassword ? 'env' : 'unset');
+    return json(res, 200, {
+      apiKey_masked: maskApiKey(effectiveApiKey),
+      apiKeySource,
+      dashboardPasswordSet: !!getEffectiveDashboardPasswordStored(),
+      dashboardPasswordSource,
+    });
+  }
+
+  // PUT /settings/credentials — rotate one or both credentials. Body:
+  //   { apiKey?: string, dashboardPassword?: string }
+  // Empty string clears the runtime override (env value takes over).
+  // Requires the caller to re-authenticate with the NEW dashboard
+  // password on the next request — no session cookies, so the UI just
+  // re-prompts. We don't accept the old-password proof here because the
+  // caller already passed dashboard auth at the top of this function.
+  if (subpath === '/settings/credentials' && method === 'PUT') {
+    if (!body || typeof body !== 'object') {
+      return json(res, 400, { error: 'Body must be a JSON object' });
+    }
+    const out = {};
+    let touched = false;
+    if (Object.prototype.hasOwnProperty.call(body, 'apiKey')) {
+      const v = body.apiKey;
+      if (v != null && typeof v !== 'string') {
+        return json(res, 400, { error: 'apiKey must be a string' });
+      }
+      const trimmed = String(v ?? '').trim();
+      // Loose sanity: reject keys with whitespace / control chars. An
+      // empty string is the explicit "clear runtime override" signal.
+      if (trimmed && /[\s\x00-\x1f]/.test(trimmed)) {
+        return json(res, 400, { error: 'apiKey must not contain whitespace or control characters' });
+      }
+      if (trimmed && trimmed.length < 8) {
+        return json(res, 400, { error: 'apiKey must be at least 8 characters' });
+      }
+      setRuntimeApiKey(trimmed);
+      out.apiKeyUpdated = true;
+      out.apiKey_masked = maskApiKey(trimmed || getEffectiveApiKey());
+      touched = true;
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'dashboardPassword')) {
+      const v = body.dashboardPassword;
+      if (v != null && typeof v !== 'string') {
+        return json(res, 400, { error: 'dashboardPassword must be a string' });
+      }
+      const pw = String(v ?? '');
+      if (pw && pw.length < 8) {
+        return json(res, 400, { error: 'dashboardPassword must be at least 8 characters' });
+      }
+      setRuntimeDashboardPassword(pw);
+      out.dashboardPasswordUpdated = true;
+      touched = true;
+    }
+    if (!touched) {
+      return json(res, 400, { error: 'Provide apiKey, dashboardPassword, or both' });
+    }
+    log.info(`Settings: credentials rotated from ${dashboardClientIp(req) || 'unknown'} (apiKey=${!!out.apiKeyUpdated}, dashboardPassword=${!!out.dashboardPasswordUpdated})`);
+    return json(res, 200, { success: true, ...out });
+  }
+
   if (subpath === '/proxy' && method === 'GET') {
-    return json(res, 200, getProxyConfig());
+    return json(res, 200, getProxyConfigMasked());
   }
 
   if (subpath === '/proxy/global' && method === 'PUT') {
+    // v2.0.55 (audit H3): wire this PUT through the same private-host
+    // gate the add-account path uses, otherwise a dashboard-authenticated
+    // caller can pin the global proxy at 127.0.0.1 / 169.254.169.254 /
+    // any internal socket, then upstream egress flows through it. Skip
+    // when the operator explicitly allows private hosts or when the
+    // body has no host (clearing the global proxy via empty PUT).
+    if (body && typeof body === 'object' && body.host && !config.allowPrivateProxyHosts) {
+      try { await assertPublicUrlHost(body.host); }
+      catch (e) {
+        return json(res, 400, { error: e?.message || 'ERR_PROXY_PRIVATE_HOST' });
+      }
+    }
     setGlobalProxy(body);
-    return json(res, 200, { success: true, config: getProxyConfig() });
+    return json(res, 200, { success: true, config: getProxyConfigMasked() });
   }
 
   if (subpath === '/proxy/global' && method === 'DELETE') {
@@ -351,6 +913,15 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
   const proxyAccount = subpath.match(/^\/proxy\/accounts\/([^/]+)$/);
   if (proxyAccount && method === 'PUT') {
+    // Same H3 gate as /proxy/global PUT — per-account proxies were the
+    // other half of the bypass. Empty body / no host = clearing the
+    // proxy, leave it unvalidated.
+    if (body && typeof body === 'object' && body.host && !config.allowPrivateProxyHosts) {
+      try { await assertPublicUrlHost(body.host); }
+      catch (e) {
+        return json(res, 400, { error: e?.message || 'ERR_PROXY_PRIVATE_HOST' });
+      }
+    }
     setAccountProxy(proxyAccount[1], body);
     // Spawn (or adopt) the LS instance for this proxy so chat routes immediately
     ensureLsForAccount(proxyAccount[1]).catch(e => log.warn(`LS ensure failed: ${e.message}`));
@@ -376,6 +947,182 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     });
   }
 
+  // ─── Language Server binary inspect / update ─────────
+  // GET → current LS binary stat (size, mtime, sha256 prefix). UI uses
+  // this to show "binary installed at X, version sha:abcd1234, age 21d".
+  if (subpath === '/langserver/binary' && method === 'GET') {
+    const binPath = config.lsBinaryPath;
+    try {
+      const { statSync } = await import('node:fs');
+      const { createReadStream } = await import('node:fs');
+      const { createHash } = await import('node:crypto');
+      const stat = statSync(binPath);
+      const sha = await new Promise((resolve, reject) => {
+        const h = createHash('sha256');
+        createReadStream(binPath)
+          .on('data', c => h.update(c))
+          .on('end', () => resolve(h.digest('hex')))
+          .on('error', reject);
+      });
+      return json(res, 200, {
+        ok: true,
+        path: binPath,
+        sizeBytes: stat.size,
+        mtime: stat.mtime.toISOString(),
+        sha256: sha.slice(0, 16),
+      });
+    } catch (err) {
+      return json(res, 200, {
+        ok: false,
+        path: binPath,
+        error: err.code || err.message,
+      });
+    }
+  }
+
+  // POST → run install-ls.sh to download the latest binary, then restart
+  // every LS pool entry so requests pick up the new binary on next call.
+  // Body: { url?: string } — optional override (e.g. desktop-extracted
+  // binary URL); falls back to `install-ls.sh` auto-discovery (our
+  // release → Exafunction).
+  if (subpath === '/langserver/update' && method === 'POST') {
+    const { spawn } = await import('node:child_process');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join: pjoin } = await import('node:path');
+    // install-ls.sh ships at the repo root, two levels above this file
+    // (src/dashboard/api.js). Resolving by import.meta.url avoids any
+    // dependence on cwd, so the endpoint works whether started from /app
+    // (Docker), the repo root, or a deeper subdir.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const scriptPath = pjoin(here, '..', '..', 'install-ls.sh');
+    if (!existsSync(scriptPath)) {
+      return json(res, 500, {
+        ok: false,
+        error: `install-ls.sh not found at ${scriptPath}`,
+      });
+    }
+    const url = body && typeof body.url === 'string' ? body.url.trim() : '';
+    // Defence-in-depth: only allow http(s) URLs from a small allowlist of
+    // hosts. Without this, an attacker who got past dashboard auth could
+    // pipe an arbitrary URL into the install script and have curl write
+    // bytes to LS_BINARY_PATH which is then chmod +x and exec'd as the
+    // node user. Still gated by checkAuth above; this is a second layer.
+    if (url) {
+      let parsed;
+      try { parsed = new URL(url); } catch {
+        return json(res, 400, { ok: false, error: 'invalid url' });
+      }
+      if (parsed.protocol !== 'https:') {
+        return json(res, 400, { ok: false, error: 'url must be https' });
+      }
+      const allowedHosts = new Set([
+        'github.com',
+        'objects.githubusercontent.com',
+        'release-assets.githubusercontent.com',
+        'api.github.com',
+      ]);
+      if (!allowedHosts.has(parsed.hostname)) {
+        return json(res, 400, {
+          ok: false,
+          error: `url host not allowed; permitted: ${[...allowedHosts].join(', ')}`,
+        });
+      }
+    }
+    const args = url ? ['--url', url] : [];
+    const env = {
+      ...process.env,
+      LS_INSTALL_PATH: config.lsBinaryPath,
+    };
+    // Snapshot sha256 BEFORE the install. install-ls.sh will atomic-
+    // rename the binary into place even if the download is byte-
+    // identical to what's already there (no upstream change), so
+    // without comparing before/after the dashboard can't tell whether
+    // "Update LS" actually replaced anything — leading to user reports
+    // like "LS update has no effect". Returning both lets the toast
+    // distinguish "binary changed" from "binary already up to date".
+    let beforeSha = null;
+    try {
+      const { createReadStream } = await import('node:fs');
+      const { createHash } = await import('node:crypto');
+      beforeSha = await new Promise((resolve, reject) => {
+        const h = createHash('sha256');
+        createReadStream(config.lsBinaryPath)
+          .on('data', c => h.update(c))
+          .on('end', () => resolve(h.digest('hex')))
+          .on('error', () => resolve(null));
+      });
+    } catch { /* missing or unreadable — that's fine, treat as null */ }
+
+    const child = spawn('bash', [scriptPath, ...args], { env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', c => { stdout += c.toString(); });
+    child.stderr.on('data', c => { stderr += c.toString(); });
+    const exitCode = await new Promise(resolve => {
+      child.on('close', resolve);
+      child.on('error', () => resolve(-1));
+    });
+    if (exitCode !== 0) {
+      return json(res, 200, {
+        ok: false,
+        exitCode,
+        stdout: stdout.slice(-4000),
+        stderr: stderr.slice(-4000),
+      });
+    }
+    let afterSha = null;
+    try {
+      const { createReadStream } = await import('node:fs');
+      const { createHash } = await import('node:crypto');
+      afterSha = await new Promise((resolve) => {
+        const h = createHash('sha256');
+        createReadStream(config.lsBinaryPath)
+          .on('data', c => h.update(c))
+          .on('end', () => resolve(h.digest('hex')))
+          .on('error', () => resolve(null));
+      });
+    } catch { /* keep null */ }
+    const binaryChanged = !!(beforeSha && afterSha && beforeSha !== afterSha);
+    // Restart every LS pool entry. The pool is keyed by proxy; iterating
+    // through the live list catches per-account proxies as well as the
+    // default no-proxy LS. Errors during restart get surfaced so the user
+    // knows whether they need to bounce the container.
+    const { _poolKeys, restartLsForProxy: doRestart, getProxyByKey } =
+      await import('../langserver.js');
+    let restarted = 0;
+    let restartErrors = [];
+    try {
+      const keys = typeof _poolKeys === 'function' ? _poolKeys() : ['default'];
+      for (const key of keys) {
+        try {
+          const proxy = typeof getProxyByKey === 'function' ? getProxyByKey(key) : null;
+          await doRestart(proxy);
+          restarted++;
+        } catch (e) {
+          restartErrors.push(`${key}: ${e.message}`);
+        }
+      }
+    } catch (e) {
+      restartErrors.push(e.message);
+    }
+    return json(res, 200, {
+      ok: true,
+      stdout: stdout.slice(-4000),
+      restarted,
+      restartErrors,
+      // 16-char prefix matches what /langserver/binary returns so the
+      // dashboard can string-compare against its current shown stat.
+      beforeSha: beforeSha ? beforeSha.slice(0, 16) : null,
+      afterSha: afterSha ? afterSha.slice(0, 16) : null,
+      binaryChanged,
+      // poolEmpty distinguishes "no live LS to restart" (cold proxy,
+      // restart will happen on next request) from "all LS restart
+      // attempts failed" (real problem). Without this the toast counts
+      // both as "restarted 0".
+      poolEmpty: restarted === 0 && restartErrors.length === 0,
+    });
+  }
+
   // ─── Language Server ──────────────────────────────────
   if (subpath === '/langserver/restart' && method === 'POST') {
     if (!body.confirm) {
@@ -383,11 +1130,15 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     }
     stopLanguageServer();
     setTimeout(async () => {
-      await startLanguageServer({
-        binaryPath: config.lsBinaryPath,
-        port: config.lsPort,
-        apiServerUrl: config.codeiumApiUrl,
-      });
+      try {
+        await startLanguageServer({
+          binaryPath: config.lsBinaryPath,
+          port: config.lsPort,
+          apiServerUrl: config.codeiumApiUrl,
+        });
+      } catch (e) {
+        log.error(`Language server restart failed: ${e.message}`);
+      }
     }, 2000);
     return json(res, 200, { success: true, message: 'Restarting language server...' });
   }
@@ -396,22 +1147,9 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (subpath === '/models' && method === 'GET') {
     const models = Object.entries(MODELS).map(([id, info]) => ({
       id, name: info.name, provider: info.provider,
+      credit: typeof info.credit === 'number' ? info.credit : null,
     }));
     return json(res, 200, { models });
-  }
-
-  // ─── Manual cloud model-catalog refresh ───────────────
-  // Re-fetches GetCascadeModelConfigs via the first active account and merges
-  // any new modelUids into the local catalog. Idempotent; safe to spam.
-  if (subpath === '/models/refresh-catalog' && method === 'POST') {
-    try {
-      const sizeBefore = Object.keys(MODELS).length;
-      await fetchAndMergeModelCatalog();
-      const sizeAfter = Object.keys(MODELS).length;
-      return json(res, 200, { success: true, before: sizeBefore, after: sizeAfter, added: sizeAfter - sizeBefore });
-    } catch (err) {
-      return json(res, 500, { error: err.message });
-    }
   }
 
   // ─── Model Access Control ──────────────────────────────
@@ -440,39 +1178,92 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // ─── Windsurf Login ────────────────────────────────────
   if (subpath === '/windsurf-login' && method === 'POST') {
     try {
-      const { email, password, proxy: loginProxy, autoAdd } = body;
-      if (!email || !password) return json(res, 400, { error: 'email 和 password 為必填' });
+      const { email, password, proxy: loginProxy, autoAdd } = body || {};
+      return json(res, 200, await processWindsurfLogin({ email, password, loginProxy, autoAdd }));
+    } catch (err) {
+      return json(res, err.statusCode || 400, { error: err.message, isAuthFail: !!err.isAuthFail, firebaseCode: err.firebaseCode });
+    }
+  }
 
-      // Use provided proxy, or global proxy
-      const proxy = loginProxy?.host ? loginProxy : getProxyConfig().global;
-
-      const result = await windsurfLogin(email, password, proxy);
-
-      // Auto-add to account pool if requested
-      let account = null;
-      if (autoAdd !== false) {
-        account = addAccountByKey(result.apiKey, result.name || email);
-        // Persist refresh token via the setter so it survives restart and
-        // the background Firebase-renewal loop can find it.
-        if (result.refreshToken) {
-          setAccountTokens(account.id, { refreshToken: result.refreshToken, idToken: result.idToken });
-        }
-        // Persist the per-account proxy we used for login so chat requests
-        // also egress through the same IP, then warm up a matching LS.
-        if (loginProxy?.host) setAccountProxy(account.id, loginProxy);
-        ensureLsForAccount(account.id)
-          .then(() => probeAccount(account.id))
-          .catch(e => log.warn(`Auto-probe failed: ${e.message}`));
+  if (subpath === '/windsurf-login/batch' && method === 'POST') {
+    try {
+      const { accounts, proxy: loginProxy, autoAdd } = body || {};
+      if (!Array.isArray(accounts) || !accounts.length) {
+        return json(res, 400, { error: 'ERR_ACCOUNTS_REQUIRED' });
       }
 
+      const results = [];
+      for (const acct of accounts) {
+        const email = String(acct?.email || '').trim();
+        const password = String(acct?.password || '').trim();
+        try {
+          const result = await processWindsurfLogin({ email, password, loginProxy, autoAdd });
+          results.push(result);
+        } catch (err) {
+          results.push({
+            success: false,
+            email,
+            error: err.message,
+            isAuthFail: !!err.isAuthFail,
+            firebaseCode: err.firebaseCode,
+          });
+        }
+      }
+
+      const successCount = results.filter(r => r.success).length;
+      const failCount = results.length - successCount;
       return json(res, 200, {
         success: true,
-        apiKey: result.apiKey,
-        name: result.name,
-        email: result.email,
-        apiServerUrl: result.apiServerUrl,
-        account: account ? { id: account.id, email: account.email, status: account.status } : null,
+        total: results.length,
+        successCount,
+        failCount,
+        results,
       });
+    } catch (err) {
+      return json(res, 400, { error: err.message });
+    }
+  }
+
+  // ─── Batch proxy + account import ─────────────────────
+  // POST /batch-import — each line: "proxy email password" or "email password"
+  if (subpath === '/batch-import' && method === 'POST') {
+    try {
+      const { text, autoAdd = true } = body || {};
+      if (!text || typeof text !== 'string') return json(res, 400, { error: 'ERR_TEXT_REQUIRED' });
+      const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+      if (!lines.length) return json(res, 400, { error: 'ERR_NO_VALID_LINES' });
+
+      const results = [];
+      for (const line of lines) {
+        const parts = line.split(/\s+/);
+        let proxy = null, email, password;
+        if (parts.length >= 3 && (parts[0].includes('://') || parts[0].includes(':'))) {
+          proxy = parts[0];
+          email = parts[1];
+          password = parts[2];
+        } else if (parts.length >= 2) {
+          email = parts[0];
+          password = parts[1];
+        } else {
+          results.push({ success: false, email: line.slice(0, 30), error: 'ERR_FORMAT_INVALID' });
+          continue;
+        }
+        try {
+          const loginProxy = proxy ? parseProxyUrl(proxy) : getProxyConfig().global;
+          const result = await processWindsurfLogin({ email, password, loginProxy, autoAdd });
+          const binding = buildBatchProxyBinding(result, proxy);
+          if (binding) {
+              setAccountProxy(binding.accountId, binding.proxy);
+              result.proxy = proxy;
+              ensureLsForAccount(binding.accountId).catch(() => {});
+          }
+          results.push(result);
+        } catch (err) {
+          results.push({ success: false, email, error: err.message });
+        }
+      }
+      const successCount = results.filter(r => r.success).length;
+      return json(res, 200, { success: true, total: results.length, successCount, failCount: results.length - successCount, results });
     } catch (err) {
       return json(res, 400, { error: err.message });
     }
@@ -483,7 +1274,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (subpath === '/oauth-login' && method === 'POST') {
     try {
       const { idToken, refreshToken, email, provider, autoAdd } = body;
-      if (!idToken) return json(res, 400, { error: '缺少 idToken' });
+      if (!idToken) return json(res, 400, { error: 'ERR_IDTOKEN_REQUIRED' });
 
       const proxy = getProxyConfig().global;
       const { apiKey, name } = await reRegisterWithCodeium(idToken, proxy);
@@ -501,7 +1292,12 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
       return json(res, 200, {
         success: true,
-        apiKey,
+        // Same one-time-export contract as /windsurf-login: raw key returned
+        // only when autoAdd:false (caller takes the key themselves and we do
+        // not persist it). Otherwise mask for listings.
+        ...(autoAdd === false
+          ? { apiKey }
+          : { apiKey_masked: maskApiKey(apiKey) }),
         name,
         email: email || '',
         account: account ? { id: account.id, email: account.email, status: account.status } : null,
@@ -518,21 +1314,28 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     const list = getAccountList();
     const acct = list.find(a => a.id === rateLimitCheck[1]);
     if (!acct) return json(res, 404, { error: 'Account not found' });
+    const secret = getAccountInternal(acct.id);
     try {
       const proxy = getEffectiveProxy(acct.id) || null;
-      const result = await checkMessageRateLimit(acct.apiKey, proxy);
+      const result = await checkMessageRateLimit(secret.apiKey, proxy);
       return json(res, 200, { success: true, account: acct.email, ...result });
     } catch (err) {
       return json(res, 500, { error: err.message });
     }
   }
 
+  const revealKey = subpath.match(/^\/account\/([^/]+)\/reveal-key$/);
+  if (revealKey && method === 'POST') {
+    const acct = getAccountInternal(revealKey[1]);
+    if (!acct) return json(res, 404, { error: 'Account not found' });
+    return json(res, 200, { success: true, apiKey: acct.apiKey });
+  }
+
   // ─── Firebase Token Refresh ───────────────────────────────
   // POST /accounts/:id/refresh-token — manually refresh Firebase token
   const tokenRefresh = subpath.match(/^\/accounts\/([^/]+)\/refresh-token$/);
   if (tokenRefresh && method === 'POST') {
-    const list = getAccountList();
-    const acct = list.find(a => a.id === tokenRefresh[1]);
+    const acct = getAccountInternal(tokenRefresh[1]);
     if (!acct) return json(res, 404, { error: 'Account not found' });
     if (!acct.refreshToken) return json(res, 400, { error: 'Account has no refresh token' });
     try {
@@ -551,4 +1354,135 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   }
 
   json(res, 404, { error: `Dashboard API: ${method} ${subpath} not found` });
+}
+
+// ─── Proxy connectivity test ──────────────────────────────
+// HTTP CONNECT tunnel to api.ipify.org:443 → GET / → the returned IP is the
+// proxy's egress IP. Confirms the proxy works AND that auth is accepted.
+// ─── Self-update helpers ───────────────────────────────
+//
+// execFile (not exec) for every invocation: no shell is spawned, so
+// metacharacters in any future argument source are data, not commands.
+// Belt-and-braces with the branch-name regex in /self-update — if a
+// future refactor drops the regex, execFile still denies injection.
+const SELF_UPDATE_UNAVAILABLE = 'ERR_SELF_UPDATE_UNAVAILABLE';
+let gitExecFileForTest = null;
+
+export function setGitExecFileForTest(execFile) {
+  gitExecFileForTest = execFile;
+}
+
+function makeSelfUpdateUnavailableError() {
+  const err = new Error(SELF_UPDATE_UNAVAILABLE);
+  err.code = SELF_UPDATE_UNAVAILABLE;
+  err.reason = 'docker';
+  return err;
+}
+
+function isSelfUpdateUnavailableError(err) {
+  return err?.code === SELF_UPDATE_UNAVAILABLE || err?.message === SELF_UPDATE_UNAVAILABLE;
+}
+
+function hasGitMetadata(cwd = process.cwd()) {
+  return existsSync(join(cwd, '.git'));
+}
+
+async function getGitExecFile() {
+  if (gitExecFileForTest) return gitExecFileForTest;
+  const { execFile } = await import('node:child_process');
+  return execFile;
+}
+
+export function runGit(args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    if (!hasGitMetadata(opts.cwd)) return reject(makeSelfUpdateUnavailableError());
+    getGitExecFile().then((execFile) => {
+      execFile('git', args, { timeout: 30_000, maxBuffer: 1024 * 1024, ...opts }, (err, stdout, stderr) => {
+        if (err?.code === 'ENOENT') return reject(makeSelfUpdateUnavailableError());
+        if (err) return reject(new Error((stderr || err.message).toString().slice(0, 500)));
+        resolve(stdout.toString());
+      });
+    }).catch(reject);
+  });
+}
+
+async function gitStatus() {
+  const commit = (await runGit(['rev-parse', 'HEAD'])).trim();
+  const branch = (await runGit(['rev-parse', '--abbrev-ref', 'HEAD'])).trim();
+  let remote = '';
+  try {
+    await runGit(['fetch', '--quiet', 'origin']);
+    remote = (await runGit(['rev-parse', `origin/${branch}`])).trim();
+  } catch {}
+  const localMsg = (await runGit(['log', '-1', '--pretty=format:%s'])).trim();
+  const behind = remote && remote !== commit;
+  const remoteMsg = behind ? (await runGit(['log', '-1', '--pretty=format:%s', remote]).catch(() => '')).trim() : '';
+  return {
+    commit: commit.slice(0, 7),
+    commitFull: commit,
+    branch,
+    localMessage: localMsg,
+    remoteCommit: remote ? remote.slice(0, 7) : '',
+    remoteMessage: remoteMsg,
+    behind,
+  };
+}
+
+async function testProxy({ host, port, username, password, type }) {
+  if (config.allowPrivateProxyHosts) {
+    await validateHostFormat(host);
+  } else {
+    await assertPublicUrlHost(host);
+  }
+  const { isSocks, createSocksTunnel } = await import('../socks.js');
+  const tls = await import('node:tls');
+  const targetHost = 'api.ipify.org';
+  const targetPort = 443;
+  const proxy = { host, port, username, password, type };
+
+  // Get a raw TCP socket — either via SOCKS5 or HTTP CONNECT
+  let socket;
+  if (isSocks(proxy)) {
+    socket = await createSocksTunnel(proxy, targetHost, targetPort, 10000);
+  } else {
+    const http = await import('node:http');
+    socket = await new Promise((resolve, reject) => {
+      const authHeader = username
+        ? { 'Proxy-Authorization': 'Basic ' + Buffer.from(`${username}:${password || ''}`).toString('base64') }
+        : {};
+      const req = http.request({
+        host, port, method: 'CONNECT',
+        path: `${targetHost}:${targetPort}`,
+        headers: { Host: `${targetHost}:${targetPort}`, ...authHeader },
+        timeout: 10000,
+      });
+      req.on('connect', (res, sock) => {
+        if (res.statusCode !== 200) { sock.destroy(); return reject(new Error(`ERR_PROXY_HTTP_ERROR:${res.statusCode}`)); }
+        resolve(sock);
+      });
+      req.on('error', (err) => reject(new Error(`ERR_CONNECTION_FAILED:${err.message}`)));
+      req.on('timeout', () => { req.destroy(); reject(new Error('ERR_TIMEOUT')); });
+      req.end();
+    });
+  }
+
+  // TLS handshake + GET to verify the tunnel works
+  return new Promise((resolve, reject) => {
+      const tlsSock = tls.connect({ socket, servername: targetHost, rejectUnauthorized: false }, () => {
+        tlsSock.write(`GET / HTTP/1.1\r\nHost: ${targetHost}\r\nConnection: close\r\nUser-Agent: WindsurfAPI/ProxyTest\r\n\r\n`);
+      });
+      const chunks = [];
+      tlsSock.on('data', c => chunks.push(c));
+      tlsSock.on('end', () => {
+        const body = Buffer.concat(chunks).toString('utf-8');
+        const match = body.match(/\r\n\r\n([^\r\n]+)/);
+        const ip = match ? match[1].trim() : '';
+        tlsSock.destroy();
+        if (!ip || !/^\d+\.\d+\.\d+\.\d+$/.test(ip)) {
+          return reject(new Error('ERR_TLS_TUNNEL_ERROR'));
+        }
+        resolve({ egressIp: ip, type });
+      });
+      tlsSock.on('error', (err) => reject(new Error(`ERR_TLS_FAILED:${err.message}`)));
+  });
 }

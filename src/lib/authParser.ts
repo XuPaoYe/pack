@@ -461,6 +461,11 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
     stringField(tokens?.access_token) ??
     stringField(tokens?.accessToken) ??
     idToken;
+  const apiKey =
+    stringField(value.api_key) ??
+    stringField(value.apiKey) ??
+    stringField(tokens?.api_key) ??
+    stringField(tokens?.apiKey);
   const auth1Token =
     stringField(value.auth1_token) ??
     stringField(value.auth1Token) ??
@@ -480,10 +485,10 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
     stringField(tokens?.devin_session_token) ??
     stringField(tokens?.devinSessionToken);
 
-  if (!idToken && !refreshToken && !auth1Token && !sessionToken) return null;
+  if (!idToken && !refreshToken && !apiKey && !auth1Token && !sessionToken) return null;
 
   const jwt = parseJwtPayload(idToken);
-  const discriminatorToken = sessionToken ?? auth1Token ?? accessToken ?? refreshToken ?? idToken ?? "windsurf";
+  const discriminatorToken = apiKey ?? sessionToken ?? auth1Token ?? accessToken ?? refreshToken ?? idToken ?? "windsurf";
   const email =
     stringField(value.email) ??
     stringField(value.account) ??
@@ -512,12 +517,12 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
 
   const now = nowUnixSeconds();
   const tokenMeta = {
-    hasAccessToken: Boolean(accessToken || sessionToken || auth1Token),
+    hasAccessToken: Boolean(accessToken || apiKey || sessionToken || auth1Token),
     hasRefreshToken: Boolean(refreshToken),
     hasIdToken: Boolean(idToken),
     expiresAt,
   };
-  const discriminator = localId ?? sessionToken ?? auth1Token ?? email;
+  const discriminator = localId ?? apiKey ?? sessionToken ?? auth1Token ?? email;
   const plan =
     stringField(value.plan) ??
     stringField(value.plan_type) ??
@@ -546,6 +551,7 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
         id_token: idToken,
         refresh_token: refreshToken,
         access_token: accessToken,
+        api_key: apiKey,
         auth1_token: auth1Token,
         session_token: sessionToken,
         local_id: localId,

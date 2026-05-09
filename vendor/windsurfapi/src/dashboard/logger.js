@@ -13,40 +13,17 @@
  * and the dashboard can filter/group by ctx fields.
  */
 
-import { mkdirSync, createWriteStream, accessSync, constants } from 'fs';
+import { mkdirSync, createWriteStream, existsSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
 import { randomUUID } from 'crypto';
-import { log } from '../config.js';
+import { config, log } from '../config.js';
 
 const MAX_BUFFER = 1000;
 const _buffer = [];
 const _subscribers = new Set();
 
-// LOG_DIR override lets containers redirect logs to a mount they can write to.
-// Default: ./logs under the process cwd. If that's unwritable (common when a
-// Docker volume is mounted with host ownership), we fall back to the system
-// temp dir and, failing that, disable file logging entirely — never crash.
-function resolveLogDir() {
-  const candidates = [];
-  if (process.env.LOG_DIR) candidates.push(process.env.LOG_DIR);
-  candidates.push(join(process.cwd(), 'logs'));
-  candidates.push(join(tmpdir(), 'windsurfpoolapi-logs'));
-  for (const dir of candidates) {
-    try {
-      mkdirSync(dir, { recursive: true });
-      accessSync(dir, constants.W_OK);
-      return dir;
-    } catch { /* try next candidate */ }
-  }
-  return null; // signals "disk logging disabled"
-}
-
-const LOG_DIR = resolveLogDir();
-let _diskLoggingDisabled = LOG_DIR === null;
-if (_diskLoggingDisabled) {
-  console.warn('[WARN] Log directory is not writable; disk logging disabled. Set LOG_DIR to a writable path to re-enable.');
-}
+const LOG_DIR = join(config.dataDir, 'logs');
+try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
 
 // Rotate by UTC date. One stream per day, lazily recreated at midnight.
 let _appStream = null;
@@ -58,28 +35,13 @@ function today() {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
-function makeStream(path) {
-  const s = createWriteStream(path, { flags: 'a' });
-  // Async stream errors (e.g. EACCES on first write, EIO on full disk) are
-  // emitted on the next tick and will crash Node if unhandled. Catch them
-  // here, disable disk logging, and fall back to console-only.
-  s.on('error', (e) => {
-    if (!_diskLoggingDisabled) {
-      _diskLoggingDisabled = true;
-      console.warn(`[WARN] Log write failed (${e.code || e.message}); disk logging disabled.`);
-    }
-  });
-  return s;
-}
-
 function getStreams() {
-  if (_diskLoggingDisabled) return null;
   const date = today();
   if (date !== _streamDate) {
     try { _appStream?.end(); } catch {}
     try { _errStream?.end(); } catch {}
-    _appStream = makeStream(join(LOG_DIR, `app-${date}.jsonl`));
-    _errStream = makeStream(join(LOG_DIR, `error-${date}.jsonl`));
+    _appStream = createWriteStream(join(LOG_DIR, `app-${date}.jsonl`), { flags: 'a' });
+    _errStream = createWriteStream(join(LOG_DIR, `error-${date}.jsonl`), { flags: 'a' });
     _streamDate = date;
   }
   return { app: _appStream, err: _errStream };
@@ -125,14 +87,12 @@ for (const level of ['debug', 'info', 'warn', 'error']) {
       try { fn(entry); } catch {}
     }
 
-    // Persist to disk (no-op if disk logging disabled after a stream error)
+    // Persist to disk
     try {
-      const streams = getStreams();
-      if (streams) {
-        const line = JSON.stringify(entry) + '\n';
-        streams.app.write(line);
-        if (level === 'error' || level === 'warn') streams.err.write(line);
-      }
+      const { app, err } = getStreams();
+      const line = JSON.stringify(entry) + '\n';
+      app.write(line);
+      if (level === 'error' || level === 'warn') err.write(line);
     } catch {}
 
     // Also print to console so pm2 logs still work
@@ -195,4 +155,4 @@ export function subscribeToLogs(callback) { _subscribers.add(callback); }
 export function unsubscribeFromLogs(callback) { _subscribers.delete(callback); }
 
 /** Get current log directory (for dashboard to display). */
-export function getLogDir() { return LOG_DIR || '(disk logging disabled)'; }
+export function getLogDir() { return LOG_DIR; }

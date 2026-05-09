@@ -44,6 +44,7 @@ pub struct WindsurfApiStatus {
     /// 拼好的 base URL，例如 `http://127.0.0.1:63721/v1`。
     pub address: Option<String>,
     pub api_key: String,
+    pub default_model: String,
     pub last_error: Option<String>,
 }
 
@@ -52,12 +53,13 @@ pub struct WindsurfApiStatus {
 struct ProxyTarget {
     base_url: String, // e.g. http://127.0.0.1:39721
     inner_key: String,
-    /// 客户端没指定 model 时填的默认；为空表示不注入。
+    /// 聊天接口统一写入的默认模型；为空表示不注入。
     default_model: String,
 }
 
 struct Sidecar {
     child: Child,
+    ls_bin: PathBuf,
     /// stdout/stderr 读取线程，sidecar 退出后会自然结束。
     _stdout_join: Option<JoinHandle<()>>,
     _stderr_join: Option<JoinHandle<()>>,
@@ -77,7 +79,7 @@ impl Drop for Sidecar {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
+                Ok(Some(_)) => break,
                 _ => {
                     if Instant::now() >= deadline {
                         break;
@@ -88,6 +90,7 @@ impl Drop for Sidecar {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        cleanup_language_server_processes(&self.ls_bin);
     }
 }
 
@@ -122,10 +125,20 @@ fn generate_inner_key() -> String {
 }
 
 /// 构造对外展示的状态。
-pub fn current_status(default_host: &str, default_port: u16, api_key: &str) -> WindsurfApiStatus {
+pub fn current_status(
+    default_host: &str,
+    default_port: u16,
+    api_key: &str,
+    default_model: &str,
+) -> WindsurfApiStatus {
     let guard = lock();
     if let Some(runtime) = guard.as_ref() {
         let address = build_address(&runtime.bind_host, runtime.actual_port);
+        let default_model = runtime
+            .proxy_target
+            .as_ref()
+            .map(|target| target.default_model.clone())
+            .unwrap_or_default();
         WindsurfApiStatus {
             running: true,
             bind_host: runtime.bind_host.clone(),
@@ -133,6 +146,7 @@ pub fn current_status(default_host: &str, default_port: u16, api_key: &str) -> W
             actual_port: Some(runtime.actual_port),
             address: Some(address),
             api_key: runtime.api_key.clone(),
+            default_model,
             last_error: runtime.last_error.clone(),
         }
     } else {
@@ -143,6 +157,7 @@ pub fn current_status(default_host: &str, default_port: u16, api_key: &str) -> W
             actual_port: None,
             address: None,
             api_key: api_key.to_string(),
+            default_model: default_model.trim().to_string(),
             last_error: None,
         }
     }
@@ -205,6 +220,93 @@ fn resolve_bundled_binary(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// WindsurfAPI 2.0.92 自带孤儿 LS 清理，但当前上游是在设置
+/// `LS_BINARY_PATH` 前调用 cleanup，打包后无法命中我们的 externalBin 路径。
+/// 这里按 argv[0] 精确匹配同一个 LS 二进制，避免旧进程占住固定端口导致
+/// 新 sidecar 等待 LS ready 超时。
+#[cfg(unix)]
+fn cleanup_language_server_processes(ls_bin: &Path) {
+    let Ok(ls_bin) = ls_bin.canonicalize() else {
+        return;
+    };
+    let ls_name = ls_bin
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("language_server");
+    let Ok(output) = Command::new("ps")
+        .args(["-e", "-o", "pid=,args="])
+        .output()
+    else {
+        return;
+    };
+
+    let current_pid = std::process::id() as libc::pid_t;
+    let mut matched_pids = Vec::new();
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((pid_text, argv)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_text.trim().parse::<libc::pid_t>() else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        let argv0 = argv.split_whitespace().next().unwrap_or("");
+        if argv0.is_empty() {
+            continue;
+        }
+        let argv0_matches = Path::new(argv0)
+            .canonicalize()
+            .map(|argv0_path| argv0_path == ls_bin)
+            .unwrap_or(false);
+        if !argv0_matches && !argv.contains(ls_name) {
+            continue;
+        }
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGTERM);
+        }
+        matched_pids.push(pid);
+    }
+    thread::sleep(Duration::from_millis(300));
+    for pid in matched_pids {
+        unsafe {
+            if libc::kill(pid, 0) == 0 {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_language_server_processes(_ls_bin: &Path) {}
+
+#[cfg(target_os = "macos")]
+fn repair_macos_binary(path: &Path) {
+    let _ = Command::new("xattr")
+        .arg("-d")
+        .arg("com.apple.quarantine")
+        .arg(path)
+        .output();
+    let signature_ok = Command::new("codesign")
+        .args(["--verify", "--verbose=1"])
+        .arg(path)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if !signature_ok {
+        let _ = Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(path)
+            .output();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn repair_macos_binary(_path: &Path) {}
+
 // ---------- sidecar 启动 ----------
 
 fn pick_free_port() -> Result<u16, String> {
@@ -238,12 +340,20 @@ fn spawn_sidecar(
     let http_port = pick_free_port()?;
     let ls_port = pick_free_port()?;
 
+    cleanup_language_server_processes(ls_bin);
+    repair_macos_binary(sidecar_bin);
+    repair_macos_binary(ls_bin);
+
     let mut cmd = Command::new(sidecar_bin);
     cmd.env("PORT", http_port.to_string())
+        .env("HOST", "127.0.0.1")
         .env("API_KEY", inner_key)
         .env("LS_BINARY_PATH", ls_bin)
         .env("LS_PORT", ls_port.to_string())
         .env("LS_DATA_DIR", data_dir)
+        // bun --compile 后 sidecar 的 __dirname 指向只读的 /$bunfs/，
+        // 必须显式给它一个可写目录写 accounts.json / logs/，否则 logger 启动就崩。
+        .env("DATA_DIR", data_dir)
         .env("LOG_LEVEL", "info")
         .current_dir(data_dir)
         .stdin(Stdio::null())
@@ -304,12 +414,14 @@ fn spawn_sidecar(
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    cleanup_language_server_processes(ls_bin);
                     return Err("等待 sidecar 启动超时（30s）".to_string());
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                cleanup_language_server_processes(ls_bin);
                 return Err("sidecar stdout 通道意外关闭".to_string());
             }
         }
@@ -318,6 +430,7 @@ fn spawn_sidecar(
     Ok((
         Sidecar {
             child,
+            ls_bin: ls_bin.to_path_buf(),
             _stdout_join: Some(stdout_join),
             _stderr_join: Some(stderr_join),
         },
@@ -421,6 +534,10 @@ fn start_internal(
     let api_key_owned = api_key.to_string();
     let host_owned = host.to_string();
     let target_for_thread = target.clone();
+    let default_model = target
+        .as_ref()
+        .map(|proxy| proxy.default_model.clone())
+        .unwrap_or_default();
 
     let accept_join = thread::Builder::new()
         .name("windsurf-api".into())
@@ -448,6 +565,7 @@ fn start_internal(
         actual_port: Some(actual_port),
         address: Some(build_address(&host_owned, actual_port)),
         api_key: api_key.to_string(),
+        default_model,
         last_error: None,
     })
 }
@@ -588,7 +706,55 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
         }
     }
 
-    Ok(json!({ "added": add_count, "removed": removed, "kept": existing.len().saturating_sub(removed) }))
+    let refresh = refresh_sidecar_account_capabilities(&client, &target);
+
+    Ok(json!({
+        "added": add_count,
+        "removed": removed,
+        "kept": existing.len().saturating_sub(removed),
+        "refresh": refresh,
+    }))
+}
+
+fn refresh_sidecar_account_capabilities(
+    client: &reqwest::blocking::Client,
+    target: &ProxyTarget,
+) -> Value {
+    let credits = post_sidecar_dashboard_api(client, target, "/accounts/refresh-credits");
+    let probe = post_sidecar_dashboard_api(client, target, "/accounts/probe-all");
+    json!({
+        "credits": credits,
+        "probe": probe,
+    })
+}
+
+fn post_sidecar_dashboard_api(
+    client: &reqwest::blocking::Client,
+    target: &ProxyTarget,
+    subpath: &str,
+) -> Value {
+    let response = match client
+        .post(format!("{}/dashboard/api{}", target.base_url, subpath))
+        .header("Authorization", format!("Bearer {}", target.inner_key))
+        .json(&json!({}))
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => return json!({ "ok": false, "error": error.to_string() }),
+    };
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        return json!({
+            "ok": false,
+            "status": status.as_u16(),
+            "body": body,
+        });
+    }
+    match serde_json::from_str::<Value>(&body) {
+        Ok(value) => json!({ "ok": true, "body": value }),
+        Err(_) => json!({ "ok": true, "body": body }),
+    }
 }
 
 /// 停止服务（幂等）。
@@ -713,29 +879,31 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
         return;
     }
 
-    // 若是聊天接口且配置了默认模型，body 里 model 缺失/空 时注入默认值。
+    // 若是聊天接口且配置了默认模型，统一用默认值覆盖请求体 model。
+    let mut forced_model: Option<String> = None;
     if !target.default_model.is_empty()
         && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/responses")
         && !body.is_empty()
     {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
             if let Some(obj) = value.as_object_mut() {
-                let needs_default = match obj.get("model") {
-                    None => true,
-                    Some(Value::Null) => true,
-                    Some(Value::String(s)) => {
-                        let trimmed = s.trim();
-                        trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto")
-                    }
-                    _ => false,
-                };
-                if needs_default {
-                    obj.insert(
-                        "model".to_string(),
-                        Value::String(target.default_model.clone()),
-                    );
-                    if let Ok(new_body) = serde_json::to_vec(&value) {
-                        body = new_body;
+                let requested_model = obj
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>")
+                    .to_string();
+                obj.insert(
+                    "model".to_string(),
+                    Value::String(target.default_model.clone()),
+                );
+                if let Ok(new_body) = serde_json::to_vec(&value) {
+                    body = new_body;
+                    forced_model = Some(target.default_model.clone());
+                    if requested_model != target.default_model {
+                        eprintln!(
+                            "[Windsurf API] model override: {requested_model} -> {}",
+                            target.default_model
+                        );
                     }
                 }
             }
@@ -850,6 +1018,11 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
     for h in cors_headers(None) {
         headers.push(h);
     }
+    if let Some(model) = forced_model {
+        if let Ok(h) = Header::from_bytes(&b"x-super-ai-model"[..], model.as_bytes()) {
+            headers.push(h);
+        }
+    }
 
     let response = Response::new(StatusCode(status), headers, upstream_resp, None, None);
     let _ = request.respond(response);
@@ -858,15 +1031,19 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
 // ---------- 辅助 ----------
 
 fn is_authorized(request: &Request, api_key: &str) -> bool {
-    request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .and_then(|h| {
-            let value = h.value.as_str();
-            value.strip_prefix("Bearer ").map(str::to_string)
-        })
-        .is_some_and(|token| token.trim() == api_key)
+    request.headers().iter().any(|h| {
+        if h.field.equiv("Authorization") {
+            return h
+                .value
+                .as_str()
+                .strip_prefix("Bearer ")
+                .is_some_and(|token| token.trim() == api_key);
+        }
+        if h.field.equiv("x-api-key") {
+            return h.value.as_str().trim() == api_key;
+        }
+        false
+    })
 }
 
 fn json_response(code: u16, value: &Value) -> Response<Cursor<Vec<u8>>> {
@@ -903,7 +1080,7 @@ fn cors_headers(content_type: Option<&str>) -> Vec<Header> {
         .expect("cors methods"),
         Header::from_bytes(
             &b"Access-Control-Allow-Headers"[..],
-            &b"Authorization, Content-Type, X-Requested-With"[..],
+            &b"Authorization, Content-Type, X-Requested-With, x-api-key, anthropic-version"[..],
         )
         .expect("cors headers"),
     ];
@@ -969,6 +1146,23 @@ mod tests {
         (status, body)
     }
 
+    fn http_get_with_x_api_key(addr: &str, path: &str, key: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: {addr}\r\nx-api-key: {key}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).unwrap();
+        let status = buf
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body = buf.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
     fn http_post(addr: &str, path: &str, auth: &str, body: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         let req = format!(
@@ -1006,6 +1200,10 @@ mod tests {
         assert!(body.contains("\"object\":\"list\""), "body: {body}");
         assert!(body.contains("claude-sonnet-4"), "body: {body}");
 
+        let (code, body) = http_get_with_x_api_key(&addr, "/v1/models", key);
+        assert_eq!(code, 200);
+        assert!(body.contains("\"object\":\"list\""), "body: {body}");
+
         let (code, _) = http_get(&addr, "/nope", Some(key));
         assert_eq!(code, 404);
 
@@ -1026,7 +1224,7 @@ mod tests {
         let s2 = start_no_sidecar("127.0.0.1", 0, key).unwrap();
         let p2 = s2.actual_port.unwrap();
         assert!(p1 > 0 && p2 > 0);
-        let cur = current_status("127.0.0.1", 0, key);
+        let cur = current_status("127.0.0.1", 0, key, "");
         assert!(cur.running);
         assert_eq!(cur.actual_port, Some(p2));
         stop().unwrap();

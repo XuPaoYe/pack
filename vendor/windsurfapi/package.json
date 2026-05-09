@@ -1,37 +1,38 @@
 {
-  "name": "windsurfapi",
-  "version": "2.0.7",
-  "description": "Windsurf → OpenAI / Anthropic compatible proxy with multi-account pool, token/credit stats, and admin dashboard.",
+  "name": "windsurf-api",
+  "version": "2.0.92",
+  "description": "Windsurf to OpenAI + Anthropic compatible API proxy. Turns Windsurf's 107 AI models (Claude, GPT, Gemini, DeepSeek, Grok, Qwen, Kimi, GLM, SWE) into dual-protocol API endpoints. Zero npm deps.",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "check": "find src -name '*.js' -type f -exec node --check {} +"
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
+  "author": "dwgx <somdhmtb@gmail.com> (https://github.com/dwgx)",
+  "homepage": "https://dwgx.github.io/WindsurfAPI/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dwgx/WindsurfAPI.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dwgx/WindsurfAPI/issues"
   },
   "keywords": [
     "windsurf",
     "codeium",
     "openai",
     "anthropic",
-    "proxy",
-    "api",
-    "language-server"
-  ],
-  "license": "MIT",
-  "engines": {
-    "node": ">=20.0.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/guanxiaol/WindsurfPoolAPI.git"
-  },
-  "author": "guanxiaol (fork) <guanxiaol@users.noreply.github.com>",
-  "contributors": [
-    "dwgx1337 (original author) <https://github.com/dwgx>"
-  ],
-  "bugs": {
-    "url": "https://github.com/guanxiaol/WindsurfPoolAPI/issues"
-  },
-  "homepage": "https://github.com/guanxiaol/WindsurfPoolAPI#readme"
+    "claude",
+    "gpt",
+    "gemini",
+    "api-proxy",
+    "llm-gateway",
+    "reverse-engineering",
+    "zero-dependency"
+  ]
 }

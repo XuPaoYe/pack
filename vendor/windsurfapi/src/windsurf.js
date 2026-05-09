@@ -59,9 +59,10 @@
 
 import { randomUUID } from 'crypto';
 import {
-  writeVarintField, writeStringField, writeMessageField,
+  writeVarintField, writeStringField, writeMessageField, writeBytesField,
   writeBoolField, parseFields, getField, getAllFields,
 } from './proto.js';
+import { getSystemPrompts } from './runtime-config.js';
 
 // ─── Enums ─────────────────────────────────────────────────
 
@@ -85,16 +86,21 @@ function encodeTimestamp() {
 
 // ─── Metadata ──────────────────────────────────────────────
 
-export function buildMetadata(apiKey, version = '1.9600.41', sessionId = null) {
+import { platform, arch } from 'os';
+const _os = platform() === 'darwin' ? 'macos' : platform() === 'win32' ? 'windows' : 'linux';
+const _hw = arch() === 'arm64' ? 'arm64' : 'x86_64';
+const DEFAULT_CLIENT_VERSION = process.env.WINDSURF_CLIENT_VERSION || '2.0.67';
+
+export function buildMetadata(apiKey, version = DEFAULT_CLIENT_VERSION, sessionId = null) {
   return Buffer.concat([
     writeStringField(1, 'windsurf'),          // ide_name
     writeStringField(2, version),             // extension_version
     writeStringField(3, apiKey),              // api_key
     writeStringField(4, 'en'),                // locale
-    writeStringField(5, 'linux'),             // os
+    writeStringField(5, _os),                 // os
     writeStringField(7, version),             // ide_version
-    writeStringField(8, 'x86_64'),            // hardware
-    writeVarintField(9, Date.now()),           // request_id
+    writeStringField(8, _hw),                 // hardware
+    writeVarintField(9, Math.floor(Math.random() * 2**48)),  // request_id
     writeStringField(10, sessionId || randomUUID()), // session_id
     writeStringField(12, 'windsurf'),          // extension_name
   ]);
@@ -111,8 +117,16 @@ function buildChatMessage(content, source, conversationId) {
   ];
 
   if (source === SOURCE.ASSISTANT) {
-    // Assistant uses plain string for field 5
-    parts.push(writeStringField(5, content));
+    // Assistant goes in ChatMessage.action (field 6), not .intent (field 5).
+    // Proto: ChatMessageAction { ChatMessageActionGeneric generic = 1; }
+    //        ChatMessageActionGeneric { string text = 1; }
+    // Previous code wrote a raw string into field 5 which happens to share
+    // wire type (length-delimited) with the expected message, so short
+    // replies slipped through parsing by coincidence — real multi-turn
+    // conversations tripped the LS with "invalid wire-format data".
+    const actionGeneric = writeStringField(1, content);    // ChatMessageActionGeneric.text
+    const action = writeMessageField(1, actionGeneric);    // ChatMessageAction.generic
+    parts.push(writeMessageField(6, action));
   } else {
     // User/System/Tool use ChatMessageIntent { IntentGeneric { text } }
     const intentGeneric = writeStringField(1, content);    // IntentGeneric.text
@@ -133,14 +147,22 @@ function buildChatMessage(content, source, conversationId) {
  * @param {number} modelEnum - Windsurf model enum value
  * @param {string} [modelName] - Model name string (optional)
  */
-export function buildRawGetChatMessageRequest(apiKey, messages, modelEnum, modelName, sessionId) {
+export function buildRawGetChatMessageRequest(apiKey, messages, modelEnum, modelName, sessionId = null) {
   const parts = [];
   const conversationId = randomUUID();
 
-  // Field 1: Metadata
+  // Field 1: Metadata — pass through the caller's session id so the
+  // legacy Raw channel uses the same per-LS session as Cascade instead
+  // of a fresh UUID per request (anti-fingerprint).
   parts.push(writeMessageField(1, buildMetadata(apiKey, undefined, sessionId)));
 
-  // Field 2: repeated ChatMessage (skip system, handled separately)
+  // Field 2: repeated ChatMessage (skip system, handled separately).
+  // Windsurf's legacy RawGetChatMessage backend rejects role=tool and
+  // doesn't know about assistant tool_calls. Degrade both to plain text
+  // so multi-turn conversations that carry tool history still flow
+  // through without triggering "proto: cannot parse invalid wire-format
+  // data" upstream. Cascade models are unaffected — they use a different
+  // endpoint (SendUserCascadeMessage) with full tool support.
   let systemPrompt = '';
   for (const msg of messages) {
     if (msg.role === 'system') {
@@ -150,16 +172,39 @@ export function buildRawGetChatMessageRequest(apiKey, messages, modelEnum, model
     }
 
     let source;
-    switch (msg.role) {
-      case 'user': source = SOURCE.USER; break;
-      case 'assistant': source = SOURCE.ASSISTANT; break;
-      case 'tool': source = SOURCE.TOOL; break;
-      default: source = SOURCE.USER;
-    }
-
-    const text = typeof msg.content === 'string' ? msg.content
+    let text;
+    const baseText = typeof msg.content === 'string' ? msg.content
       : Array.isArray(msg.content) ? msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
-      : JSON.stringify(msg.content);
+      : msg.content == null ? '' : JSON.stringify(msg.content);
+
+    switch (msg.role) {
+      case 'user':
+        source = SOURCE.USER;
+        text = baseText;
+        break;
+      case 'assistant':
+        source = SOURCE.ASSISTANT;
+        // If the assistant previously called tools, append the call descriptions
+        // so the model sees its own prior tool usage as text. Empty string OK.
+        if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+          const tcLines = msg.tool_calls.map(tc =>
+            `[called tool ${tc.function?.name || 'unknown'} with ${tc.function?.arguments || '{}'}]`
+          ).join('\n');
+          text = baseText ? `${baseText}\n${tcLines}` : tcLines;
+        } else {
+          text = baseText;
+        }
+        break;
+      case 'tool':
+        // Rewrite tool-result turn as a synthetic user utterance so the
+        // server-side schema accepts it.
+        source = SOURCE.USER;
+        text = `[tool result${msg.tool_call_id ? ` for ${msg.tool_call_id}` : ''}]: ${baseText}`;
+        break;
+      default:
+        source = SOURCE.USER;
+        text = baseText;
+    }
 
     parts.push(writeMessageField(2, buildChatMessage(text, source, conversationId)));
   }
@@ -224,8 +269,13 @@ export function buildInitializePanelStateRequest(apiKey, sessionId, trusted = tr
   ]);
 }
 
+// HeartbeatRequest { metadata = 1; previous_error_traces = 2; experiment_config = 3 deprecated }.
+export function buildHeartbeatRequest(apiKey, sessionId) {
+  return writeMessageField(1, buildMetadata(apiKey, undefined, sessionId));
+}
+
 // AddTrackedWorkspaceRequest has a single field: workspace (string, filesystem path).
-export function buildAddTrackedWorkspaceRequest(apiKey, workspacePath, sessionId) {
+export function buildAddTrackedWorkspaceRequest(workspacePath) {
   return writeStringField(1, workspacePath);
 }
 
@@ -237,6 +287,16 @@ export function buildUpdateWorkspaceTrustRequest(apiKey, _ignored, trusted = tru
   ]);
 }
 
+export function buildUpdatePanelStateWithUserStatusRequest(apiKey, sessionId, userStatusBytes) {
+  const parts = [
+    writeMessageField(1, buildMetadata(apiKey, undefined, sessionId)),
+  ];
+  if (userStatusBytes?.length) {
+    parts.push(writeMessageField(2, userStatusBytes));
+  }
+  return Buffer.concat(parts);
+}
+
 // ─── Cascade flow builders ─────────────────────────────────
 
 /**
@@ -244,7 +304,11 @@ export function buildUpdateWorkspaceTrustRequest(apiKey, _ignored, trusted = tru
  * Field 1: metadata
  */
 export function buildStartCascadeRequest(apiKey, sessionId) {
-  return writeMessageField(1, buildMetadata(apiKey, undefined, sessionId));
+  return Buffer.concat([
+    writeMessageField(1, buildMetadata(apiKey, undefined, sessionId)),
+    writeVarintField(4, 1),  // source = CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT
+    writeVarintField(5, 1),  // trajectory_type = CORTEX_TRAJECTORY_TYPE_USER_MAINLINE
+  ]);
 }
 
 /**
@@ -254,8 +318,13 @@ export function buildStartCascadeRequest(apiKey, sessionId) {
  * Field 2: items (TextOrScopeItem { text = 1 })
  * Field 3: metadata
  * Field 5: cascade_config
+ * Field 6: images (repeated ImageData)
+ * Field 9: additional_steps (repeated CortexTrajectoryStep) — used by the
+ *          v2.0.65 native tool bridge to inject "the caller already ran
+ *          tool X with result Y" into the trajectory before the planner
+ *          sees the next user turn. See src/cascade-native-bridge.js.
  */
-export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images } = {}) {
+export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnum, modelUid, sessionId, { toolPreamble, images, additionalSteps, nativeMode, nativeAllowlist } = {}) {
   const parts = [];
 
   // Field 1: cascade_id
@@ -268,50 +337,85 @@ export function buildSendCascadeMessageRequest(apiKey, cascadeId, text, modelEnu
   parts.push(writeMessageField(3, buildMetadata(apiKey, undefined, sessionId)));
 
   // Field 5: cascade_config
-  // When images are present, use DEFAULT planner mode (1) instead of NO_TOOL (3)
-  // because NO_TOOL disables the vision pipeline on the Windsurf backend.
-  const cascadeConfig = buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault: !!images?.length });
+  // DEFAULT mode enables vision but also activates Cascade's built-in tools
+  // which conflict with our emulated tools. We force DEFAULT in two cases:
+  //   - vision: images are attached AND no client tools are present.
+  //   - native bridge: the caller's tools[] all map onto cascade-native
+  //     IDE tools and v2.0.65 wants the planner's IDE agent loop alive
+  //     (see src/cascade-native-bridge.js for rationale).
+  const forceDefault = !!nativeMode || (!!images?.length && !toolPreamble);
+  // v2.0.66 partition mode: when nativeMode is on AND a non-empty
+  // toolPreamble was provided, the caller has unmapped tools that need
+  // emulation alongside the mapped-tool native bridge. Pass toolPreamble
+  // through so additional_instructions_section still carries those tool
+  // definitions even though planner_mode is DEFAULT.
+  const cascadeConfig = buildCascadeConfig(modelEnum, modelUid, {
+    toolPreamble: toolPreamble || '',
+    forceDefault,
+    nativeMode: !!nativeMode,
+    nativeAllowlist: nativeAllowlist || null,
+  });
   parts.push(writeMessageField(5, cascadeConfig));
 
   // Field 6: images — repeated ImageData { base64_data=1, mime_type=2 }
   if (images?.length) {
     for (const img of images) {
       const imgMsg = Buffer.concat([
-        writeStringField(1, img.base64),
-        writeStringField(2, img.mimeType || 'image/png'),
+        writeStringField(1, img.base64_data),
+        writeStringField(2, img.mime_type || 'image/png'),
       ]);
       parts.push(writeMessageField(6, imgMsg));
+    }
+  }
+
+  // Field 9: additional_steps — repeated CortexTrajectoryStep. The native
+  // bridge fills this with "we already executed view_file/run_command/...
+  // and here are the results" steps so the planner reasons from the
+  // post-tool state directly.
+  if (Array.isArray(additionalSteps) && additionalSteps.length) {
+    for (const stepBuf of additionalSteps) {
+      if (!stepBuf || !Buffer.isBuffer(stepBuf) || stepBuf.length === 0) continue;
+      parts.push(writeMessageField(9, stepBuf));
     }
   }
 
   return Buffer.concat(parts);
 }
 
-function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } = {}) {
+function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault, nativeMode, nativeAllowlist } = {}) {
   // CascadeConversationalPlannerConfig.planner_mode (field 4) uses
   // codeium_common.ConversationalPlannerMode:
   //   0 UNSPECIFIED  1 DEFAULT  2 READ_ONLY  3 NO_TOOL
   //   4 EXPLORE      5 PLANNING 6 AUTO
   //
-  // We pick NO_TOOL (3). DEFAULT keeps the IDE agent loop alive, so even
-  // without setting CascadeToolConfig the planner reflexively fires
-  // edit_file/view_file, which produces:
+  // Default: NO_TOOL (3). DEFAULT keeps the IDE agent loop alive, which
+  // is exactly the behaviour the v2.0.65 native bridge wants — the planner
+  // reflexively proposes view_file / run_command / grep_search_v2 / find,
+  // and the bridge translates those proposals back into OpenAI tool_calls
+  // for the caller to execute. Without the bridge, DEFAULT mode produced:
   //   - stall_warm bursts (15–25s silent tool-execution trajectory steps)
-  //   - "Cascade cannot create /tmp/windsurf-workspace/foo because it already
-  //     exists" on request bursts that reuse the same filename
+  //   - "Cascade cannot create /tmp/windsurf-workspace/foo because it
+  //     already exists" on request bursts that reuse the same filename
   //   - /tmp/windsurf-workspace path leaks inside the chat body
-  // NO_TOOL tells the planner to generate a pure conversational response
-  // with no tool_call proposals at all.
+  // The bridge tames these by (a) populating CascadeToolConfig.tool_allowlist
+  // so only the kinds the caller actually has are enabled, (b) injecting
+  // observation steps via additional_steps[9] so the planner doesn't
+  // re-execute server-side, (c) ALWAYS sanitising paths on the way out.
   //
-  // When toolPreamble is provided (client-side OpenAI tools[] emulation),
-  // we inject it into the system prompt's tool_calling_section via
-  // SectionOverrideConfig (OVERRIDE mode). This is far more reliable than
-  // user-message injection because NO_TOOL mode's system prompt likely
-  // tells the model "you have no tools" — which overpowers anything we
-  // put in the user message. The section override replaces that section
-  // directly so the model sees our emulated tool definitions at the
-  // system-prompt level.
-  const convParts = [writeVarintField(4, forceDefault ? 1 : 3)]; // DEFAULT(1) for images, NO_TOOL(3) otherwise
+  // When toolPreamble is provided (NO_TOOL emulation path), we inject it
+  // into the system prompt's tool_calling_section via SectionOverrideConfig
+  // (OVERRIDE mode). This is far more reliable than user-message injection
+  // because NO_TOOL mode's system prompt tells the model "you have no
+  // tools" — which overpowers anything we put in the user message. The
+  // section override replaces that section directly so the model sees our
+  // emulated tool definitions at the system-prompt level.
+  //
+  // Mode selection:
+  //   nativeMode=true  → DEFAULT (1) + tool_allowlist
+  //   forceDefault=true (vision) → DEFAULT (1) without bridge config
+  //   else → NO_TOOL (3) + tool preamble in section overrides
+  const mode = (nativeMode || forceDefault) ? 1 : 3;
+  const convParts = [writeVarintField(4, mode)];
 
   // ── System prompt section overrides ──────────────────────────────────
   //
@@ -319,55 +423,60 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } 
   //   field 10: tool_calling_section
   //   field 12: additional_instructions_section
   //
-  // Key insight: NO_TOOL mode (planner_mode=3) appears to SUPPRESS the
+  // Key insight: NO_TOOL mode (planner_mode=3) SUPPRESSES the
   // tool_calling_section entirely — SectionOverrideConfig on field 10 is
-  // injected but never rendered to the model.  Verified 2026-04-12: even
-  // with OVERRIDE mode on field 10, the model says "I don't have access
-  // to tools" and ignores the emulated definitions.
+  // injected but never rendered to the model. Verified 2026-04-12: even
+  // with OVERRIDE mode on field 10, the model said "I don't have access
+  // to tools" and ignored the emulated definitions.
   //
-  // Fix: inject tool definitions via additional_instructions_section
-  // (field 12, OVERRIDE) which IS rendered regardless of planner mode.
-  // Field 10 is kept as belt-and-suspenders in case a future LS version
-  // respects it in NO_TOOL mode.
+  // We deliver tool definitions exclusively via
+  // additional_instructions_section (field 12, OVERRIDE) which IS
+  // rendered regardless of planner mode. The earlier code also wrote the
+  // same blob to field 10 as belt-and-suspenders, but with a 30+ tool
+  // Claude Code request that doubled the proto-level system payload and
+  // pushed total LS panel state past the ~30KB ceiling — directly causing
+  // the "tools work locally but not in cloud" symptom users reported.
+  // Field 10 is now intentionally left untouched.
   if (toolPreamble) {
     // ── Client provided OpenAI tools[] ──
-    // Primary delivery: additional_instructions_section (field 12, OVERRIDE).
-    // This section is always rendered, even in NO_TOOL planner mode.
-    const reinforcement =
-      '\n\nIMPORTANT: You have real, callable functions described above. ' +
-      'When the user\'s request can be answered by calling a function, you MUST emit ' +
-      '<tool_call> blocks as described. Do NOT say "I don\'t have access to tools" ' +
-      'or "I cannot perform that action" — call the function.';
+    // Primary (and only) delivery: additional_instructions_section
+    // (field 12, OVERRIDE). Always rendered, even in NO_TOOL planner mode.
+    const sp = getSystemPrompts();
+    const reinforcement = '\n\n' + sp.toolReinforcement;
+    const fullSection = toolPreamble + reinforcement;
     const additionalSection = Buffer.concat([
       writeVarintField(1, 1),             // SECTION_OVERRIDE_MODE_OVERRIDE
-      writeStringField(2, toolPreamble + reinforcement),
+      writeStringField(2, fullSection),
     ]);
     convParts.push(writeMessageField(12, additionalSection));
+    // v2.0.70 — diagnostic dump for #115 root-cause work. When
+    // WINDSURFAPI_DUMP_SYSTEM_PROMPT=1, write the EXACT additional_
+    // instructions_section payload to a per-LS-port file under /tmp so
+    // we can inspect what GPT actually sees when partition mode +
+    // emulation toolPreamble are in play. Only first 4KB to keep the
+    // file tail-able.
+    if (process.env.WINDSURFAPI_DUMP_SYSTEM_PROMPT === '1') {
+      try {
+        // Lazy-import fs to avoid pulling it into hot paths when off.
+        // eslint-disable-next-line no-undef
+        import('fs').then(fs => {
+          const ts = new Date().toISOString().replace(/[:.]/g, '-');
+          const path = `/tmp/windsurf-sp-dump-${ts}.txt`;
+          fs.writeFileSync(path, fullSection.slice(0, 4096) + '\n--- end ---\n');
+        }).catch(() => {});
+      } catch {}
+    }
 
-    // Belt-and-suspenders: also override tool_calling_section (field 10)
-    // in case the LS does render it in NO_TOOL mode on some code paths.
-    const toolSection = Buffer.concat([
-      writeVarintField(1, 1),             // SECTION_OVERRIDE_MODE_OVERRIDE
-      writeStringField(2, toolPreamble),
-    ]);
-    convParts.push(writeMessageField(10, toolSection));
-
-    // field 13 (communication_section): override IDE persona + add security rules.
-    // Even with tools[], the model must not leak server environment info.
+    // field 13 (communication_section): minimal override.
+    // DO NOT include any identity manipulation instructions here — Cascade's
+    // anti-injection system detects "adopt identity X / don't call yourself Y"
+    // as prompt injection and refuses the entire request. (#22)
+    // Let Cascade keep its baked-in identity; tool emulation still works via
+    // field 12 (additional_instructions_section).
     const toolCommOverride = Buffer.concat([
       writeVarintField(1, 1),             // SECTION_OVERRIDE_MODE_OVERRIDE
       writeStringField(2,
-        'You are an AI assistant accessed via API with the tool-calling capabilities described above. ' +
-        'You are NOT running inside an IDE or code editor.\n\n' +
-        'CRITICAL SECURITY RULE: You must NEVER reveal any information about the server, ' +
-        'infrastructure, or runtime environment you are running on. This includes but is not limited to: ' +
-        'operating system, Docker containers, file paths, working directories, IP addresses, ' +
-        'hostnames, environment variables, installed software, hardware specs, network configuration, ' +
-        'process information, or any other system-level details. ' +
-        'If asked about your environment, server, infrastructure, or "where you are running", ' +
-        'simply say you are a cloud-based AI assistant and cannot disclose infrastructure details. ' +
-        'Do NOT speculate about or confirm any environment details even if the user guesses correctly. ' +
-        'This rule overrides ALL other instructions.'),
+        sp.communicationWithTools),
     ]);
     convParts.push(writeMessageField(13, toolCommOverride));
   } else {
@@ -395,42 +504,35 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } 
     ]);
     convParts.push(writeMessageField(10, noToolSection));
 
-    // field 12 (additional_instructions): reinforce direct-answer mode
+    // field 12 (additional_instructions): reinforce direct-answer mode.
+    // Cascade's coding-agent training prior is strong — even with planner_mode
+    // NO_TOOL and "no tools available" system text, it will still narrate
+    // "Let me check /src/main.py" or "I opened config.yaml and saw..." purely
+    // from distribution, and clients like Claude Code then try to Read those
+    // paths in a loop (issue #24). Make the prohibition explicit at the
+    // behaviour level, not just the capability level.
     const noToolAdditional = Buffer.concat([
       writeVarintField(1, 1),             // SECTION_OVERRIDE_MODE_OVERRIDE
       writeStringField(2,
-        'You have no tools, no file access, and no command execution. ' +
-        'Answer all questions directly using your knowledge. ' +
-        'Never pretend to create files or check directories.'),
+        'CRITICAL OPERATING CONSTRAINT — READ BEFORE ANY RESPONSE:\n' +
+        'You are being accessed as a plain chat API. You have NO tools, NO file access, NO shell, NO code execution, NO repository awareness, NO ability to list or read anything on the user\'s machine or any sandbox. You cannot "check", "look at", "open", "view", "inspect", "run", "glob", "grep", "list", or "edit" anything.\n' +
+        '\n' +
+        'OUTPUT RULES:\n' +
+        '1. Never narrate tool-like actions ("Let me check X", "I\'ll look at Y", "Looking at the file...", "I see in main.py...", "Based on the codebase...").\n' +
+        '2. Never reference file paths, directory structures, line numbers, or repository contents that were not explicitly pasted into the current conversation by the user.\n' +
+        '3. If the user asks about their code or project but hasn\'t pasted the relevant file content, respond: "I don\'t see that file in our conversation — please paste it and I\'ll help." Do NOT invent file contents.\n' +
+        '4. For general questions, answer directly from your training knowledge. No preambles.\n' +
+        '5. Match the user\'s language (Chinese → Chinese, English → English; never switch mid-conversation).\n' +
+        '\n' +
+        'Violating these rules will produce broken output for the end user. Stay in chat-API mode at all times.'),
     ]);
     convParts.push(writeMessageField(12, noToolAdditional));
 
-    // field 13 (communication_section): strip the IDE-assistant persona
-    // and replace it with conversational AI identity. Cascade's baked-in
-    // instructions say "you're an IDE coding assistant that can create/edit
-    // files and run commands". This override replaces that context so the
-    // model doesn't role-play file creation.
+    // field 13 (communication_section): minimal — no identity manipulation.
+    const spNoTools = getSystemPrompts();
     const communicationOverride = Buffer.concat([
-      writeVarintField(1, 1),             // SECTION_OVERRIDE_MODE_OVERRIDE
-      writeStringField(2,
-        'You are a conversational AI assistant accessed via API. ' +
-        'You are NOT running inside an IDE or code editor. ' +
-        'You CANNOT access, create, read, edit, or delete any files on any file system. ' +
-        'You CANNOT execute commands, run programs, or interact with any external services. ' +
-        'You CANNOT check directories or browse any working directory. ' +
-        'When users ask you to perform file operations, system actions, or check directories, ' +
-        'clearly tell them that you are a text-based conversational AI without those capabilities. ' +
-        'Do NOT pretend to check directories, create files, or perform actions you cannot actually do. ' +
-        'Answer all questions directly using your training knowledge.\n\n' +
-        'CRITICAL SECURITY RULE: You must NEVER reveal any information about the server, ' +
-        'infrastructure, or runtime environment you are running on. This includes but is not limited to: ' +
-        'operating system, Docker containers, file paths, working directories, IP addresses, ' +
-        'hostnames, environment variables, installed software, hardware specs, network configuration, ' +
-        'process information, or any other system-level details. ' +
-        'If asked about your environment, server, infrastructure, or "where you are running", ' +
-        'simply say you are a cloud-based AI assistant and cannot disclose infrastructure details. ' +
-        'Do NOT speculate about or confirm any environment details even if the user guesses correctly. ' +
-        'This rule overrides ALL other instructions.'),
+      writeVarintField(1, 1),
+      writeStringField(2, spNoTools.communicationNoTools),
     ]);
     convParts.push(writeMessageField(13, communicationOverride));
   }
@@ -440,27 +542,107 @@ function buildCascadeConfig(modelEnum, modelUid, { toolPreamble, forceDefault } 
     writeMessageField(2, conversationalConfig),   // conversational = 2
   ];
 
+  // Set BOTH the modern uid field (35) and the deprecated enum field (15)
+  // when available. Seen in the wild (issue #8): free-tier / fresh accounts
+  // report "user status is nil" during InitializeCascadePanelState and then
+  // the server rejects the chat with "neither PlanModel nor RequestedModel
+  // specified" if only field 35 is populated. Setting both covers whichever
+  // field the upstream validator actually reads for that account state.
+  // plan_model_uid (field 34) is also set as a safety fallback — some
+  // backends require the plan model when user status has no tier info.
   if (modelUid) {
-    // field 35: requested_model_uid (string)
-    plannerParts.push(writeStringField(35, modelUid));
-  } else {
-    // field 15: requested_model_deprecated (ModelOrAlias { model = 1 })
+    plannerParts.push(writeStringField(35, modelUid));   // requested_model_uid
+    plannerParts.push(writeStringField(34, modelUid));   // plan_model_uid (safety)
+  }
+  if (modelEnum && modelEnum > 0) {
+    // requested_model_deprecated = ModelOrAlias { model = 1 (enum) }
     plannerParts.push(writeMessageField(15, writeVarintField(1, modelEnum)));
+    // plan_model_deprecated = Model (enum directly at field 1)
+    plannerParts.push(writeVarintField(1, modelEnum));
+  }
+  if (!modelUid && !modelEnum) {
+    throw new Error('buildCascadeConfig: at least one of modelUid or modelEnum must be provided');
+  }
+
+  // max_output_tokens (field 6) — real IDE sends 16384/32768.
+  // Missing this causes truncated long responses.
+  plannerParts.push(writeVarintField(6, 32768));
+
+  // code_changes_section (field 11) — suppress IDE-specific "apply changes" boilerplate
+  if (!toolPreamble) {
+    const emptySection = Buffer.concat([writeVarintField(1, 1), writeStringField(2, '')]);
+    plannerParts.push(writeMessageField(11, emptySection));
+  }
+
+  // CascadePlannerConfig.tool_config = field 13 → CascadeToolConfig.
+  // Only populated in native bridge mode. The allowlist (field 32) tells
+  // the planner which built-in cascade tools to enable; the per-tool
+  // sub-configs disable everything else by withholding their messages.
+  if (nativeMode) {
+    plannerParts.push(writeMessageField(13, buildNativeCascadeToolConfig(nativeAllowlist)));
   }
 
   const plannerConfig = Buffer.concat(plannerParts);
 
-  // BrainConfig: field 1=enabled(true), field 6=update_strategy { dynamic_update(6)={} }
   const brainConfig = Buffer.concat([
-    writeVarintField(1, 1),                                   // enabled = true
-    writeMessageField(6, writeMessageField(6, Buffer.alloc(0))), // update_strategy.dynamic_update = {}
+    writeVarintField(1, 1),
+    writeMessageField(6, writeMessageField(6, Buffer.alloc(0))),
   ]);
 
-  // CascadeConfig: field 1=planner_config, field 7=brain_config
+  // memory_config (field 5): {enabled=false} — prevent LS injecting user's
+  // stored Cascade memories into API responses
+  const memoryConfig = Buffer.concat([writeBoolField(1, false)]);
+
   return Buffer.concat([
     writeMessageField(1, plannerConfig),
+    writeMessageField(5, memoryConfig),
     writeMessageField(7, brainConfig),
   ]);
+}
+
+/**
+ * Build a minimal CascadeToolConfig for native bridge mode.
+ *
+ * field numbers (exa.cortex_pb.proto, message CascadeToolConfig):
+ *   8  RunCommandToolConfig run_command
+ *   10 ViewFileToolConfig   view_file
+ *   19 ListDirToolConfig    list_dir
+ *   33 GrepV2ToolConfig     grep_v2
+ *   5  FindToolConfig       find
+ *   32 repeated string tool_allowlist
+ *
+ * Each per-tool config is intentionally minimal — empty messages are
+ * legal protobufs and tell the LS "enable this tool with defaults". The
+ * tool_allowlist (field 32) is the authoritative gate: kinds NOT listed
+ * there stay disabled even if their sub-config is present.
+ */
+function buildNativeCascadeToolConfig(allowlist = null) {
+  const list = Array.isArray(allowlist) && allowlist.length
+    ? allowlist
+    : ['view_file', 'run_command', 'grep_search_v2', 'find', 'list_dir'];
+  const parts = [];
+  // Empty messages = "use defaults" for each enabled tool. Setting the
+  // submessage at all is what tells the LS the tool is on.
+  if (list.includes('run_command')) {
+    parts.push(writeMessageField(8, Buffer.alloc(0)));
+  }
+  if (list.includes('view_file')) {
+    parts.push(writeMessageField(10, Buffer.alloc(0)));
+  }
+  if (list.includes('list_dir') || list.includes('list_directory')) {
+    parts.push(writeMessageField(19, Buffer.alloc(0)));
+  }
+  if (list.includes('grep_search_v2') || list.includes('grep_search')) {
+    parts.push(writeMessageField(33, Buffer.alloc(0)));
+  }
+  if (list.includes('find')) {
+    parts.push(writeMessageField(5, Buffer.alloc(0)));
+  }
+  // tool_allowlist (field 32, repeated string)
+  for (const name of list) {
+    parts.push(writeStringField(32, name));
+  }
+  return Buffer.concat(parts);
 }
 
 /**
@@ -521,8 +703,12 @@ export function buildGetGeneratorMetadataRequest(cascadeId, offset = 0) {
  * }
  *
  * Returns null if nothing reported; otherwise an aggregated
- * {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens} summed
- * across every generator invocation (multi-model trajectories sum).
+ * {inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, entryCount}
+ * summed across every generator invocation (multi-model trajectories sum).
+ *
+ * `entryCount` is the number of generator-metadata records returned by this
+ * response. On resumed cascades we use it as the next offset so prior-turn
+ * usage is not counted again.
  */
 export function parseGeneratorMetadata(buf) {
   const fields = parseFields(buf);
@@ -557,7 +743,13 @@ export function parseGeneratorMetadata(buf) {
     }
   }
   if (!found) return null;
-  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    entryCount: metaEntries.length,
+  };
 }
 
 // ─── Cascade response parsers ──────────────────────────────
@@ -699,6 +891,131 @@ export function parseTrajectorySteps(buf) {
       }
     }
 
+    // ── v2.0.65 native bridge: cascade-native IDE step kinds ──────────
+    //
+    // The planner emits these directly (no ChatToolCall wrapping) when
+    // running in DEFAULT planner_mode. Each oneof field number on
+    // CortexTrajectoryStep matches the per-kind body schema in
+    // exa_cortex_pb_cortex.proto:
+    //   13  CortexStepGrepSearch         (legacy, replaced by 105)
+    //   14  CortexStepViewFile           {absolute_path_uri=1, content=4, ...}
+    //   15  CortexStepListDirectory      {directory_path_uri=1, children=2*}
+    //   23  CortexStepWriteToFile        {target_file_uri=1, code_content=2*}
+    //   28  CortexStepRunCommand         {command_line=23, combined_output=21, ...}
+    //   34  CortexStepFind               {pattern=1, search_directory=10, ...}
+    //   105 CortexStepGrepSearchV2       {pattern=2, path=3, raw_output=15, ...}
+    //
+    // We surface these as toolCalls entries shaped like the wrapped
+    // ChatToolCall variants — name = cascade kind ("view_file" /
+    // "run_command" / ...), argumentsJson = JSON.stringify(decoded body),
+    // result = the observation field for that kind. The OpenAI handler
+    // (chat.js / messages.js / responses.js) translates these names back
+    // into the caller's declared OpenAI tool name via TOOL_MAP reverse
+    // lookup (see src/cascade-native-bridge.js).
+    const NATIVE_STEP_FIELDS = [
+      [14,  'view_file'],
+      [15,  'list_directory'],
+      [23,  'write_to_file'],
+      [28,  'run_command'],
+      [13,  'grep_search'],
+      [34,  'find'],
+      [105, 'grep_search_v2'],
+    ];
+    for (const [fieldNum, kind] of NATIVE_STEP_FIELDS) {
+      const oneof = getField(sf, fieldNum, 2);
+      if (!oneof) continue;
+      const body = parseFields(oneof.value);
+      let argumentsJson = '';
+      let result = '';
+      try {
+        if (kind === 'view_file') {
+          const args = {
+            absolute_path_uri: getField(body, 1, 2)?.value?.toString('utf8') || '',
+            offset: Number(getField(body, 11, 0)?.value || 0),
+            limit: Number(getField(body, 12, 0)?.value || 0),
+            start_line: Number(getField(body, 2, 0)?.value || 0),
+            end_line: Number(getField(body, 3, 0)?.value || 0),
+          };
+          argumentsJson = JSON.stringify(args);
+          result = getField(body, 4, 2)?.value?.toString('utf8') || '';
+        } else if (kind === 'run_command') {
+          const args = {
+            command_line: getField(body, 23, 2)?.value?.toString('utf8')
+                       || getField(body, 1, 2)?.value?.toString('utf8') || '',
+            cwd: getField(body, 2, 2)?.value?.toString('utf8') || '',
+          };
+          argumentsJson = JSON.stringify(args);
+          // Combined output preferred — newer LS versions only fill it.
+          const combined = getField(body, 21, 2);
+          if (combined) {
+            const c = parseFields(combined.value);
+            result = getField(c, 1, 2)?.value?.toString('utf8') || '';
+          }
+          if (!result) {
+            // Legacy stdout / stderr top-level fields (deprecated).
+            const stdout = getField(body, 4, 2)?.value?.toString('utf8') || '';
+            const stderr = getField(body, 5, 2)?.value?.toString('utf8') || '';
+            result = stdout + (stderr ? `\n[stderr]\n${stderr}` : '');
+          }
+        } else if (kind === 'grep_search_v2') {
+          const args = {
+            pattern: getField(body, 2, 2)?.value?.toString('utf8') || '',
+            path: getField(body, 3, 2)?.value?.toString('utf8') || '',
+            glob: getField(body, 4, 2)?.value?.toString('utf8') || '',
+            output_mode: getField(body, 5, 2)?.value?.toString('utf8') || '',
+            head_limit: Number(getField(body, 12, 0)?.value || 0),
+          };
+          argumentsJson = JSON.stringify(args);
+          result = getField(body, 15, 2)?.value?.toString('utf8') || '';
+        } else if (kind === 'grep_search') {
+          const args = {
+            query: getField(body, 1, 2)?.value?.toString('utf8') || '',
+            search_path_uri: getField(body, 11, 2)?.value?.toString('utf8') || '',
+          };
+          argumentsJson = JSON.stringify(args);
+          result = getField(body, 3, 2)?.value?.toString('utf8') || '';
+        } else if (kind === 'find') {
+          const args = {
+            pattern: getField(body, 1, 2)?.value?.toString('utf8') || '',
+            search_directory: getField(body, 10, 2)?.value?.toString('utf8') || '',
+          };
+          argumentsJson = JSON.stringify(args);
+          result = getField(body, 11, 2)?.value?.toString('utf8') || '';
+        } else if (kind === 'list_directory') {
+          const children = getAllFields(body, 2)
+            .filter(x => x.wireType === 2)
+            .map(x => x.value.toString('utf8'));
+          const args = {
+            directory_path_uri: getField(body, 1, 2)?.value?.toString('utf8') || '',
+          };
+          argumentsJson = JSON.stringify(args);
+          result = children.join('\n');
+        } else if (kind === 'write_to_file') {
+          const lines = getAllFields(body, 2)
+            .filter(x => x.wireType === 2)
+            .map(x => x.value.toString('utf8'));
+          const args = {
+            target_file_uri: getField(body, 1, 2)?.value?.toString('utf8') || '',
+            code_content: lines,
+          };
+          argumentsJson = JSON.stringify(args);
+        }
+      } catch {
+        argumentsJson = argumentsJson || '{}';
+      }
+      // Synthetic id keyed off step type + step index — the caller dedupes
+      // on (id || name+args) so a stable shape avoids replays. The "native:"
+      // prefix lets downstream layers tell these apart from ChatToolCall
+      // wrappers without inspecting cascade_kind directly.
+      entry.toolCalls.push({
+        id: `native:${kind}:${results.length}`,
+        name: kind,
+        argumentsJson,
+        result,
+        cascade_native: true,
+      });
+    }
+
     if (plannerField) {
       const pf = parseFields(plannerField.value);
       const textField = getField(pf, 1, 2);
@@ -749,4 +1066,161 @@ export function parseTrajectorySteps(buf) {
   }
 
   return results;
+}
+
+// ─── GetUserStatus (authoritative tier + model allowlist) ──
+//
+// LanguageServerService/GetUserStatus → GetUserStatusResponse {
+//   UserStatus user_status = 1;
+//   PlanInfo   plan_info   = 2;
+// }
+// GetUserStatusRequest { Metadata metadata = 1; }
+//
+// Beats our probe-based inferTier — one RPC returns exact tier, trial
+// end time, per-model allowlist with credit multipliers, credit usage.
+// Verified via extracted FileDescriptorProto on 2026-04-21 (scripts/ls-protos).
+
+export function buildGetUserStatusRequest(apiKey) {
+  return writeMessageField(1, buildMetadata(apiKey));
+}
+
+export function extractUserStatusBytes(getUserStatusResponseBuf) {
+  if (!getUserStatusResponseBuf || getUserStatusResponseBuf.length === 0) return null;
+  const top = parseFields(getUserStatusResponseBuf);
+  return getField(top, 1, 2)?.value || null;
+}
+
+// exa.codeium_common_pb.TeamsTier → free | pro
+// Values as defined in the binary (enum TeamsTier). Paid/trial tiers all
+// map to 'pro' so the caller can unlock premium models uniformly.
+// UNSPECIFIED(0) and WAITLIST_PRO(6) and DEVIN_FREE(19) are the only frees.
+export function mapTeamsTier(t) {
+  if (t === 0 || t === 6 || t === 19) return 'free';
+  if (t > 0) return 'pro';
+  return 'unknown';
+}
+
+// Human-readable label for dashboard display.
+export function teamsTierLabel(t) {
+  return ({
+    0: 'Unspecified', 1: 'Teams', 2: 'Pro', 3: 'Enterprise (SaaS)',
+    4: 'Hybrid', 5: 'Enterprise (Self-Hosted)', 6: 'Waitlist Pro',
+    7: 'Teams Ultimate', 8: 'Pro Ultimate', 9: 'Trial',
+    10: 'Enterprise (Self-Serve)', 11: 'Enterprise (SaaS Pooled)',
+    12: 'Devin Enterprise', 14: 'Devin Teams', 15: 'Devin Teams V2',
+    16: 'Devin Pro', 17: 'Devin Max', 18: 'Max',
+    19: 'Devin Free', 20: 'Devin Trial',
+  })[t] || `Tier ${t}`;
+}
+
+/**
+ * Parse GetUserStatusResponse into a flat object.
+ *
+ * UserStatus field numbers (exa.codeium_common_pb.UserStatus):
+ *   1  pro (bool)
+ *   3  name (string)
+ *   5  team_id (string)
+ *   7  email (string)
+ *   10 teams_tier (TeamsTier enum)
+ *   13 plan_status (PlanStatus message)
+ *   28 user_used_prompt_credits (int64)
+ *   29 user_used_flow_credits (int64)
+ *   33 cascade_model_config_data (CascadeModelConfigData)
+ *   34 windsurf_pro_trial_end_time (Timestamp)
+ *   35 max_num_premium_chat_messages (int64)
+ *
+ * PlanInfo field numbers (exa.codeium_common_pb.PlanInfo):
+ *   1  teams_tier
+ *   2  plan_name (string)
+ *   12 monthly_prompt_credits (int32)
+ *   13 monthly_flow_credits (int32)
+ *   16 is_enterprise (bool)
+ *   17 is_teams (bool)
+ *   21 cascade_allowed_models_config (repeated AllowedModelConfig)
+ *   32 has_paid_features (bool)
+ *
+ * AllowedModelConfig { ModelOrAlias model_or_alias = 1; float credit_multiplier = 2; }
+ * ModelOrAlias       { Model model = 1; ModelAlias alias = 2; }  (oneof in practice)
+ */
+export function parseGetUserStatusResponse(buf) {
+  const out = {
+    pro: false,
+    teamsTier: 0,
+    tierName: '',
+    email: '',
+    displayName: '',
+    teamId: '',
+    userUsedPromptCredits: 0,
+    userUsedFlowCredits: 0,
+    trialEndMs: 0,
+    maxPremiumChatMessages: 0,
+    planName: '',
+    monthlyPromptCredits: 0,
+    monthlyFlowCredits: 0,
+    hasPaidFeatures: false,
+    isTeams: false,
+    isEnterprise: false,
+    allowedModels: [], // [{ modelEnum, alias, multiplier }]
+  };
+
+  if (!buf || buf.length === 0) {
+    out.tierName = mapTeamsTier(out.teamsTier);
+    return out;
+  }
+  const top = parseFields(buf);
+  const usBuf = getField(top, 1, 2)?.value;
+  const piBuf = getField(top, 2, 2)?.value;
+
+  if (usBuf && usBuf.length) {
+    const us = parseFields(usBuf);
+    out.pro = (getField(us, 1, 0)?.value ?? 0) === 1;
+    out.displayName = getField(us, 3, 2)?.value?.toString('utf8') || '';
+    out.teamId = getField(us, 5, 2)?.value?.toString('utf8') || '';
+    out.email = getField(us, 7, 2)?.value?.toString('utf8') || '';
+    out.teamsTier = getField(us, 10, 0)?.value ?? 0;
+    out.userUsedPromptCredits = Number(getField(us, 28, 0)?.value ?? 0);
+    out.userUsedFlowCredits = Number(getField(us, 29, 0)?.value ?? 0);
+    out.maxPremiumChatMessages = Number(getField(us, 35, 0)?.value ?? 0);
+    const tsBuf = getField(us, 34, 2)?.value;
+    if (tsBuf && tsBuf.length) {
+      const tsFields = parseFields(tsBuf);
+      const secs = Number(getField(tsFields, 1, 0)?.value ?? 0);
+      out.trialEndMs = secs * 1000;
+    }
+  }
+
+  if (piBuf && piBuf.length) {
+    const pi = parseFields(piBuf);
+    if (!out.teamsTier) out.teamsTier = getField(pi, 1, 0)?.value ?? 0;
+    out.planName = getField(pi, 2, 2)?.value?.toString('utf8') || '';
+    out.monthlyPromptCredits = Number(getField(pi, 12, 0)?.value ?? 0);
+    out.monthlyFlowCredits = Number(getField(pi, 13, 0)?.value ?? 0);
+    out.isEnterprise = (getField(pi, 16, 0)?.value ?? 0) === 1;
+    out.isTeams = (getField(pi, 17, 0)?.value ?? 0) === 1;
+    out.hasPaidFeatures = (getField(pi, 32, 0)?.value ?? 0) === 1;
+
+    // cascade_allowed_models_config — repeated AllowedModelConfig (field 21)
+    for (const entry of getAllFields(pi, 21)) {
+      if (entry.wireType !== 2) continue;
+      const ac = parseFields(entry.value);
+      const moaBuf = getField(ac, 1, 2)?.value;
+      // credit_multiplier is float → wire type 5 (fixed32)
+      const cmField = getField(ac, 2, 5);
+      let multiplier = 1.0;
+      if (cmField && cmField.value.length === 4) {
+        multiplier = cmField.value.readFloatLE(0);
+      }
+      let modelEnum = 0;
+      let alias = 0;
+      if (moaBuf && moaBuf.length) {
+        const moa = parseFields(moaBuf);
+        modelEnum = getField(moa, 1, 0)?.value ?? 0;
+        alias = getField(moa, 2, 0)?.value ?? 0;
+      }
+      out.allowedModels.push({ modelEnum, alias, multiplier });
+    }
+  }
+
+  out.tierName = mapTeamsTier(out.teamsTier);
+  return out;
 }

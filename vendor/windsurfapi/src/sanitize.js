@@ -22,40 +22,92 @@
  */
 
 // Detect the actual project root from this module's path so the sanitizer
-// covers deployments outside /root/WindsurfAPI.
+// covers deployments outside /root/WindsurfAPI (e.g. /srv/WindsurfAPI).
+import { fileURLToPath as _fileURLToPath } from 'url';
 const _repoRoot = (() => {
   try {
-    const thisFile = new URL(import.meta.url).pathname;
-    return thisFile.replace(/\/src\/sanitize\.js$/, '');
-  } catch { return '/root/WindsurfPoolAPI'; }
+    const thisFile = _fileURLToPath(import.meta.url);
+    // sanitize.js is in src/, so project root is one directory up.
+    // Handle both / and \ separators for cross-platform support.
+    return thisFile.replace(/[/\\]src[/\\]sanitize\.js$/, '');
+  } catch { return process.cwd(); }
 })();
 
+// Placeholder history: every marker has to avoid becoming either a fake path
+// the model reuses in tool calls or a fake answer the model repeats to users.
+//   ./tail                    → LLM Reads ./src/main.py → ENOENT → loops
+//   [internal]                → LLM runs `ls [internal]` → ENOENT → loops
+//   <redacted-path>           → LLM passes to Read/Bash → ENOENT (Linux) /
+//                               Errno 22 (Windows) → loops
+//   (internal path redacted)  → zsh parses `cd (internal path redacted)`
+//                               as glob-qualifier syntax → cryptic
+//                               "unknown file attribute: i" error
+//   redacted internal path    → Opus 4.7 echoes it verbatim into bash
+//                               commands; reads to the model as a
+//                               plausible directory name and the
+//                               failure mode is `cd: too many arguments`
+//                               which still wastes 2-3 turns
+//   …                         → avoids shell loops, but Sonnet 4.6 can echo
+//                               it in prose as "your path is …", causing a
+//                               user-visible answer loop when asked for the
+//                               project path.
+// Current marker is structural and explicit: it tells the user/model the
+// workspace path is intentionally hidden, without looking like a real absolute
+// path or a literal ellipsis answer. The proto/tool preamble also tells the
+// model not to answer project-path questions by echoing this marker.
+// Verified with the drift probe (scripts/_agent_drift_probe.py).
+const REDACTED_PATH = '<workspace>';
+
+// Path body char class: anything that's not whitespace or syntax-terminator.
+// Used in patterns and in cut-point detection — must match.
+// Note: `\\` is INSIDE the char class so backslash-separated tails (Windows
+// style: `\home\user\projects\workspace-x\src\index.js`) keep extending the
+// match instead of terminating at the first backslash.
 const PATTERNS = [
-  [/\/tmp\/windsurf-workspace(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
-  // Cascade sandbox workspace (per-account wsId). The model sees this path
-  // in its context and suggests it in tool calls — Claude Code then runs
-  // Read/Glob against a path that doesn't exist on the user's machine (#38).
-  [/\/home\/user\/projects\/workspace-[a-z0-9]+(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
-  [/\/opt\/windsurf(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
+  [/\/tmp\/windsurf-workspace(?:[/\\][^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
+  // Unix and Windows-mixed forms — issue #86 reports of
+  // `C:\home\user\projects\workspace-devinxse` leaking despite the Unix-only
+  // regex catching `/home/user/projects/workspace-skxwsx01`. Cover:
+  //   /home/user/projects/workspace-x[/...]
+  //   \home\user\projects\workspace-x[\...]
+  //   C:\home\user\projects\workspace-x[\...]
+  //   C:\home/user/projects/workspace-x  (mixed separators, GLM-style hallucination)
+  [/(?:[A-Za-z]:)?[/\\]home[/\\]user[/\\]projects[/\\]workspace-[a-z0-9]+(?:[/\\][^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
+  [/\/opt\/windsurf(?:[/\\][^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
+  [new RegExp(_repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:[/\\\\][^\\s"\'`<>)}\\],*;]*)?', 'g'), REDACTED_PATH],
+  // v2.0.78 (#108 zhangzhang-bit) — Cascade upstream injects these XML
+  // blocks into the system prompt to describe its sandbox state:
+  //   <workspace_information>...workspace path / metadata...</workspace_information>
+  //   <workspace_layout>...file tree...</workspace_layout>
+  //   <user_information>...account / config...</user_information>
+  // The model sometimes echoes them verbatim into its response, leaking
+  // server-internal sandbox state to API callers (the actual #108
+  // screenshot showed `workspace-devinxse` paths surrounded by these
+  // wrappers). Strip the entire block (greedy across newlines) — these
+  // are upstream-injected and have no legitimate reason to surface in
+  // client-facing output.
+  [/<workspace_information>[\s\S]*?<\/workspace_information>/gi, ''],
+  [/<workspace_layout>[\s\S]*?<\/workspace_layout>/gi, ''],
+  [/<user_information>[\s\S]*?<\/user_information>/gi, ''],
 ];
-// Dynamic repo-root pattern — only when the path is long enough to avoid
-// overly-broad matches (e.g. root "/" or "/tmp").
-if (_repoRoot.length > 10 && _repoRoot !== '/root/WindsurfPoolAPI') {
-  PATTERNS.push([new RegExp(_repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:\\/[^\\s"\'`<>)}\\],*;]*)?', 'g'), '[internal]']);
-}
-// /root/WindsurfPoolAPI is always redacted regardless of auto-detection
-PATTERNS.push([/\/root\/WindsurfPoolAPI(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]']);
+
+// Tags whose ENTIRE block (open → close) is upstream-injected and must
+// be held back during streaming until we see the closing tag — otherwise
+// chunk N might emit `<workspace_information>file:///home/user/proj...`
+// before chunk N+1 arrives with the rest. Used by PathSanitizeStream
+// alongside SENSITIVE_LITERALS.
+const STRIP_BLOCK_TAGS = ['workspace_information', 'workspace_layout', 'user_information'];
 
 // Bare literals (no path tail) used by the streaming cut-point finder.
+// Listed once per separator/prefix shape so the partial-prefix detection
+// can hold back the right tail length on stream chunks.
 const SENSITIVE_LITERALS = [
   '/tmp/windsurf-workspace',
   '/home/user/projects/workspace-',
+  '\\home\\user\\projects\\workspace-',
   '/opt/windsurf',
-  '/root/WindsurfPoolAPI',
+  _repoRoot,
 ];
-if (_repoRoot.length > 10 && _repoRoot !== '/root/WindsurfPoolAPI') {
-  SENSITIVE_LITERALS.push(_repoRoot);
-}
 
 // Character class that counts as part of a path body. Mirrors the PATTERNS
 // regex char class so cut-point detection matches replacement behaviour.
@@ -142,6 +194,39 @@ export class PathSanitizeStream {
       }
     }
 
+    // (3) v2.0.78 (#108) — XML block strip-tags. If the buffer contains
+    // an open `<workspace_information>` (etc.) without its matching
+    // close tag yet, hold the cut at the open-tag start so the next
+    // delta can extend the block; we only emit it once we see </tag>.
+    // Also handle the partial-prefix case where buffer ends with
+    // `<workspace_inform` (still being typed by the model).
+    for (const tag of STRIP_BLOCK_TAGS) {
+      const open = `<${tag}`;
+      const close = `</${tag}>`;
+      let searchFrom = 0;
+      while (searchFrom < len) {
+        const openIdx = buf.indexOf(open, searchFrom);
+        if (openIdx === -1) break;
+        const closeIdx = buf.indexOf(close, openIdx + open.length);
+        if (closeIdx === -1) {
+          // No close yet — hold from openIdx so the next feed can
+          // accumulate more of the block before we emit.
+          if (openIdx < cut) cut = openIdx;
+          break;
+        }
+        searchFrom = closeIdx + close.length;
+      }
+      // Partial-prefix tail of the open tag (`<workspace_inform`).
+      const openMax = Math.min(open.length - 1, len);
+      for (let plen = openMax; plen > 0; plen--) {
+        if (buf.endsWith(open.slice(0, plen))) {
+          const start = len - plen;
+          if (start < cut) cut = start;
+          break;
+        }
+      }
+    }
+
     return cut;
   }
 
@@ -153,11 +238,15 @@ export class PathSanitizeStream {
 }
 
 /**
- * Sanitize a native Cascade tool call (built-in tools like edit_file /
- * view_file) before surfacing to the client. Scrubs argumentsJson and
- * result. Not used on the hot path today — handlers/chat.js drops all
- * native tool calls in non-emulation mode rather than risking leakage —
- * but kept here for opt-in use.
+ * Sanitize a tool call before surfacing to the client. Covers three carriers
+ * a leaked path can ride:
+ *   - argumentsJson  (OpenAI-emulated + legacy native)
+ *   - result         (native Cascade tool result)
+ *   - input          (Anthropic-format parsed input dict — the hot path
+ *                     used by Claude Code streaming, issue #38)
+ * Without the `input` scrub, the stream handler would emit a tool_use
+ * delta whose file_path still references /home/user/projects/workspace-x
+ * and Claude Code would try to Read a path that doesn't exist locally.
  */
 export function sanitizeToolCall(tc) {
   if (!tc) return tc;

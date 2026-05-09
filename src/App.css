@@ -562,9 +562,9 @@ h2 {
   max-width: min(420px, calc(100vw - 56px));
   display: grid;
   grid-template-columns: 16px minmax(0, 1fr) 24px;
-  align-items: center;
+  align-items: start;
   gap: 10px;
-  padding: 0 10px 0 13px;
+  padding: 10px 10px 10px 13px;
   border: 1px solid color-mix(in srgb, var(--toast-accent) 32%, var(--line));
   border-left-width: 3px;
   border-radius: 8px;
@@ -590,14 +590,15 @@ h2 {
 }
 
 .toast-icon {
+  margin-top: 2px;
   color: var(--toast-accent);
 }
 
 .toast-text {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .toast-text b {
@@ -2458,7 +2459,7 @@ textarea:focus {
 
 .windsurf-api-toggle:disabled {
   opacity: 0.5;
-  cursor: wait;
+  cursor: not-allowed;
 }
 
 .windsurf-api-grid {
@@ -2784,15 +2785,21 @@ textarea:focus {
 /* ── Reasoning Effort segmented ── */
 .effort-segments {
   display: inline-flex;
+  align-items: center;
+  min-height: 46px;
   padding: 3px;
   gap: 2px;
   background: var(--surface-soft);
   border: 1px solid var(--line-soft);
   border-radius: 8px;
+  box-sizing: border-box;
 }
 
 .effort-segment {
+  display: grid;
+  place-items: center;
   min-width: 58px;
+  height: 38px;
   padding: 4px 10px;
   background: transparent;
   border: 0;
@@ -2820,7 +2827,18 @@ textarea:focus {
   opacity: 0.55;
 }
 
+.effort-segments.unsupported {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
 .effort-segment:disabled {
+  cursor: not-allowed;
+}
+
+.effort-segment.placeholder {
+  display: grid;
+  place-items: center;
   cursor: not-allowed;
 }
 
@@ -2835,6 +2853,7 @@ textarea:focus {
   grid-template-columns: minmax(0, 1fr) minmax(220px, 260px);
   align-items: center;
   gap: 18px;
+  min-height: 78px;
   padding: 14px;
   border: 1px solid var(--line-soft);
   border-radius: 12px;
@@ -2857,13 +2876,6 @@ textarea:focus {
   color: var(--text-soft);
   font-size: 12px;
   line-height: 1.45;
-}
-
-.api-config-muted {
-  justify-self: start;
-  color: var(--text-soft);
-  font-size: 12px;
-  font-weight: 500;
 }
 
 .model-select-option-clear {

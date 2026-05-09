@@ -1,3 +1,10 @@
+/**
+ * POST /v1/responses - OpenAI Responses API compatibility layer.
+ *
+ * Translates Responses requests to the internal Chat Completions handler and
+ * adapts Chat SSE chunks back into Responses SSE events.
+ */
+
 import { randomUUID } from 'crypto';
 import { handleChatCompletions } from './chat.js';
 import { log } from '../config.js';
@@ -20,6 +27,11 @@ function stringifyMaybe(value) {
   try { return JSON.stringify(value); } catch { return String(value); }
 }
 
+function safeJsonParse(value) {
+  if (typeof value !== 'string' || !value) return null;
+  try { return JSON.parse(value); } catch { return null; }
+}
+
 function normalizeMessageContent(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return stringifyMaybe(content);
@@ -38,21 +50,194 @@ function normalizeMessageContent(content) {
   return out.length ? out : '';
 }
 
-function responseToolToChatTool(tool) {
-  if (!tool) return null;
-  if (tool.type !== 'function') {
-    throw new Error(`Unsupported Responses tool type: ${tool.type}`);
+// Codex SDK exposes server-side tools (file_search, computer_use_preview,
+// mcp) where execution lives on OpenAI's side, not the model's. The proxy
+// can't bridge these — each needs its own service implementation — so
+// drop them silently rather than 500-ing the whole request.
+//
+// `web_search` / `web_search_preview` are NOT in this set: they get
+// translated by flattenResponseTool below into a regular function tool
+// with a `query` param so the model can still drive the search loop
+// through normal function calls.
+const UNBRIDGED_SERVER_SIDE_TYPES = new Set([
+  'file_search',
+  'computer_use_preview',
+  'mcp',
+]);
+
+function encodeToolName(name, namespace = '') {
+  const toolName = name || 'unknown';
+  if (!namespace) return toolName;
+  return namespace.endsWith('__') ? `${namespace}${toolName}` : `${namespace}__${toolName}`;
+}
+
+function flattenResponseTool(tool, inheritedNamespace = '') {
+  if (!tool) return [];
+
+  if (tool.type === 'namespace') {
+    const namespace = tool.name || tool.namespace || inheritedNamespace || '';
+    const children = tool.tools || tool.children || tool.functions || tool.items || [];
+    if (!Array.isArray(children)) return [];
+    return children.flatMap(child => flattenResponseTool(child, namespace));
   }
-  if (tool.function) return tool;
+
+  if (tool.type === 'function') {
+    const base = tool.function || tool;
+    const originalName = base.name || tool.name || 'unknown';
+    return [{
+      type: 'function',
+      function: {
+        name: encodeToolName(originalName, inheritedNamespace),
+        description: base.description || tool.description || '',
+        parameters: base.parameters || tool.parameters || {},
+      },
+      __response_tool: {
+        type: inheritedNamespace ? 'namespace' : 'function',
+        namespace: inheritedNamespace || '',
+        originalName,
+      },
+    }];
+  }
+
+  if (tool.type === 'custom') {
+    const base = tool.function || tool;
+    const originalName = base.name || tool.name;
+    if (!originalName) return [];
+    return [{
+      type: 'function',
+      function: {
+        name: encodeToolName(originalName, inheritedNamespace),
+        description: base.description || tool.description || '',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            input: {
+              type: 'string',
+              description: 'Raw custom tool input.',
+            },
+          },
+          required: ['input'],
+        },
+      },
+      __response_tool: {
+        type: 'custom',
+        namespace: inheritedNamespace || '',
+        originalName,
+      },
+    }];
+  }
+
+  if (tool.type === 'web_search' || tool.type === 'web_search_preview') {
+    return [{
+      type: 'function',
+      function: {
+        name: encodeToolName('web_search', inheritedNamespace),
+        description: tool.description || 'Search the web.',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Search query.',
+            },
+          },
+          required: ['query'],
+        },
+      },
+      __response_tool: {
+        type: 'web_search',
+        namespace: inheritedNamespace || '',
+        originalName: 'web_search',
+      },
+    }];
+  }
+
+  if (tool.type === 'tool_search') {
+    return [{
+      type: 'function',
+      function: {
+        name: encodeToolName('tool_search', inheritedNamespace),
+        description: tool.description || 'Search available tools.',
+        parameters: {
+          type: 'object',
+          additionalProperties: true,
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Tool search query.',
+            },
+          },
+        },
+      },
+      __response_tool: {
+        type: 'tool_search',
+        namespace: inheritedNamespace || '',
+        originalName: 'tool_search',
+      },
+    }];
+  }
+
+  // file_search / computer_use_preview / mcp — known server-side tools
+  // we can't bridge. Drop silently so Codex requests with these enabled
+  // don't 500; the model keeps whatever real function tools it has.
+  if (UNBRIDGED_SERVER_SIDE_TYPES.has(tool.type)) return [];
+  log.warn(`responses: dropping unknown tool type "${tool.type}"`);
+  return [];
+}
+
+function flattenResponseTools(tools = []) {
+  if (!Array.isArray(tools)) return [];
+  return tools.flatMap(tool => flattenResponseTool(tool));
+}
+
+function responseItemToolName(item) {
+  return encodeToolName(item.name || item.function?.name || 'unknown', item.namespace || '');
+}
+function normalizeResponseToolChoice(toolChoice) {
+  if (toolChoice == null) return toolChoice;
+  if (toolChoice === 'auto' || toolChoice === 'required' || toolChoice === 'none') return toolChoice;
+  if (typeof toolChoice !== 'object') return toolChoice;
+  if (toolChoice.type === 'web_search' || toolChoice.type === 'tool_search') return 'auto';
+  if (toolChoice.type === 'function' && toolChoice.function?.name) {
+    return {
+      type: 'function',
+      function: {
+        name: encodeToolName(toolChoice.function.name, toolChoice.function.namespace || toolChoice.namespace || ''),
+      },
+    };
+  }
+  if ((toolChoice.type === 'custom' || toolChoice.type === 'namespace') && (toolChoice.name || toolChoice.function?.name)) {
+    return {
+      type: 'function',
+      function: {
+        name: encodeToolName(toolChoice.name || toolChoice.function?.name, toolChoice.namespace || toolChoice.function?.namespace || ''),
+      },
+    };
+  }
+  return toolChoice;
+}
+
+function normalizeResponseTextFormat(format) {
+  if (!format || typeof format !== 'object') return null;
+  if (format.type === 'json_object') return { type: 'json_object' };
+  if (format.type !== 'json_schema') return null;
+  const nested = format.json_schema && typeof format.json_schema === 'object'
+    ? format.json_schema
+    : null;
+  const schema = format.schema || nested?.schema;
+  if (!schema) return null;
   return {
-    type: 'function',
-    function: {
-      name: tool.name,
-      description: tool.description || '',
-      parameters: tool.parameters || {},
+    type: 'json_schema',
+    json_schema: {
+      name: format.name || nested?.name || 'response',
+      schema,
+      strict: format.strict ?? nested?.strict ?? false,
     },
   };
 }
+
 
 export function responsesToChat(body) {
   const messages = [];
@@ -101,39 +286,45 @@ export function responsesToChat(body) {
           tool_call_id: item.call_id || item.id,
           content: stringifyMaybe(item.output),
         });
+      } else if (item.type === 'custom_tool_call') {
+        flushToolCalls.add({
+          id: item.call_id || item.id,
+          name: item.name,
+          arguments: JSON.stringify({ input: stringifyMaybe(item.input) }),
+        });
+      } else if (item.type === 'custom_tool_call_output') {
+        flushToolCalls.flush();
+        messages.push({
+          role: 'tool',
+          tool_call_id: item.call_id || item.id,
+          content: stringifyMaybe(item.output),
+        });
       }
     }
     flushToolCalls.flush();
   }
 
-  const tools = (body.tools || []).map(responseToolToChatTool).filter(Boolean);
-  const chatBody = {
+  const tools = flattenResponseTools(body.tools || []);
+  const responseFormat = normalizeResponseTextFormat(body.text?.format);
+  return {
     model: body.model || 'claude-sonnet-4.6',
     messages,
     stream: !!body.stream,
+    ...(body.max_output_tokens != null ? { max_tokens: body.max_output_tokens } : {}),
+    ...(body.reasoning?.effort != null ? { reasoning_effort: body.reasoning.effort } : {}),
+    ...(tools.length ? { tools } : {}),
+    ...(body.temperature != null ? { temperature: body.temperature } : {}),
+    ...(body.top_p != null ? { top_p: body.top_p } : {}),
+    ...(body.tool_choice != null ? { tool_choice: normalizeResponseToolChoice(body.tool_choice) } : {}),
+    ...(responseFormat ? { response_format: responseFormat } : {}),
   };
-
-  if (body.max_output_tokens != null) chatBody.max_tokens = body.max_output_tokens;
-  if (body.reasoning?.effort != null) chatBody.reasoning_effort = body.reasoning.effort;
-  if (body.reasoning_effort != null) chatBody.reasoning_effort = body.reasoning_effort;
-  if (body.fast === true || body.priority === true) chatBody.fast = true;
-  if (body.service_tier === 'priority' || body.service_tier === 'fast') chatBody.service_tier = body.service_tier;
-  if (tools.length) chatBody.tools = tools;
-  if (body.temperature != null) chatBody.temperature = body.temperature;
-  if (body.top_p != null) chatBody.top_p = body.top_p;
-  if (body.tool_choice != null) chatBody.tool_choice = body.tool_choice;
-  if (body.metadata != null) chatBody.metadata = body.metadata;
-
-  return chatBody;
 }
 
 function mapUsage(usage = {}) {
-  const input = usage.prompt_tokens || usage.input_tokens || 0;
-  const output = usage.completion_tokens || usage.output_tokens || 0;
   return {
-    input_tokens: input,
-    output_tokens: output,
-    total_tokens: usage.total_tokens || input + output,
+    input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
+    output_tokens: usage.completion_tokens || usage.output_tokens || 0,
+    total_tokens: usage.total_tokens || (usage.prompt_tokens || usage.input_tokens || 0) + (usage.completion_tokens || usage.output_tokens || 0),
   };
 }
 
@@ -156,18 +347,64 @@ function reasoningItem(id, text, status = 'completed') {
   };
 }
 
-function functionCallItem(toolCall, status = 'completed') {
+function functionCallItem(toolCall, status = 'completed', requestedTools = []) {
+  const name = toolCall.function?.name || 'unknown';
+  const argsText = toolCall.function?.arguments || '';
+  const requestedTool = Array.isArray(requestedTools)
+    ? requestedTools.find(t => (t?.function?.name || t?.name || (t?.__response_tool?.type === 'web_search' ? 'web_search' : null)) === name)
+    : null;
+  const responseTool = requestedTool?.__response_tool || null;
+  if (responseTool?.type === 'custom') {
+    const parsed = safeJsonParse(argsText);
+    const input = parsed && typeof parsed === 'object' && parsed.input != null
+      ? stringifyMaybe(parsed.input)
+      : argsText;
+    return {
+      type: 'custom_tool_call',
+      call_id: toolCall.id || `call_${randomUUID().slice(0, 8)}`,
+      name: responseTool.originalName || name,
+      ...(responseTool.namespace ? { namespace: responseTool.namespace } : {}),
+      input,
+      status,
+    };
+  }
+  if (responseTool?.type === 'web_search' || responseTool?.type === 'tool_search') {
+    const parsed = safeJsonParse(argsText) || {};
+    return {
+      type: responseTool.type === 'web_search' ? 'web_search_call' : 'function_call',
+      ...(responseTool.type === 'web_search'
+        ? { id: toolCall.id || `ws_${randomUUID().replace(/-/g, '').slice(0, 24)}` }
+        : {
+            id: genFunctionCallId(),
+            call_id: toolCall.id || `call_${randomUUID().slice(0, 8)}`,
+            name: responseTool.originalName || name,
+            ...(responseTool.namespace ? { namespace: responseTool.namespace } : {}),
+          }),
+      status,
+      ...(responseTool.type === 'web_search'
+        ? {
+            action: {
+              type: 'search',
+              query: typeof parsed.query === 'string' ? parsed.query : argsText,
+            },
+          }
+        : {
+            arguments: argsText,
+          }),
+    };
+  }
   return {
     type: 'function_call',
     id: genFunctionCallId(),
     call_id: toolCall.id || `call_${randomUUID().slice(0, 8)}`,
-    name: toolCall.function?.name || 'unknown',
-    arguments: toolCall.function?.arguments || '',
+    name: responseTool?.originalName || name,
+    ...(responseTool?.namespace ? { namespace: responseTool.namespace } : {}),
+    arguments: argsText,
     status,
   };
 }
 
-export function chatToResponse(chatBody, requestedModel, responseId = genResponseId(), msgId = genMessageId()) {
+export function chatToResponse(chatBody, requestedModel, responseId = genResponseId(), msgId = genMessageId(), requestedTools = []) {
   const choice = chatBody.choices?.[0] || {};
   const message = choice.message || {};
   const finishReason = choice.finish_reason || 'stop';
@@ -175,13 +412,13 @@ export function chatToResponse(chatBody, requestedModel, responseId = genRespons
   const output = [];
   if (message.reasoning_content) output.push(reasoningItem('rs_' + msgId.slice(4), message.reasoning_content));
   if (text) output.push(textMessageItem(msgId, text));
-  for (const tc of (message.tool_calls || [])) output.push(functionCallItem(tc));
+  for (const tc of (message.tool_calls || [])) output.push(functionCallItem(tc, 'completed', requestedTools));
 
   return {
     id: responseId,
     object: 'response',
     created_at: chatBody.created || Math.floor(Date.now() / 1000),
-    status: finishReason === 'stop' || finishReason === 'tool_calls' ? 'completed' : 'incomplete',
+    status: finishReason === 'stop' ? 'completed' : 'incomplete',
     model: requestedModel || chatBody.model,
     output,
     usage: mapUsage(chatBody.usage || {}),
@@ -189,10 +426,11 @@ export function chatToResponse(chatBody, requestedModel, responseId = genRespons
 }
 
 class ResponsesStreamTranslator {
-  constructor(res, responseId, model) {
+  constructor(res, responseId, model, requestedTools = []) {
     this.res = res;
     this.responseId = responseId;
     this.model = model;
+    this.requestedTools = Array.isArray(requestedTools) ? requestedTools : [];
     this.createdAt = Math.floor(Date.now() / 1000);
     this.msgId = genMessageId();
     this.pendingSseBuf = '';
@@ -231,6 +469,10 @@ class ResponsesStreamTranslator {
       model: this.model,
       output,
     };
+  }
+
+  resolveRequestedTool(name) {
+    return this.requestedTools.find(t => (t?.function?.name || t?.name || (t?.__response_tool?.type === 'web_search' ? 'web_search' : null)) === name) || null;
   }
 
   start() {
@@ -294,10 +536,8 @@ class ResponsesStreamTranslator {
     if (this.messageStarted) return;
     this.messageStarted = true;
     this.messageOutputIndex = this.nextOutputIndex++;
-    this.send('response.output_item.added', {
-      output_index: this.messageOutputIndex,
-      item: textMessageItem(this.msgId, '', 'in_progress'),
-    });
+    const addedItem = textMessageItem(this.msgId, '', 'in_progress');
+    this.send('response.output_item.added', { output_index: this.messageOutputIndex, item: addedItem });
   }
 
   ensureTextPart() {
@@ -328,30 +568,89 @@ class ResponsesStreamTranslator {
     const idx = toolCall.index ?? 0;
     let existing = this.toolCalls.get(idx);
     if (!existing) {
-      const outputIndex = this.nextOutputIndex++;
-      const item = {
-        type: 'function_call',
-        id: genFunctionCallId(),
-        call_id: toolCall.id || `call_${randomUUID().slice(0, 8)}`,
-        name: toolCall.function?.name || 'unknown',
-        arguments: '',
-        status: 'in_progress',
+      existing = {
+        item: null,
+        outputIndex: this.nextOutputIndex++,
+        argChunks: [],
+        emittedArgsLength: 0,
+        done: false,
+        custom: false,
+        webSearch: false,
+        responseTool: null,
+        callId: toolCall.id || null,
+        toolName: null,
       };
-      this.send('response.output_item.added', { output_index: outputIndex, item });
-      existing = { item, outputIndex, argChunks: [], done: false };
       this.toolCalls.set(idx, existing);
     }
 
-    if (toolCall.id) existing.item.call_id = toolCall.id;
-    if (toolCall.function?.name) existing.item.name = toolCall.function.name;
+    const ensureItem = (name, responseTool) => {
+      if (existing.item) return;
+      const item = responseTool?.type === 'custom'
+        ? {
+            type: 'custom_tool_call',
+            call_id: existing.callId || `call_${randomUUID().slice(0, 8)}`,
+            name: responseTool.originalName || name,
+            ...(responseTool.namespace ? { namespace: responseTool.namespace } : {}),
+            input: '',
+            status: 'in_progress',
+          }
+        : responseTool?.type === 'web_search'
+          ? {
+              type: 'web_search_call',
+              id: existing.callId || `ws_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+              status: 'in_progress',
+              action: { type: 'search', query: '' },
+            }
+          : {
+              type: 'function_call',
+              id: genFunctionCallId(),
+              call_id: existing.callId || `call_${randomUUID().slice(0, 8)}`,
+              name: responseTool?.originalName || name,
+              ...(responseTool?.namespace ? { namespace: responseTool.namespace } : {}),
+              arguments: '',
+              status: 'in_progress',
+            };
+      existing.item = item;
+      this.send('response.output_item.added', { output_index: existing.outputIndex, item });
+    };
+
+    if (toolCall.id) existing.callId = toolCall.id;
+    if (toolCall.function?.name) {
+      existing.toolName = toolCall.function.name;
+      const requestedTool = this.resolveRequestedTool(toolCall.function.name);
+      const responseTool = requestedTool?.__response_tool || null;
+      if (responseTool) {
+        existing.responseTool = responseTool;
+        existing.custom = responseTool.type === 'custom';
+        existing.webSearch = responseTool.type === 'web_search' || responseTool.type === 'tool_search';
+      }
+      ensureItem(toolCall.function.name, existing.responseTool);
+      existing.item.name = existing.responseTool?.originalName || toolCall.function.name;
+      if (existing.responseTool?.namespace) existing.item.namespace = existing.responseTool.namespace;
+    }
+
     const argsChunk = toolCall.function?.arguments || '';
-    if (argsChunk) {
-      existing.argChunks.push(argsChunk);
-      this.send('response.function_call_arguments.delta', {
-        item_id: existing.item.id,
-        output_index: existing.outputIndex,
-        delta: argsChunk,
-      });
+    if (argsChunk) existing.argChunks.push(argsChunk);
+    if (!existing.item && !existing.toolName) return;
+    ensureItem(existing.toolName || 'unknown', existing.responseTool);
+
+    if (existing.item.type === 'web_search_call') {
+      if (existing.callId) existing.item.id = existing.callId;
+    } else if (existing.callId) {
+      existing.item.call_id = existing.callId;
+    }
+
+    if (!existing.custom && !existing.webSearch) {
+      const allArgs = existing.argChunks.join('');
+      const pendingArgs = allArgs.slice(existing.emittedArgsLength);
+      if (pendingArgs) {
+        this.send('response.function_call_arguments.delta', {
+          item_id: existing.item.id,
+          output_index: existing.outputIndex,
+          delta: pendingArgs,
+        });
+        existing.emittedArgsLength = allArgs.length;
+      }
     }
   }
 
@@ -361,6 +660,36 @@ class ResponsesStreamTranslator {
       if (tc.done) continue;
       tc.done = true;
       const args = tc.argChunks.join('');
+      if (tc.custom) {
+        const parsed = safeJsonParse(args);
+        const input = parsed && typeof parsed === 'object' && parsed.input != null
+          ? stringifyMaybe(parsed.input)
+          : args;
+        const complete = { ...tc.item, input, status: 'completed' };
+        this.send('response.output_item.done', { output_index: tc.outputIndex, item: complete });
+        this.outputItems[tc.outputIndex] = complete;
+        continue;
+      }
+      if (tc.item.type === 'web_search_call') {
+        const parsed = safeJsonParse(args) || {};
+        const complete = {
+          ...tc.item,
+          status: 'completed',
+          action: {
+            type: 'search',
+            query: typeof parsed.query === 'string' ? parsed.query : args,
+          },
+        };
+        this.send('response.output_item.done', { output_index: tc.outputIndex, item: complete });
+        this.outputItems[tc.outputIndex] = complete;
+        continue;
+      }
+      if (tc.item.type === 'function_call' && tc.item.name === 'tool_search') {
+        const complete = { ...tc.item, arguments: args, status: 'completed' };
+        this.send('response.output_item.done', { output_index: tc.outputIndex, item: complete });
+        this.outputItems[tc.outputIndex] = complete;
+        continue;
+      }
       this.send('response.function_call_arguments.done', {
         item_id: tc.item.id,
         output_index: tc.outputIndex,
@@ -505,6 +834,7 @@ function createCaptureRes(translator, realRes) {
 
 export async function handleResponses(body, deps = {}) {
   const chatHandler = deps.handleChatCompletions || handleChatCompletions;
+  const context = deps.context || {};
   const responseId = genResponseId();
   const requestedModel = body.model || 'claude-sonnet-4.6';
   let chatBody;
@@ -522,27 +852,15 @@ export async function handleResponses(body, deps = {}) {
     };
   }
 
-  if (!Array.isArray(chatBody.messages) || chatBody.messages.length === 0) {
-    return {
-      status: 400,
-      body: {
-        error: {
-          message: 'input must contain at least one message',
-          type: 'invalid_request_error',
-        },
-      },
-    };
-  }
-
-  chatBody._source = 'POST /v1/responses';
+  const requestedTools = chatBody.tools || [];
 
   if (!body.stream) {
-    const result = await chatHandler({ ...chatBody, stream: false }, deps.context || deps);
+    const result = await chatHandler({ ...chatBody, stream: false, __route: 'responses' }, context);
     if (result.status !== 200) return result;
-    return { status: 200, body: chatToResponse(result.body, requestedModel, responseId) };
+    return { status: 200, body: chatToResponse(result.body, requestedModel, responseId, genMessageId(), requestedTools) };
   }
 
-  const streamResult = await chatHandler({ ...chatBody, stream: true }, deps.context || deps);
+  const streamResult = await chatHandler({ ...chatBody, stream: true, __route: 'responses' }, context);
   if (!streamResult.stream) return streamResult;
 
   return {
@@ -550,12 +868,12 @@ export async function handleResponses(body, deps = {}) {
     stream: true,
     headers: {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-store',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const translator = new ResponsesStreamTranslator(realRes, responseId, requestedModel);
+      const translator = new ResponsesStreamTranslator(realRes, responseId, requestedModel, requestedTools);
       const captureRes = createCaptureRes(translator, realRes);
 
       realRes.on('close', () => {

@@ -12,16 +12,19 @@
 
 export function encodeVarint(value) {
   const bytes = [];
-  let v = Number(value);
-  if (v < 0) {
-    const big = BigInt(v) & 0xFFFFFFFFFFFFFFFFn;
-    let b = big;
-    for (let i = 0; i < 10; i++) {
-      bytes.push(Number(b & 0x7Fn) | (i < 9 ? 0x80 : 0));
+  // BigInt path for negatives (two's-complement uint64) and any int > 2^31
+  // since JS `>>>` truncates to uint32 and silently corrupts larger varints.
+  if (typeof value === 'bigint' || value < 0 || value > 0x7FFFFFFF) {
+    let b = (typeof value === 'bigint' ? value : BigInt(value)) & 0xFFFFFFFFFFFFFFFFn;
+    while (true) {
+      const byte = Number(b & 0x7Fn);
       b >>= 7n;
+      if (b === 0n) { bytes.push(byte); break; }
+      bytes.push(byte | 0x80);
     }
     return Buffer.from(bytes);
   }
+  let v = Number(value);
   do {
     let byte = v & 0x7F;
     v >>>= 7;
@@ -32,15 +35,33 @@ export function encodeVarint(value) {
 }
 
 export function decodeVarint(buf, offset = 0) {
+  // Fast path: read up to 4 bytes (28 bits) with plain int math — covers
+  // all field tags and most small ints without touching BigInt. Fall through
+  // to BigInt for anything larger so uint64 values (request_id, credit
+  // counters, timestamps) decode accurately without sign/truncation bugs.
   let result = 0, shift = 0, pos = offset;
-  while (pos < buf.length) {
+  while (pos < buf.length && shift < 28) {
     const byte = buf[pos++];
     result |= (byte & 0x7F) << shift;
-    if (!(byte & 0x80)) break;
+    if (!(byte & 0x80)) return { value: result >>> 0, length: pos - offset };
     shift += 7;
-    if (shift >= 64) throw new Error('Varint overflow');
   }
-  return { value: result >>> 0, length: pos - offset };
+  if (pos >= buf.length) throw new Error('Truncated varint');
+  // Continuation byte needed beyond 28 bits — switch to BigInt.
+  let big = BigInt(result >>> 0);
+  let bigShift = BigInt(shift);
+  while (pos < buf.length) {
+    const byte = buf[pos++];
+    big |= BigInt(byte & 0x7F) << bigShift;
+    if (!(byte & 0x80)) {
+      // Return Number if safely representable, else BigInt.
+      const asNum = Number(big);
+      return { value: Number.isSafeInteger(asNum) ? asNum : big, length: pos - offset };
+    }
+    bigShift += 7n;
+    if (bigShift >= 64n) throw new Error('Varint overflow');
+  }
+  throw new Error('Truncated varint');
 }
 
 // ─── Field-level writers (standalone functions) ────────────
@@ -99,8 +120,8 @@ export function parseFields(buf) {
   while (pos < buf.length) {
     const tag = decodeVarint(buf, pos);
     pos += tag.length;
-    const fieldNum = tag.value >>> 3;
-    const wireType = tag.value & 0x07;
+    const fieldNum = Number(tag.value) >>> 3;
+    const wireType = Number(tag.value) & 0x07;
 
     let value;
     switch (wireType) {
@@ -111,6 +132,7 @@ export function parseFields(buf) {
         break;
       }
       case 1: { // fixed64
+        if (pos + 8 > buf.length) throw new Error(`truncated fixed64 at offset ${pos}`);
         value = buf.subarray(pos, pos + 8);
         pos += 8;
         break;
@@ -118,11 +140,16 @@ export function parseFields(buf) {
       case 2: { // length-delimited
         const len = decodeVarint(buf, pos);
         pos += len.length;
-        value = buf.subarray(pos, pos + len.value);
-        pos += len.value;
+        const sz = Number(len.value);
+        if (sz < 0 || pos + sz > buf.length) {
+          throw new Error(`truncated len-delim field ${fieldNum} at offset ${pos} (need ${sz}, have ${buf.length - pos})`);
+        }
+        value = buf.subarray(pos, pos + sz);
+        pos += sz;
         break;
       }
       case 5: { // fixed32
+        if (pos + 4 > buf.length) throw new Error(`truncated fixed32 at offset ${pos}`);
         value = buf.subarray(pos, pos + 4);
         pos += 4;
         break;

@@ -1,735 +1,718 @@
 /**
- * POST /v1/messages — Anthropic Messages API compatible endpoint.
+ * POST /v1/messages — Anthropic Messages API compatibility layer.
  *
- * Thin adapter on top of handleChatCompletions:
- *   Request:  Anthropic Messages body → OpenAI chat/completions body
- *   Response: OpenAI chat.completion ↔ Anthropic Message
- *             OpenAI SSE (chat.completion.chunk) ↔ Anthropic SSE
- *             (message_start / content_block_* / message_delta / message_stop)
+ * Translates Anthropic request/response format to/from the internal OpenAI
+ * format so Claude Code and any Anthropic SDK client can connect directly.
  *
- * This lets Claude Code (and any Anthropic-SDK client) point ANTHROPIC_BASE_URL
- * at WindsurfPoolAPI directly, no protocol-translation middlebox required.
- *
- * Spec refs:
- *   https://docs.claude.com/en/api/messages
- *   https://docs.claude.com/en/api/messages-streaming
+ * Streaming path is a real-time translator: it pipes the OpenAI SSE stream
+ * from handleChatCompletions through a response shim that parses each
+ * chat.completion.chunk and emits the equivalent Anthropic message_start /
+ * content_block_* / message_delta / message_stop events as bytes arrive.
+ * No buffering, so first-token latency matches the upstream Cascade stream.
  */
 
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { handleChatCompletions } from './chat.js';
-import { resolveModel } from '../models.js';
-import { config, log } from '../config.js';
-
-// ── Model name aliasing ────────────────────────────────────
-// Claude Code sends names like "claude-opus-4-5-20250929" or the bare alias
-// "opus"/"sonnet"/"haiku". Map them onto Windsurf's catalog before handing
-// the body to handleChatCompletions.
-const ALIAS_MAP = {
-  // Bare CC aliases → latest Windsurf equivalent
-  'opus':   'claude-opus-4.6-thinking',
-  'sonnet': 'claude-sonnet-4.6',
-  'haiku':  'claude-4.5-haiku',
-};
-
-const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
-
-/**
- * Map a CC-sent model name to a Windsurf catalog entry.
- *
- * Claude Code 2.1.114 internally ships the model family name as `model`
- * (e.g. `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`)
- * and passes the chosen effort tier separately in `output_config.effort`.
- * Our catalog stores Opus 4.7 as five separate entries keyed by effort
- * (claude-opus-4.7-{low,medium,high,xhigh,max}), so we have to fuse the two
- * fields back together here.
- *
- * `effort` may also come through as a `-low`/`-medium`/… suffix on the model
- * name itself (older clients, or curl tests); we handle that too.
- *
- * @param {string} name    Model name exactly as the caller sent it
- * @param {string} [effort] Optional effort tier ('low'|'medium'|'high'|'xhigh'|'max')
- */
-function mapModel(name, effort) {
-  if (!name) return config.defaultModel;
-  const eff = VALID_EFFORTS.has((effort || '').toLowerCase()) ? effort.toLowerCase() : null;
-
-  // CC appends "[1m]" to the model string to request the 1M-token context
-  // variant of Sonnet 4.6 (see CC binary: function it9 returns H+"[1m]" for
-  // opus-4-7 / opus-4-6 / sonnet-4-6 when long-context mode triggers).
-  // Strip the suffix for catalog matching and remember the flag for routing.
-  const wants1m = /\[1m\]$/.test(name);
-  const bareName = wants1m ? name.replace(/\[1m\]$/, '') : name;
-
-  // Exact catalog match first (post-suffix-strip)
-  const resolved = resolveModel(bareName);
-  if (resolved && resolved !== bareName) {
-    // If caller asked for 1M but catalog entry isn't a -1m variant, try to upgrade
-    if (wants1m && !/-1m$/.test(resolved)) {
-      if (/^claude-sonnet-4\.6-thinking$/.test(resolved)) return 'claude-sonnet-4.6-thinking-1m';
-      if (/^claude-sonnet-4\.6$/.test(resolved))          return 'claude-sonnet-4.6-1m';
-    }
-    return resolved;
-  }
-
-  // CC bare aliases (haiku/sonnet/opus without version)
-  const lower = bareName.toLowerCase();
-  if (ALIAS_MAP[lower]) return ALIAS_MAP[lower];
-
-  // Claude Opus 4.7 family — redirected to opus 4.6 thinking per user config.
-  if (/claude.*opus.*4[-_.]7/i.test(bareName))         return 'claude-opus-4.6-thinking';
-
-  // Older Opus families — effort heuristic (high/xhigh/max → thinking variant)
-  if (/claude.*opus.*4[-_.]6/i.test(bareName)) {
-    return (eff && ['high','xhigh','max'].includes(eff)) ? 'claude-opus-4.6-thinking' : 'claude-opus-4.6';
-  }
-
-  // Fallback bare opus → opus 4.6 thinking
-  if (/claude.*opus/i.test(bareName)) return 'claude-opus-4.6-thinking';
-
-  // Sonnet — 4.6 family. Honour [1m] to pick the 1M-context variant.
-  const sonnetThinking = /claude.*sonnet.*thinking/i.test(bareName);
-  const sonnet46       = /claude.*sonnet.*4[-_.]6/i.test(bareName);
-  const sonnetGeneric  = /claude.*sonnet/i.test(bareName);
-  if (sonnetThinking) return wants1m ? 'claude-sonnet-4.6-thinking-1m' : 'claude-sonnet-4.6-thinking';
-  if (sonnet46) {
-    const thinking = (eff && ['high','xhigh','max'].includes(eff));
-    if (wants1m && thinking) return 'claude-sonnet-4.6-thinking-1m';
-    if (wants1m)             return 'claude-sonnet-4.6-1m';
-    if (thinking)            return 'claude-sonnet-4.6-thinking';
-    return 'claude-sonnet-4.6';
-  }
-  if (sonnetGeneric) return wants1m ? 'claude-sonnet-4.6-1m' : 'claude-sonnet-4.6';
-
-  // Haiku
-  if (/claude.*haiku/i.test(bareName)) return 'claude-4.5-haiku';
-
-  // Unknown — let resolveModel's fallthrough try, chat.js will 403 if really bogus
-  return resolved || bareName;
-}
+import { log } from '../config.js';
 
 function genMsgId() {
   return 'msg_' + randomUUID().replace(/-/g, '').slice(0, 24);
 }
 
-function genToolUseId() {
-  return 'toolu_' + randomUUID().replace(/-/g, '').slice(0, 22);
+// Anthropic Messages API tool types whose execution lives on Anthropic's
+// servers, not the client. The proxy treats these as opt-out: it cannot
+// satisfy server_tool_result delivery without implementing each one
+// against Cascade, so they're stripped from the request rather than
+// translated into normal function tools.
+//   web_search_20250305     server-side web search
+//   code_execution_20250522 server-side python sandbox
+//   advisor_20260301        Anthropic Advisor Strategy (sonnet+opus pair)
+const SERVER_SIDE_ANTHROPIC_TOOL_TYPES = new Set([
+  'web_search_20250305',
+  'code_execution_20250522',
+  'advisor_20260301',
+]);
+
+function sha256Hex(value) {
+  return createHash('sha256').update(String(value || '')).digest('hex');
 }
 
-// ── Request conversion: Anthropic → OpenAI ────────────────
+// Real Claude Code 2.1.120 traffic carries metadata.user_id as a
+// JSON-encoded string with shape {device_id, account_uuid, session_id}.
+// Older Anthropic SDK clients send a plain string. The proxy currently
+// derives callerKey from API key + IP/UA, which means every Claude Code
+// client behind the same key shares one cascade pool — leading to cross-
+// device session bleed. Extract a stable per-user tag from metadata so
+// the pool can isolate concurrent users.
+export function extractCallerSubKey(body) {
+  const userId = body?.metadata?.user_id;
+  if (typeof userId !== 'string' || !userId) return '';
+  let parsed = null;
+  try { parsed = JSON.parse(userId); } catch {}
+  let tag = '';
+  if (parsed && typeof parsed === 'object') {
+    tag = parsed.device_id || parsed.deviceId
+      || parsed.session_id || parsed.sessionId
+      || parsed.account_uuid || parsed.accountUuid
+      || '';
+  } else {
+    tag = userId;
+  }
+  if (!tag) return '';
+  return sha256Hex(tag).slice(0, 16);
+}
 
-/**
- * Flatten an Anthropic content block array into either a plain string (for the
- * text-only case, which maximises downstream cache hit rate) or an array of
- * OpenAI content parts. Tool-use / tool-result blocks get hoisted into OpenAI
- * tool_calls / tool messages; image blocks are preserved as OpenAI image_url
- * parts.
- */
-function anthropicContentToOpenAI(content) {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return String(content ?? '');
+// Anthropic prompt caching (`cache_control`) — verified spec:
+//   - shape: { type: 'ephemeral', ttl?: '5m' | '1h' }, default ttl 5m
+//   - placeable on tools[], system[] blocks, messages[].content[] blocks
+//   - prefix-cumulative, ordered tools → system → messages
+//   - max 4 breakpoints per request
+//
+// Cascade upstream doesn't speak this dialect — its own caching layer
+// reports cacheReadTokens/cacheWriteTokens that already flow through
+// chat.js → openAIToAnthropic. We strip the markers before forwarding
+// (so they don't leak into Cascade requests) and expose a policy
+// summary for downstream stages: TTL hint for the conversation pool,
+// 5m vs 1h split attribution in usage.cache_creation.
+//
+// Returns: { has1h, breakpointCount } describing the request.
+function extractCachePolicy(body) {
+  let breakpointCount = 0;
+  let has1h = false;
+  const visit = (block) => {
+    if (!block || typeof block !== 'object') return;
+    const cc = block.cache_control;
+    if (cc && typeof cc === 'object' && cc.type === 'ephemeral') {
+      breakpointCount++;
+      if (cc.ttl === '1h') has1h = true;
+      delete block.cache_control;
+    }
+  };
+  if (Array.isArray(body.tools)) for (const t of body.tools) visit(t);
+  if (Array.isArray(body.system)) for (const s of body.system) visit(s);
+  if (Array.isArray(body.messages)) {
+    for (const m of body.messages) {
+      if (Array.isArray(m.content)) for (const c of m.content) visit(c);
+    }
+  }
+  // Also accept top-level cache_control hint (auto-caching mode).
+  if (body.cache_control && typeof body.cache_control === 'object') {
+    if (body.cache_control.type === 'ephemeral') {
+      breakpointCount++;
+      if (body.cache_control.ttl === '1h') has1h = true;
+    }
+    delete body.cache_control;
+  }
+  return { has1h, breakpointCount };
+}
 
-  const textParts = [];
-  const toolUses = [];
-  const toolResults = [];
-  const imageParts = [];
+// ─── Anthropic → OpenAI request translation ──────────────────
 
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue;
-    switch (block.type) {
-      case 'text':
-        if (block.text) textParts.push(block.text);
-        break;
-      case 'thinking':
-        // Assistant-side reasoning. Keep it visible as <thinking> so that if
-        // the model reads prior turns it can see its own reasoning.
-        if (block.thinking) textParts.push(`<thinking>${block.thinking}</thinking>`);
-        break;
-      case 'tool_use':
-        toolUses.push({
-          id: block.id || genToolUseId(),
-          type: 'function',
-          function: {
-            name: block.name || 'unknown',
-            arguments: JSON.stringify(block.input ?? {}),
-          },
-        });
-        break;
-      case 'tool_result':
-        toolResults.push({
-          tool_call_id: block.tool_use_id || '',
-          // Anthropic tool_result content may itself be a string or an array
-          // of content blocks. Collapse to a string for OpenAI's tool message
-          // shape (OpenAI only accepts string content for role=tool).
-          content: flattenToolResultContent(block.content),
-          is_error: !!block.is_error,
-        });
-        break;
-      case 'image':
-        if (block.source?.type === 'base64') {
-          imageParts.push({
-            type: 'image_url',
-            image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
+function anthropicToOpenAI(body) {
+  const cachePolicy = extractCachePolicy(body);
+  const mapAnthropicToolChoice = (toolChoice) => {
+    if (!toolChoice || typeof toolChoice !== 'object') return toolChoice;
+    if (toolChoice.type === 'auto') return 'auto';
+    if (toolChoice.type === 'any') return 'required';
+    if (toolChoice.type === 'none') return 'none';
+    if (toolChoice.type === 'tool' && toolChoice.name) {
+      return { type: 'function', function: { name: toolChoice.name } };
+    }
+    return toolChoice;
+  };
+  const pruneToolChoice = (toolChoice, forwardedTools) => {
+    if (!toolChoice || !forwardedTools.length) return undefined;
+    if (toolChoice.type === 'function') {
+      const names = new Set(forwardedTools.map(t => t.function?.name).filter(Boolean));
+      return names.has(toolChoice.function?.name) ? toolChoice : undefined;
+    }
+    return toolChoice;
+  };
+  const messages = [];
+  const toolNameById = new Map();
+  if (body.system) {
+    const sysText = typeof body.system === 'string'
+      ? body.system
+      : Array.isArray(body.system)
+        ? body.system.map(b => b.text || '').join('\n')
+        : '';
+    if (sysText) messages.push({ role: 'system', content: sysText });
+  }
+  for (const m of (body.messages || [])) {
+    const role = m.role === 'assistant' ? 'assistant' : 'user';
+    if (typeof m.content === 'string') {
+      messages.push({ role, content: m.content });
+    } else if (Array.isArray(m.content)) {
+      const textParts = [];
+      const imageParts = [];
+      const toolCalls = [];
+      const toolResults = [];
+      for (const block of m.content) {
+        if (block.type === 'text') {
+          textParts.push(block.text || '');
+        } else if (block.type === 'image') {
+          imageParts.push(block);
+        } else if (block.type === 'thinking') {
+          // Thinking blocks from assistant history — skip; the model will regenerate
+        } else if (block.type === 'tool_use' && role === 'assistant') {
+          const id = block.id || `call_${randomUUID().slice(0, 8)}`;
+          toolNameById.set(id, block.name || '');
+          toolCalls.push({
+            id,
+            type: 'function',
+            function: { name: block.name, arguments: JSON.stringify(block.input || {}) },
           });
-        } else if (block.source?.type === 'url') {
-          imageParts.push({ type: 'image_url', image_url: { url: block.source.url } });
+        } else if (block.type === 'tool_result') {
+          let content = typeof block.content === 'string'
+            ? block.content
+            : Array.isArray(block.content)
+              ? block.content.map(b => b.text || '').join('\n')
+              : JSON.stringify(block.content);
+          content = annotateRiskyReadToolResult(content, {
+            toolName: toolNameById.get(block.tool_use_id),
+            isError: !!block.is_error,
+          });
+          toolResults.push({ role: 'tool', tool_call_id: block.tool_use_id, content });
         }
-        break;
-      case 'document':
-        // Drop. Windsurf backend doesn't expose document inputs.
-        log.warn('messages: document content block dropped (not supported)');
-        break;
-      default:
-        log.debug(`messages: unknown content block type="${block.type}" dropped`);
-    }
-  }
-
-  return { textParts, toolUses, toolResults, imageParts };
-}
-
-function flattenToolResultContent(content) {
-  if (typeof content === 'string') return content;
-  if (!Array.isArray(content)) return JSON.stringify(content ?? '');
-  const parts = [];
-  for (const blk of content) {
-    if (blk?.type === 'text' && blk.text) parts.push(blk.text);
-    else if (blk?.type === 'image') parts.push('[image]'); // Windsurf tool-results are text-only
-    else if (typeof blk === 'string') parts.push(blk);
-  }
-  return parts.join('\n');
-}
-
-/**
- * Map one Anthropic message → one or more OpenAI messages.
- * Splits assistant turns with tool_use into {assistant content + tool_calls}.
- * Splits user turns with tool_result into one or more role:tool messages.
- */
-function anthropicMessageToOpenAI(msg) {
-  const role = msg.role;
-  const parsed = anthropicContentToOpenAI(msg.content);
-
-  // Simple string passthrough
-  if (typeof parsed === 'string') {
-    return [{ role, content: parsed }];
-  }
-
-  const { textParts, toolUses, toolResults, imageParts } = parsed;
-  const out = [];
-
-  // User turns: emit role:tool messages first for any tool_results, then any
-  // remaining text/images as a single role:user message. Claude Code
-  // interleaves tool_result + user text within the same user message (per
-  // Anthropic's protocol), OpenAI requires them as separate role=tool msgs.
-  if (role === 'user') {
-    for (const r of toolResults) {
-      out.push({
-        role: 'tool',
-        tool_call_id: r.tool_call_id,
-        content: r.is_error ? `[error] ${r.content}` : r.content,
-      });
-    }
-    if (textParts.length || imageParts.length) {
-      if (imageParts.length) {
-        out.push({
-          role: 'user',
-          content: [
-            ...(textParts.length ? [{ type: 'text', text: textParts.join('\n') }] : []),
-            ...imageParts,
-          ],
-        });
-      } else {
-        out.push({ role: 'user', content: textParts.join('\n') });
       }
+      if (toolCalls.length) {
+        messages.push({
+          role: 'assistant',
+          content: textParts.length ? textParts.join('\n') : null,
+          tool_calls: toolCalls,
+        });
+      } else if (imageParts.length) {
+        const contentArr = [...imageParts];
+        if (textParts.length) contentArr.push({ type: 'text', text: textParts.join('\n') });
+        messages.push({ role, content: contentArr });
+      } else if (textParts.length) {
+        messages.push({ role, content: textParts.join('\n') });
+      }
+      for (const tr of toolResults) messages.push(tr);
     }
-    return out;
   }
-
-  // Assistant turns: merge text + tool_calls onto a single assistant message
-  if (role === 'assistant') {
-    const message = { role: 'assistant', content: textParts.join('\n') || null };
-    if (toolUses.length) message.tool_calls = toolUses;
-    out.push(message);
-    return out;
-  }
-
-  // Fallback for unknown roles
-  out.push({ role, content: textParts.join('\n') });
-  return out;
-}
-
-/** Anthropic system prompt (string | ContentBlock[]) → OpenAI system message content */
-function anthropicSystemToOpenAI(system) {
-  if (!system) return '';
-  if (typeof system === 'string') return system;
-  if (Array.isArray(system)) {
-    return system.map(b => (typeof b === 'string' ? b : b?.text || '')).filter(Boolean).join('\n\n');
-  }
-  return String(system);
-}
-
-/** Anthropic tools → OpenAI tools */
-function anthropicToolsToOpenAI(tools) {
-  if (!Array.isArray(tools)) return undefined;
-  const out = [];
-  for (const t of tools) {
-    if (!t || typeof t !== 'object' || !t.name) continue;
-    // Skip Anthropic's server-side tools (web_search, computer_20241022, etc.)
-    // that we have no way to fulfil — keep only function-style tool definitions.
-    if (t.type && t.type !== 'custom' && !t.input_schema) continue;
-    out.push({
+  // Anthropic exposes a growing set of "server-side" tool types where
+  // the service itself runs the work and the client only opts in via
+  // type. The proxy can't honor any of these (each needs its own stage-2
+  // implementation - Cascade-side opus advisor pass, web-search bridge,
+  // sandbox code exec). Drop them silently from the OpenAI-shaped tools
+  // forwarded upstream; otherwise the upstream model is free to invent
+  // a normal function tool_use for "advisor" the client will never get
+  // a server_tool_result for.
+  const droppedServerTools = [];
+  const tools = (body.tools || []).reduce((acc, t) => {
+    if (t?.type && SERVER_SIDE_ANTHROPIC_TOOL_TYPES.has(t.type)) {
+      droppedServerTools.push(t.type);
+      return acc;
+    }
+    acc.push({
       type: 'function',
       function: {
         name: t.name,
         description: t.description || '',
-        parameters: t.input_schema || { type: 'object', properties: {} },
+        parameters: t.input_schema || {},
       },
     });
+    return acc;
+  }, []);
+  if (droppedServerTools.length) {
+    log.info(`messages: dropped ${droppedServerTools.length} server-side tool(s) [${[...new Set(droppedServerTools)].join(',')}] - proxy does not implement them yet`);
   }
-  return out.length ? out : undefined;
-}
-
-/** Anthropic tool_choice → OpenAI tool_choice */
-function anthropicToolChoiceToOpenAI(tc) {
-  if (!tc) return undefined;
-  if (typeof tc === 'string') return tc;
-  if (tc.type === 'auto') return 'auto';
-  if (tc.type === 'any') return 'required';
-  if (tc.type === 'none') return 'none';
-  if (tc.type === 'tool' && tc.name) {
-    return { type: 'function', function: { name: tc.name } };
+  const forwardedToolChoice = pruneToolChoice(
+    body.tool_choice ? mapAnthropicToolChoice(body.tool_choice) : undefined,
+    tools,
+  );
+  // Claude Code 2.x and Anthropic SDK clients send response shape and
+  // reasoning controls inside body.output_config — output_config.effort
+  // mirrors OpenAI's reasoning_effort, and output_config.format carries
+  // structured-output schemas Anthropic-side instead of OpenAI's
+  // response_format. The internal handler speaks OpenAI dialect, so
+  // unwrap both here so chat.js sees them on the path it already knows.
+  const oc = body.output_config;
+  const ocEffort = oc?.effort;
+  const ocFormat = oc?.format;
+  let translatedResponseFormat = null;
+  if (ocFormat?.type === 'json_schema' && ocFormat.schema) {
+    translatedResponseFormat = {
+      type: 'json_schema',
+      json_schema: {
+        name: ocFormat.name || 'response',
+        schema: ocFormat.schema,
+        strict: ocFormat.strict !== false,
+      },
+    };
+  } else if (ocFormat?.type === 'json_object') {
+    translatedResponseFormat = { type: 'json_object' };
   }
-  return undefined;
-}
-
-/**
- * Build an OpenAI chat.completions body from an Anthropic Messages body.
- */
-function buildOpenAIBody(anthropicBody) {
-  const messages = [];
-
-  const sysText = anthropicSystemToOpenAI(anthropicBody.system);
-  if (sysText) messages.push({ role: 'system', content: sysText });
-
-  for (const m of anthropicBody.messages || []) {
-    for (const conv of anthropicMessageToOpenAI(m)) {
-      messages.push(conv);
-    }
-  }
-
-  // Claude Code 2.1.114 places the effort tier in output_config.effort;
-  // older Anthropic clients use top-level `effort`. Honour both.
-  const effort = anthropicBody.output_config?.effort || anthropicBody.effort;
-  const openaiBody = {
-    model: mapModel(anthropicBody.model, effort),
-    messages,
-    stream: !!anthropicBody.stream,
-  };
-  if (effort) openaiBody.reasoning_effort = effort;
-  if (anthropicBody.output_config?.fast === true || anthropicBody.output_config?.priority === true) {
-    openaiBody.fast = true;
-  }
-  if (anthropicBody.service_tier === 'priority' || anthropicBody.service_tier === 'fast') {
-    openaiBody.service_tier = anthropicBody.service_tier;
-  }
-  if (typeof anthropicBody.max_tokens === 'number') openaiBody.max_tokens = anthropicBody.max_tokens;
-  if (typeof anthropicBody.temperature === 'number') openaiBody.temperature = anthropicBody.temperature;
-  if (typeof anthropicBody.top_p === 'number') openaiBody.top_p = anthropicBody.top_p;
-  if (Array.isArray(anthropicBody.stop_sequences) && anthropicBody.stop_sequences.length) {
-    openaiBody.stop = anthropicBody.stop_sequences;
-  }
-  const oaiTools = anthropicToolsToOpenAI(anthropicBody.tools);
-  if (oaiTools) openaiBody.tools = oaiTools;
-  const oaiToolChoice = anthropicToolChoiceToOpenAI(anthropicBody.tool_choice);
-  if (oaiToolChoice) openaiBody.tool_choice = oaiToolChoice;
-
-  return openaiBody;
-}
-
-// ── Response conversion: OpenAI → Anthropic (non-stream) ──
-
-const FINISH_TO_STOP_REASON = {
-  stop: 'end_turn',
-  length: 'max_tokens',
-  tool_calls: 'tool_use',
-  content_filter: 'end_turn',
-};
-
-function openaiUsageToAnthropic(u) {
-  if (!u) return { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
   return {
-    input_tokens: (u.prompt_tokens || 0) - (u.prompt_tokens_details?.cached_tokens || 0) - (u.cache_creation_input_tokens || 0),
-    output_tokens: u.completion_tokens || 0,
-    cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
-    cache_read_input_tokens: u.prompt_tokens_details?.cached_tokens || 0,
+    model: body.model || 'claude-sonnet-4.6',
+    messages,
+    max_tokens: body.max_tokens || 8192,
+    stream: !!body.stream,
+    ...(tools.length ? { tools } : {}),
+    ...(body.temperature != null ? { temperature: body.temperature } : {}),
+    ...(body.top_p != null ? { top_p: body.top_p } : {}),
+    ...(body.stop_sequences ? { stop: body.stop_sequences } : {}),
+    ...(forwardedToolChoice ? { tool_choice: forwardedToolChoice } : {}),
+    ...(body.thinking ? { thinking: body.thinking } : {}),
+    ...(ocEffort ? { reasoning_effort: ocEffort } : {}),
+    ...(translatedResponseFormat ? { response_format: translatedResponseFormat } : {}),
+    ...(cachePolicy.breakpointCount > 0 ? { __cachePolicy: cachePolicy } : {}),
   };
 }
 
-function openaiResponseToAnthropic(openaiResp, requestedModel) {
-  const choice = openaiResp.choices?.[0];
-  const msg = choice?.message || {};
-  const content = [];
+export { extractCachePolicy };
 
-  if (msg.reasoning_content) {
-    content.push({ type: 'thinking', thinking: msg.reasoning_content, signature: '' });
+export function annotateRiskyReadToolResult(content, { toolName = '', isError = false } = {}) {
+  if (toolName !== 'Read' || typeof content !== 'string' || !content) return content;
+  const lower = content.toLowerCase();
+  const isOversizeNoContent = isError
+    && /file content \([^)]+\) exceeds maximum allowed size/i.test(content)
+    && /use offset and limit parameters/i.test(content);
+  // Claude Code Read tool emits real file bodies in "<lineno>\t<line>" form.
+  // Stub strings (cached/unchanged/truncated) never use that prefix, so the
+  // presence of a line-numbered line means we're looking at actual content
+  // and keyword heuristics would only false-positive on user code/comments.
+  const looksLikeRealBody = /^\s*\d+\t/m.test(content);
+  const isCachedStub = !looksLikeRealBody && (
+    /(?:file )?(?:content )?(?:unchanged|cached)/i.test(content)
+    || /(?:内容未变更|已缓存)/.test(content)
+  ) && content.length < 2000;
+  const mentionsTruncation = !looksLikeRealBody
+    && /truncated|截断|丢失/.test(lower);
+  if (!isOversizeNoContent && !isCachedStub && !mentionsTruncation) return content;
+
+  return `${content}\n\n[WindsurfAPI note: This Read result does not prove the full file body is available in the current conversation. If the task depends on full file contents, use Read with offset/limit or another content-bearing tool result before returning PASS.]`;
+}
+
+// ─── OpenAI → Anthropic non-stream response translation ──────
+
+export function openAIToAnthropic(result, model, msgId) {
+  const choice = result.choices?.[0];
+  const usage = result.usage || {};
+  const content = [];
+  if (choice?.message?.reasoning_content) {
+    content.push({ type: 'thinking', thinking: choice.message.reasoning_content });
   }
-  if (msg.content) {
-    content.push({ type: 'text', text: msg.content });
-  }
-  if (Array.isArray(msg.tool_calls)) {
-    for (const tc of msg.tool_calls) {
+  if (choice?.message?.tool_calls?.length) {
+    if (choice.message.content) content.push({ type: 'text', text: choice.message.content });
+    for (const tc of choice.message.tool_calls) {
       let input = {};
-      try { input = JSON.parse(tc.function?.arguments || '{}'); } catch { input = { _raw: tc.function?.arguments || '' }; }
+      try { input = JSON.parse(tc.function?.arguments || '{}'); } catch {}
       content.push({
         type: 'tool_use',
-        id: tc.id || genToolUseId(),
+        id: tc.id,
         name: tc.function?.name || 'unknown',
         input,
       });
     }
+  } else {
+    content.push({ type: 'text', text: choice?.message?.content || '' });
   }
-  // Anthropic requires content to be a non-empty array — if all blocks were
-  // empty (rare upstream oddity) emit a single empty text block.
-  if (!content.length) content.push({ type: 'text', text: '' });
-
+  const stopMap = { stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use' };
   return {
-    id: genMsgId(),
+    id: msgId,
     type: 'message',
     role: 'assistant',
     content,
-    model: requestedModel,
-    stop_reason: FINISH_TO_STOP_REASON[choice?.finish_reason] || 'end_turn',
+    model: model || result.model,
+    stop_reason: stopMap[choice?.finish_reason] || 'end_turn',
     stop_sequence: null,
-    usage: openaiUsageToAnthropic(openaiResp.usage),
+    usage: buildAnthropicUsage(usage),
   };
 }
 
-// ── Response conversion: OpenAI SSE → Anthropic SSE (stream) ──
+// Anthropic's prompt-caching usage shape carries BOTH the legacy flat
+// fields (cache_creation_input_tokens, cache_read_input_tokens) AND the
+// newer nested split (cache_creation: { ephemeral_5m_input_tokens,
+// ephemeral_1h_input_tokens }, GA since 2025-08-18). Emit both so SDK
+// callers on either schema see consistent numbers — the flat total
+// equals ephemeral_5m + ephemeral_1h. When chat.js doesn't supply a
+// split (no cache_control on the request) we attribute the whole
+// creation count to the 5m bucket since that's the spec default.
+function buildAnthropicUsage(usage) {
+  const cacheRead = usage.cache_read_input_tokens
+    ?? usage.prompt_tokens_details?.cached_tokens
+    ?? 0;
+  const cacheCreationFlat = usage.cache_creation_input_tokens || 0;
+  const split = usage.cache_creation && typeof usage.cache_creation === 'object'
+    ? {
+        ephemeral_5m_input_tokens: usage.cache_creation.ephemeral_5m_input_tokens || 0,
+        ephemeral_1h_input_tokens: usage.cache_creation.ephemeral_1h_input_tokens || 0,
+      }
+    : { ephemeral_5m_input_tokens: cacheCreationFlat, ephemeral_1h_input_tokens: 0 };
+  // v2.0.68 (#118): Anthropic semantics for input_tokens DIFFER from OpenAI.
+  // OpenAI: prompt_tokens = freshInput + cacheRead (cached_tokens is a subset).
+  // Anthropic: input_tokens = freshInput ONLY; cache_read_input_tokens and
+  //            cache_creation_input_tokens are siblings (mutually exclusive).
+  // The OpenAI prompt_tokens we receive here already follows the OpenAI
+  // convention (chat.js buildUsageBody puts freshInput+cacheRead in
+  // prompt_tokens). To get Anthropic's freshInput we subtract the cached
+  // subset. Negative values clamp to 0 (defensive against upstream skew).
+  const promptTotal = usage.prompt_tokens ?? usage.input_tokens ?? 0;
+  const freshInput = Math.max(0, promptTotal - cacheRead);
+  return {
+    input_tokens: freshInput,
+    output_tokens: usage.completion_tokens || usage.output_tokens || 0,
+    cache_creation_input_tokens: cacheCreationFlat,
+    cache_read_input_tokens: cacheRead,
+    cache_creation: split,
+  };
+}
 
-/**
- * Stream transformer that pretends to be an http.ServerResponse to
- * handleChatCompletions' streaming handler, captures every OpenAI SSE event
- * written to it, and forwards Anthropic SSE events to the real client response.
- *
- * OpenAI chunk events we translate:
- *   data: {"choices":[{"delta":{"role":"assistant","content":""}}]}       → message_start
- *   data: {"choices":[{"delta":{"reasoning_content":"..."}}]}             → thinking block
- *   data: {"choices":[{"delta":{"content":"..."}}]}                       → text block
- *   data: {"choices":[{"delta":{"tool_calls":[{"index":N,"id":...}]}}]}   → tool_use block
- *   data: {"choices":[{"delta":{},"finish_reason":"stop"}], "usage":...}  → message_delta / stop
- *   data: [DONE]                                                          → message_stop
- *   : ping                                                                → ping
- */
-class AnthropicStreamTransform {
-  constructor(realRes, requestedModel) {
-    this.real = realRes;
-    this.model = requestedModel;
-    this.msgId = genMsgId();
+// ─── Streaming translator: intercepts OpenAI SSE, emits Anthropic SSE ──
+
+class AnthropicStreamTranslator {
+  constructor(res, msgId, model) {
+    this.res = res;
+    this.msgId = msgId;
+    this.model = model;
+    // Current content block: null | { type, index }
+    // type: 'text' | 'thinking' | 'tool_use'
+    this.current = null;
+    this.blockIndex = 0;
+    this.toolCallBufs = new Map();   // index → { id, name, argsBuffered }
+    this.finalUsage = null;
+    this.stopReason = 'end_turn';
     this.messageStarted = false;
     this.messageStopped = false;
-    // Track the active content block per "kind". Anthropic requires opening
-    // and closing each block in order; we assign sequential indices.
-    this.nextBlockIdx = 0;
-    this.textBlockIdx = null;
-    this.thinkingBlockIdx = null;
-    this.toolBlockByOaiIdx = new Map(); // OpenAI tool_calls[i].index → Anthropic block idx
-    // Accumulators for final message_delta usage
-    this.stopReason = 'end_turn';
-    this.usage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
-    // Forward write-path events so chat.js's abort listener still fires on
-    // client disconnect.
-    this.on = (ev, cb) => this.real.on(ev, cb);
-    // Buffer across write() boundaries so a single SSE event split across
-    // multiple writes still parses cleanly.
-    this._buf = '';
+    this.pendingSseBuf = '';
   }
 
-  get writableEnded() { return this.real.writableEnded || this.messageStopped; }
-
-  _sendEvent(type, data) {
-    if (this.real.writableEnded) return;
-    const payload = { type, ...data };
-    this.real.write(`event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`);
+  send(event, data) {
+    if (!this.res.writableEnded) {
+      this.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    }
   }
 
-  _startMessage() {
+  startMessage() {
     if (this.messageStarted) return;
     this.messageStarted = true;
-    this._sendEvent('message_start', {
+    this.send('message_start', {
+      type: 'message_start',
       message: {
         id: this.msgId,
         type: 'message',
         role: 'assistant',
-        model: this.model,
         content: [],
+        model: this.model,
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+        },
       },
     });
   }
 
-  _openTextBlock() {
-    if (this.textBlockIdx != null) return;
-    this._closeThinkingBlock();
-    this.textBlockIdx = this.nextBlockIdx++;
-    this._sendEvent('content_block_start', {
-      index: this.textBlockIdx,
-      content_block: { type: 'text', text: '' },
+  startBlock(type, extra = {}) {
+    this.closeCurrentBlock();
+    this.current = { type, index: this.blockIndex };
+    let content_block;
+    if (type === 'text') content_block = { type: 'text', text: '' };
+    else if (type === 'thinking') content_block = { type: 'thinking', thinking: '' };
+    else if (type === 'tool_use') content_block = { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
+    this.send('content_block_start', {
+      type: 'content_block_start',
+      index: this.blockIndex,
+      content_block,
     });
   }
 
-  _closeTextBlock() {
-    if (this.textBlockIdx == null) return;
-    this._sendEvent('content_block_stop', { index: this.textBlockIdx });
-    this.textBlockIdx = null;
+  closeCurrentBlock() {
+    if (!this.current) return;
+    this.send('content_block_stop', { type: 'content_block_stop', index: this.current.index });
+    this.blockIndex++;
+    this.current = null;
   }
 
-  _openThinkingBlock() {
-    if (this.thinkingBlockIdx != null) return;
-    this.thinkingBlockIdx = this.nextBlockIdx++;
-    this._sendEvent('content_block_start', {
-      index: this.thinkingBlockIdx,
-      content_block: { type: 'thinking', thinking: '', signature: '' },
+  emitTextDelta(text) {
+    if (!text) return;
+    if (this.current?.type !== 'text') this.startBlock('text');
+    this.send('content_block_delta', {
+      type: 'content_block_delta',
+      index: this.current.index,
+      delta: { type: 'text_delta', text },
     });
   }
 
-  _closeThinkingBlock() {
-    if (this.thinkingBlockIdx == null) return;
-    this._sendEvent('content_block_stop', { index: this.thinkingBlockIdx });
-    this.thinkingBlockIdx = null;
+  emitThinkingDelta(text) {
+    if (!text) return;
+    if (this.current?.type !== 'thinking') this.startBlock('thinking');
+    this.send('content_block_delta', {
+      type: 'content_block_delta',
+      index: this.current.index,
+      delta: { type: 'thinking_delta', thinking: text },
+    });
   }
 
-  _openToolBlock(oaiIdx, toolCall) {
-    if (this.toolBlockByOaiIdx.has(oaiIdx)) return this.toolBlockByOaiIdx.get(oaiIdx);
-    this._closeThinkingBlock();
-    this._closeTextBlock();
-    const idx = this.nextBlockIdx++;
-    this.toolBlockByOaiIdx.set(oaiIdx, idx);
-    this._sendEvent('content_block_start', {
-      index: idx,
-      content_block: {
-        type: 'tool_use',
-        id: toolCall.id || genToolUseId(),
-        name: toolCall.function?.name || 'unknown',
-        input: {},
+  emitToolCallDelta(toolCall) {
+    const idx = toolCall.index ?? 0;
+    let existing = this.toolCallBufs.get(idx);
+    const id = toolCall.id || existing?.id;
+    const name = toolCall.function?.name || existing?.name;
+    const argsChunk = toolCall.function?.arguments || '';
+
+    if (!existing) {
+      existing = { id, name, blockIndex: null, argsBuffered: '', pendingArgs: '' };
+      this.toolCallBufs.set(idx, existing);
+    } else {
+      if (id) existing.id = id;
+      if (name) existing.name = name;
+    }
+    const buf = this.toolCallBufs.get(idx);
+    if (buf.blockIndex == null && buf.id && buf.name) {
+      this.startBlock('tool_use', { id: buf.id, name: buf.name });
+      buf.blockIndex = this.current.index;
+      if (buf.pendingArgs) {
+        const pending = buf.pendingArgs;
+        buf.pendingArgs = '';
+        buf.argsBuffered += pending;
+        this.send('content_block_delta', {
+          type: 'content_block_delta',
+          index: buf.blockIndex,
+          delta: { type: 'input_json_delta', partial_json: pending },
+        });
+      }
+    }
+    if (argsChunk) {
+      if (buf.blockIndex == null) {
+        buf.pendingArgs += argsChunk;
+        return;
+      }
+      buf.argsBuffered += argsChunk;
+      this.send('content_block_delta', {
+        type: 'content_block_delta',
+        index: buf.blockIndex,
+        delta: { type: 'input_json_delta', partial_json: argsChunk },
+      });
+    }
+  }
+
+  processChunk(chunk) {
+    if (chunk.error) {
+      this.error(chunk.error);
+      return;
+    }
+    this.startMessage();
+    const choice = chunk.choices?.[0];
+    if (choice) {
+      const delta = choice.delta || {};
+      if (delta.reasoning_content) this.emitThinkingDelta(delta.reasoning_content);
+      if (delta.content) this.emitTextDelta(delta.content);
+      if (Array.isArray(delta.tool_calls)) {
+        for (const tc of delta.tool_calls) this.emitToolCallDelta(tc);
+      }
+      if (choice.finish_reason) {
+        const stopMap = { stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use' };
+        this.stopReason = stopMap[choice.finish_reason] || 'end_turn';
+      }
+    }
+    if (chunk.usage) this.finalUsage = chunk.usage;
+  }
+
+  finish() {
+    if (this.messageStopped) return;
+    this.messageStopped = true;
+    // Ensure message_start is always sent — when the upstream stream
+    // fails before any content arrives (e.g. cascade immediate error,
+    // new-api timeout), Claude Code still expects a complete event
+    // sequence. Without this, the client sees message_delta + stop
+    // with no preceding start and reports "Content block not found".
+    if (!this.messageStarted) this.startMessage();
+    this.closeCurrentBlock();
+    const u = this.finalUsage || {};
+    this.send('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: this.stopReason, stop_sequence: null },
+      usage: buildAnthropicUsage(u),
+    });
+    this.send('message_stop', { type: 'message_stop' });
+  }
+
+  error(err) {
+    if (this.messageStopped) return;
+    this.messageStopped = true;
+    this.closeCurrentBlock();
+    this.send('error', {
+      type: 'error',
+      error: {
+        type: err?.type || 'api_error',
+        message: err?.message || 'Upstream stream error',
       },
     });
-    return idx;
   }
 
-  _closeAllToolBlocks() {
-    for (const idx of this.toolBlockByOaiIdx.values()) {
-      this._sendEvent('content_block_stop', { index: idx });
-    }
-    this.toolBlockByOaiIdx.clear();
-  }
-
-  _handleOpenAIChunk(chunk) {
-    const delta = chunk.choices?.[0]?.delta || {};
-    const finish = chunk.choices?.[0]?.finish_reason;
-
-    // Pass-through reasoning (thinking) deltas
-    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length) {
-      this._openThinkingBlock();
-      this._sendEvent('content_block_delta', {
-        index: this.thinkingBlockIdx,
-        delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
-      });
-    }
-
-    // Pass-through text deltas
-    if (typeof delta.content === 'string' && delta.content.length) {
-      this._openTextBlock();
-      this._sendEvent('content_block_delta', {
-        index: this.textBlockIdx,
-        delta: { type: 'text_delta', text: delta.content },
-      });
-    }
-
-    // Tool call deltas — OpenAI chunks them as {index, id, function:{name, arguments}}
-    if (Array.isArray(delta.tool_calls)) {
-      for (const tc of delta.tool_calls) {
-        const oaiIdx = tc.index ?? 0;
-        const blockIdx = this._openToolBlock(oaiIdx, tc);
-        if (tc.function?.arguments) {
-          this._sendEvent('content_block_delta', {
-            index: blockIdx,
-            delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
-          });
+  // SSE parser — handleChatCompletions writes `data: {...}\n\n` frames;
+  // accumulate and flush each complete frame as a translated event.
+  feed(rawChunk) {
+    this.pendingSseBuf += typeof rawChunk === 'string' ? rawChunk : rawChunk.toString('utf8');
+    let idx;
+    while ((idx = this.pendingSseBuf.indexOf('\n\n')) !== -1) {
+      const frame = this.pendingSseBuf.slice(0, idx);
+      this.pendingSseBuf = this.pendingSseBuf.slice(idx + 2);
+      const lines = frame.split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6);
+        if (payload === '[DONE]') continue;
+        try {
+          this.processChunk(JSON.parse(payload));
+        } catch (e) {
+          log.warn(`Messages SSE parse error: ${e.message}`);
         }
       }
     }
-
-    // Absorb usage if the chunk carries it (chat.js emits it with the final chunk)
-    if (chunk.usage) this.usage = openaiUsageToAnthropic(chunk.usage);
-
-    if (finish) {
-      this.stopReason = FINISH_TO_STOP_REASON[finish] || 'end_turn';
-    }
   }
-
-  _finishMessage() {
-    if (this.messageStopped) return;
-    this.messageStopped = true;
-    // Close any open content blocks in reverse order
-    this._closeAllToolBlocks();
-    this._closeTextBlock();
-    this._closeThinkingBlock();
-    this._sendEvent('message_delta', {
-      delta: { stop_reason: this.stopReason, stop_sequence: null },
-      usage: { output_tokens: this.usage.output_tokens || 0 },
-    });
-    this._sendEvent('message_stop', {});
-    if (!this.real.writableEnded) this.real.end();
-  }
-
-  /**
-   * handleChatCompletions' handler calls res.write(...) with either SSE data
-   * frames or heartbeat comments. We parse frames out of the byte stream.
-   */
-  write(chunk) {
-    if (this.real.writableEnded) return true;
-    // First call — open the message envelope so the client sees metadata ASAP
-    this._startMessage();
-
-    this._buf += chunk.toString();
-    // SSE events are terminated by '\n\n'
-    let nlIdx;
-    while ((nlIdx = this._buf.indexOf('\n\n')) !== -1) {
-      const rawEvent = this._buf.slice(0, nlIdx);
-      this._buf = this._buf.slice(nlIdx + 2);
-      this._parseSseEvent(rawEvent);
-    }
-    return true;
-  }
-
-  _parseSseEvent(raw) {
-    const dataLines = [];
-    for (const line of raw.split('\n')) {
-      if (line.startsWith(': ')) {
-        // SSE comment — upstream heartbeat. Forward as Anthropic ping so our
-        // clients' keepalives fire too.
-        this._sendEvent('ping', {});
-        continue;
-      }
-      if (line.startsWith('data: ')) dataLines.push(line.slice(6));
-    }
-    if (!dataLines.length) return;
-    const dataStr = dataLines.join('\n');
-    if (dataStr === '[DONE]') {
-      this._finishMessage();
-      return;
-    }
-    try {
-      const parsed = JSON.parse(dataStr);
-      this._handleOpenAIChunk(parsed);
-    } catch (e) {
-      log.debug(`messages: unparseable upstream SSE chunk: ${dataStr.slice(0, 120)}`);
-    }
-  }
-
-  end() {
-    // If chat.js ends without a [DONE] (shouldn't normally happen) still
-    // produce a clean message_stop so clients don't hang.
-    if (!this.messageStopped) this._finishMessage();
-  }
-
-  // handleChatCompletions calls res.setHeader/writeHead before `handler(res)`
-  // in server.js — but we wrap AFTER writeHead has already run on the real
-  // response, so these are typically no-ops. Keep them defensive:
-  setHeader() {}
-  writeHead() {}
 }
 
-// ── Public entry ───────────────────────────────────────────
+// ─── Fake ServerResponse that pipes writes into the translator ──
 
-export async function handleMessages(anthropicBody, deps = {}) {
-  // Validate minimum contract
-  if (!anthropicBody || !Array.isArray(anthropicBody.messages) || !anthropicBody.messages.length) {
+function createCaptureRes(translator, realRes) {
+  const listeners = new Map();
+  const fire = (event) => {
+    const cbs = listeners.get(event) || [];
+    for (const cb of cbs) { try { cb(); } catch {} }
+  };
+  return {
+    writableEnded: false,
+    headersSent: false,
+    writeHead() { this.headersSent = true; },
+    write(chunk) {
+      // chat.js writes SSE heartbeat comments (`: ping\n\n`) every 15s
+      // while Cascade is slow-polling its trajectory. The translator
+      // only parses `data:` lines, so pings are silently dropped —
+      // leaving the real Anthropic stream quiet for minutes until a
+      // CDN/proxy/client decides the connection is dead and bails. Pass
+      // heartbeat comments straight through so Claude Code stays happy.
+      const str = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      if (str.startsWith(':') && realRes && !realRes.writableEnded) {
+        try { realRes.write(str); } catch {}
+      }
+      translator.feed(chunk);
+      return true;
+    },
+    end(chunk) {
+      if (this.writableEnded) return;
+      if (chunk) translator.feed(chunk);
+      translator.finish();
+      this.writableEnded = true;
+      fire('close');
+    },
+    // Fire 'close' without marking writableEnded=true so chat.js's
+    // close handler sees an un-ended stream and triggers its abort path.
+    _clientDisconnected() { fire('close'); },
+    on(event, cb) {
+      if (!listeners.has(event)) listeners.set(event, []);
+      listeners.get(event).push(cb);
+      return this;
+    },
+    once(event, cb) {
+      const self = this;
+      const wrapped = function onceWrapper() {
+        self.off(event, wrapped);
+        cb.apply(self, arguments);
+      };
+      return self.on(event, wrapped);
+    },
+    off(event, cb) {
+      const arr = listeners.get(event);
+      if (arr) {
+        const idx = arr.indexOf(cb);
+        if (idx !== -1) arr.splice(idx, 1);
+      }
+      return this;
+    },
+    removeListener(event, cb) { return this.off(event, cb); },
+    emit() { return true; },
+  };
+}
+
+// ─── Main entry ───────────────────────────────────────────────
+
+export async function handleMessages(body, context = {}) {
+  const msgId = genMsgId();
+  const requestedModel = body.model || 'claude-sonnet-4.6';
+  const wantStream = !!body.stream;
+  const openaiBody = anthropicToOpenAI(body);
+  const chatHandler = context.handleChatCompletions || handleChatCompletions;
+  // Augment callerKey with the per-user tag from metadata.user_id when
+  // present so the cascade pool can isolate concurrent Claude Code users
+  // sharing one API key. Bare API-key callers and other client SDKs that
+  // do not send metadata.user_id keep the original callerKey unchanged.
+  const subKey = extractCallerSubKey(body);
+  const effectiveContext = subKey
+    ? { ...context, callerKey: `${context.callerKey || ''}:user:${subKey}` }
+    : context;
+
+  if (!wantStream) {
+    const result = await chatHandler({ ...openaiBody, stream: false, __route: 'messages' }, effectiveContext);
+    if (result.status !== 200) {
+      return {
+        status: result.status,
+        body: {
+          type: 'error',
+          error: {
+            type: result.body?.error?.type || 'api_error',
+            message: result.body?.error?.message || 'Unknown error',
+          },
+        },
+      };
+    }
+    return { status: 200, body: openAIToAnthropic(result.body, requestedModel, msgId) };
+  }
+
+  // Streaming path — ask handleChatCompletions for its streaming handler and
+  // point its writes at our translator shim. This lets the upstream Cascade
+  // poll loop drive the downstream SSE in real time — no buffer-then-replay.
+  const streamResult = await chatHandler({ ...openaiBody, stream: true, __route: 'messages' }, effectiveContext);
+
+  if (!streamResult.stream) {
+    // The OpenAI path returned a non-stream error (e.g. 403 model_not_entitled)
     return {
-      status: 400,
+      status: streamResult.status || 502,
       body: {
         type: 'error',
-        error: { type: 'invalid_request_error', message: 'messages: array is required and non-empty' },
+        error: {
+          type: streamResult.body?.error?.type || 'api_error',
+          message: streamResult.body?.error?.message || 'Upstream error',
+        },
       },
     };
   }
-  const openaiBody = buildOpenAIBody(anthropicBody);
-  const requestedModel = anthropicBody.model || openaiBody.model;
 
-  const inEffort = anthropicBody.output_config?.effort || anthropicBody.effort || null;
-  log.info(`Messages: anthropic→openai model=${anthropicBody.model}${inEffort ? ` effort=${inEffort}` : ''} → ${openaiBody.model} stream=${openaiBody.stream} msgs=${openaiBody.messages.length} tools=${openaiBody.tools?.length || 0}`);
-
-  // Tag source for the stats recorder so /v1/messages traffic shows up as its
-  // own API bucket instead of being merged with /v1/chat/completions.
-  openaiBody._source = 'POST /v1/messages';
-
-  // Non-stream path: delegate and re-shape the body.
-  if (!openaiBody.stream) {
-    const result = await handleChatCompletions(openaiBody, deps);
-    if (result.status !== 200) {
-      // Re-shape the error envelope to Anthropic's shape
-      const msg = result.body?.error?.message || 'Unknown error';
-      const type = result.body?.error?.type || 'api_error';
-      const anthType = {
-        auth_error: 'authentication_error',
-        rate_limit_exceeded: 'rate_limit_error',
-        model_not_available: 'permission_error',
-        model_blocked: 'permission_error',
-        model_not_entitled: 'permission_error',
-        pool_exhausted: 'api_error',
-        upstream_error: 'api_error',
-        ls_unavailable: 'api_error',
-        invalid_request: 'invalid_request_error',
-        not_found: 'not_found_error',
-        server_error: 'api_error',
-      }[type] || 'api_error';
-      return {
-        status: result.status,
-        body: { type: 'error', error: { type: anthType, message: msg } },
-      };
-    }
-    return {
-      status: 200,
-      body: openaiResponseToAnthropic(result.body, requestedModel),
-    };
-  }
-
-  // Stream path: delegate and wrap the response with our transform.
-  const result = await handleChatCompletions(openaiBody, deps);
-  if (result.status !== 200 || !result.stream) {
-    // Upstream returned a synchronous error before streaming started — re-shape
-    const msg = result.body?.error?.message || 'Upstream failed to start stream';
-    const type = result.body?.error?.type || 'api_error';
-    return {
-      status: result.status,
-      body: { type: 'error', error: { type, message: msg } },
-    };
-  }
   return {
     status: 200,
     stream: true,
     headers: {
-      ...result.headers,
-      // Anthropic SSE uses text/event-stream too, but some clients check the
-      // anthropic-prefixed header so we mirror it for safety.
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-store',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
     },
     async handler(realRes) {
-      const wrapper = new AnthropicStreamTransform(realRes, requestedModel);
-      // Kick the stream open immediately so CC's UI leaves the "connecting"
-      // state even before upstream's first token arrives. Without this the
-      // client sits silent for the entire LS cold-start + Windsurf first-token
-      // window (often 8-15s on thinking models), which feels like it hung.
-      wrapper._startMessage();
-      wrapper._sendEvent('ping', {});
+      const translator = new AnthropicStreamTranslator(realRes, msgId, requestedModel);
+      const captureRes = createCaptureRes(translator, realRes);
+
+      // Forward client disconnect so the upstream cascade is cancelled.
+      // We don't call captureRes.end() here — that would set writableEnded=true
+      // and suppress the abort path inside chat.js's stream handler.
+      realRes.on('close', () => {
+        if (!captureRes.writableEnded) captureRes._clientDisconnected();
+      });
+
       try {
-        await result.handler(wrapper);
-      } catch (err) {
-        log.error(`messages: stream handler error: ${err.message}`);
-        if (!realRes.writableEnded) {
-          realRes.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: err.message } })}\n\n`);
-          realRes.end();
-        }
+        await streamResult.handler(captureRes);
+      } catch (e) {
+        log.error(`Messages stream error: ${e.message}`);
+        translator.error({ type: 'api_error', message: e.message });
       }
+
+      if (!realRes.writableEnded) realRes.end();
     },
   };
 }

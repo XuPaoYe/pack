@@ -18,7 +18,6 @@ import {
   Copy,
   Cloud,
   Download,
-  Eye,
   EyeOff,
   ExternalLink,
   FileJson,
@@ -52,7 +51,7 @@ import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/acco
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
-type ImportMode = "paste" | "file" | "local" | "oauth" | "password";
+type ImportMode = "paste" | "file" | "local" | "oauth" | "password" | "token";
 type OAuthProvider = "codex" | "gemini";
 type ThemeMode = "system" | "light" | "dark";
 
@@ -95,6 +94,7 @@ type WindsurfApiStatus = {
   actualPort: number | null;
   address: string | null;
   apiKey: string;
+  defaultModel: string;
   lastError: string | null;
 };
 
@@ -137,7 +137,7 @@ const modeConfig: Record<
   paste: {
     icon: Clipboard,
     title: "粘贴凭证",
-    desc: "粘贴 Auth.json、账号 Json、Windsurf auth1/session 凭证",
+    desc: "粘贴 Auth.json、账号 Json、Windsurf api_key / refresh_token 凭证",
   },
   file: {
     icon: FileJson,
@@ -159,12 +159,17 @@ const modeConfig: Record<
     title: "账号密码",
     desc: "使用旧版 Windsurf Firebase 邮箱密码登录。",
   },
+  token: {
+    icon: LockKeyhole,
+    title: "Token",
+    desc: "粘贴 Token",
+  },
 };
 
 const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
-const windsurfImportModeOrder: ImportMode[] = ["password", "paste"];
+const windsurfImportModeOrder: ImportMode[] = ["token", "password", "paste"];
 const defaultImportMode: ImportMode = "oauth";
-const defaultWindsurfImportMode: ImportMode = "password";
+const defaultWindsurfImportMode: ImportMode = "token";
 
 function importModesForProvider(provider: Provider): ImportMode[] {
   return provider === "windsurf" ? windsurfImportModeOrder : importModeOrder;
@@ -353,9 +358,21 @@ const MODEL_FAMILIES: ModelFamily[] = [
   {
     key: "gpt-5.3-codex",
     label: "GPT-5.3-Codex",
-    aliases: ["GPT-5.3 Codex", "GPT-5.3-Codex"],
-    efforts: [],
-    resolveId: () => "gpt-5.3-codex",
+    aliases: [
+      "GPT-5.3 Codex",
+      "GPT-5.3-Codex",
+      "gpt-5.3-codex-low",
+      "gpt-5.3-codex-high",
+      "gpt-5.3-codex-xhigh",
+    ],
+    efforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "medium",
+    resolveId: (effort) => {
+      if (effort === "low") return "gpt-5.3-codex-low";
+      if (effort === "high") return "gpt-5.3-codex-high";
+      if (effort === "xhigh") return "gpt-5.3-codex-xhigh";
+      return "gpt-5.3-codex";
+    },
   },
   {
     key: "gpt-5.4",
@@ -377,11 +394,9 @@ const MODEL_FAMILIES: ModelFamily[] = [
   {
     key: "claude-opus-4.6",
     label: "Claude Opus 4.6",
-    aliases: ["Claude Opus 4.6"],
-    efforts: ["medium", "high"],
-    defaultEffort: "medium",
-    resolveId: (effort) =>
-      effort === "high" ? "claude-opus-4.6-thinking" : "claude-opus-4.6",
+    aliases: ["Claude Opus 4.6", "claude-opus-4-6"],
+    efforts: [],
+    resolveId: () => "claude-opus-4.6",
   },
   {
     key: "claude-opus-4.7",
@@ -617,18 +632,14 @@ function EffortSegments({
 function WindsurfApiCard({
   status,
   busy,
-  showKey,
   pref,
-  onToggleKey,
   onToggleService,
   onCopy,
   onOpenConfig,
 }: {
   status: WindsurfApiStatus | null;
   busy: boolean;
-  showKey: boolean;
   pref: ApiModelPref;
-  onToggleKey: () => void;
   onToggleService: () => void;
   onCopy: (text: string, label: string) => void;
   onOpenConfig: () => void;
@@ -636,7 +647,6 @@ function WindsurfApiCard({
   const running = Boolean(status?.running);
   const address = status?.address ?? "—";
   const apiKey = status?.apiKey ?? "";
-  const maskedKey = apiKey ? `${apiKey.slice(0, 9)}${"•".repeat(Math.max(apiKey.length - 9, 4))}` : "—";
   const family = MODEL_FAMILIES.find((f) => f.key === pref.family) ?? MODEL_FAMILIES[0];
   const modelSummary = [
     family.label,
@@ -672,16 +682,7 @@ function WindsurfApiCard({
         </dd>
         <dt>密钥</dt>
         <dd>
-          <code>{showKey ? apiKey || "—" : maskedKey}</code>
-          <button
-            type="button"
-            className="icon-btn"
-            onClick={onToggleKey}
-            disabled={!apiKey}
-            aria-label={showKey ? "隐藏密钥" : "显示密钥"}
-          >
-            {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
-          </button>
+          <code>{apiKey || "—"}</code>
           <button
             type="button"
             className="icon-btn"
@@ -722,14 +723,8 @@ function WindsurfApiCard({
           onClick={onToggleService}
           disabled={busy}
         >
-          {busy ? (
-            "处理中..."
-          ) : (
-            <>
-              <Power size={14} />
-              {running ? "停止服务" : "启动 API 服务"}
-            </>
-          )}
+          <Power size={14} />
+          {running ? "停止服务" : "启动 API 服务"}
         </button>
 
         <p className="windsurf-api-hint">
@@ -788,7 +783,9 @@ function WindsurfApiConfigPanel({
             onChange={onChangeEffort}
           />
         ) : (
-          <span className="api-config-muted">不支持</span>
+          <div className="effort-segments unsupported" aria-disabled="true">
+            <span className="effort-segment placeholder">不支持</span>
+          </div>
         )}
       </section>
 
@@ -897,6 +894,7 @@ function App() {
   const [pasteValue, setPasteValue] = useState("");
   const [windsurfEmail, setWindsurfEmail] = useState("");
   const [windsurfPassword, setWindsurfPassword] = useState("");
+  const [windsurfToken, setWindsurfToken] = useState("");
   const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
   const [accountPage, setAccountPage] = useState(1);
@@ -916,7 +914,6 @@ function App() {
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>(loadAppLogs);
   const [forceUpdate, setForceUpdate] = useState<ForceUpdateState | null>(null);
   const [windsurfApi, setWindsurfApi] = useState<WindsurfApiStatus | null>(null);
-  const [showWindsurfApiKey, setShowWindsurfApiKey] = useState(false);
   const [isWindsurfApiBusy, setIsWindsurfApiBusy] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({
     theme: "system",
@@ -924,7 +921,7 @@ function App() {
     maskSensitive: false,
     windsurfApiHost: "0.0.0.0",
     windsurfApiPort: 0,
-    windsurfApiDefaultModel: "",
+    windsurfApiDefaultModel: "gpt-5.3-codex",
   });
   const [windsurfApiModels, setWindsurfApiModels] = useState<WindsurfApiModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
@@ -1122,6 +1119,10 @@ function App() {
   }, [appendAppLog]);
 
   useEffect(() => {
+    setFailures([]);
+  }, [activeProvider, mode]);
+
+  useEffect(() => {
     if (import.meta.env.DEV || !isTauri()) return;
     let isCancelled = false;
 
@@ -1256,6 +1257,7 @@ function App() {
     setMode(defaultImportModeForProvider(activeProvider));
     setWindsurfEmail("");
     setWindsurfPassword("");
+    setWindsurfToken("");
   };
 
   const applyImportResult = (
@@ -1451,8 +1453,37 @@ function App() {
     close();
   };
   const handleAddAccount = () => {
+    setFailures([]);
     setMode(defaultImportModeForProvider(activeProvider));
     setIsImportModalOpen(true);
+  };
+
+  const handleWindsurfTokenImport = async () => {
+    const trimmed = windsurfToken.trim();
+    if (!trimmed) {
+      showNotice("error", "请粘贴 Windsurf Token");
+      return;
+    }
+    setIsBusy(true);
+    setFailures([]);
+    try {
+      const account = await invoke<ManagedAccount>("add_windsurf_account_by_token", {
+        token: trimmed,
+      });
+      applyImportResult(
+        { imported: [account], failed: [] },
+        { closeModal: true, successText: `已添加 Windsurf 账号 ${account.email}` },
+      );
+    } catch (error) {
+      const rawMessage = String(error);
+      const message = rawMessage.includes("invalid token") || rawMessage.includes("401")
+        ? "Windsurf Token 无效或已过期，请重新从 Windsurf 页面复制完整 token"
+        : rawMessage.split("(trace ID:")[0].trim();
+      setFailures([{ label: "Windsurf Token", reason: message }]);
+      showNotice("error", `Token 登录失败：${message}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const handleWindsurfPasswordImport = async () => {
@@ -1472,7 +1503,10 @@ function App() {
         { successText: `Windsurf 账号 ${account.email} 已添加` },
       );
     } catch (error) {
-      const text = String(error).replace(/^Windsurf\s*登录失败[:：]?\s*/, "");
+      const rawText = String(error).replace(/^Windsurf\s*登录失败[:：]?\s*/, "");
+      const text = rawText.includes("401") || rawText.includes("{")
+        ? "邮箱或密码错误，或该账号不支持邮箱密码登录"
+        : rawText.split("(trace ID:")[0].trim();
       showNotice("error", `Windsurf 登录失败：${text}`);
     } finally {
       setIsBusy(false);
@@ -1703,9 +1737,13 @@ function App() {
         persistApiPref(next);
         const modelId = resolveModelId(next) ?? "";
         if (isTauri()) {
-          invoke("set_windsurf_api_default_model", { model: modelId }).catch((error) => {
-            showNotice("error", `设置默认模型失败：${String(error)}`);
-          });
+          invoke("set_windsurf_api_default_model", { model: modelId })
+            .then(() => {
+              setWindsurfApi((status) => status ? { ...status, defaultModel: modelId } : status);
+            })
+            .catch((error) => {
+              showNotice("error", `设置默认模型失败：${String(error)}`);
+            });
         }
         return next;
       });
@@ -1861,9 +1899,7 @@ function App() {
                     <WindsurfApiCard
                       status={windsurfApi}
                       busy={isWindsurfApiBusy}
-                      showKey={showWindsurfApiKey}
                       pref={apiPref}
-                      onToggleKey={() => setShowWindsurfApiKey((prev) => !prev)}
                       onToggleService={() => void toggleWindsurfApi()}
                       onCopy={(text, label) => void copyWindsurfApiText(text, label)}
                       onOpenConfig={() => setIsApiConfigOpen(true)}
@@ -2008,7 +2044,7 @@ function App() {
                     value={pasteValue}
                     onChange={(event) => setPasteValue(event.target.value)}
                     spellCheck={false}
-                    placeholder={'{\n  "provider": "windsurf",\n  "email": "name@example.com",\n  "tokens": {\n    "auth1_token": "auth1_...",\n    "session_token": "devin-session-token$..."\n  }\n}'}
+                    placeholder={'{\n  "provider": "windsurf",\n  "email": "name@example.com",\n  "tokens": {\n    "api_key": "codeium-api-key...",\n    "refresh_token": "firebase-refresh-token..."\n  }\n}'}
                   />
                   <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim() || isBusy}>
                     <Clipboard size={20} />
@@ -2055,6 +2091,30 @@ function App() {
                 </div>
               )}
 
+              {mode === "token" && activeProvider === "windsurf" && (
+                <div className="windsurf-password-form">
+                  <label className="field">
+                    <span>Token</span>
+                    <textarea
+                      value={windsurfToken}
+                      onChange={(event) => setWindsurfToken(event.target.value)}
+                      placeholder="eyJhbGciOi... (Firebase id_token JWT)"
+                      spellCheck={false}
+                      rows={5}
+                      disabled={isBusy}
+                    />
+                  </label>
+                  <button
+                    className="wide primary"
+                    onClick={() => void handleWindsurfTokenImport()}
+                    disabled={!windsurfToken.trim() || isBusy}
+                  >
+                    <LockKeyhole size={20} />
+                    {isBusy ? "登录中..." : "登录并添加"}
+                  </button>
+                </div>
+              )}
+
               {mode === "password" && activeProvider === "windsurf" && (
                 <div className="windsurf-password-form">
                   <label className="field">
@@ -2088,7 +2148,7 @@ function App() {
                     {isBusy ? "登录中..." : "登录并添加"}
                   </button>
                   <p className="windsurf-password-tip">
-                    此入口仅适用于使用邮箱 + 密码注册的 Windsurf 账号（Firebase 密码登录）。通过 Google/Devin SSO 登录的账号请用“粘贴凭证”导入 auth1_token 或 session_token。
+                    此入口优先使用 Devin/Auth1 账密登录并换取 session token；失败时再回退 Firebase 老登录。通过 Google/GitHub/SSO 登录且未设置密码的账号请使用 Token 导入。
                   </p>
                 </div>
               )}

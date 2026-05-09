@@ -1,1 +1,3 @@
-https://github.com/guanxiaol/WindsurfPoolAPI
+https://github.com/dwgx/WindsurfAPI
+source: /Users/xusanye/Desktop/WindsurfAPI-2.0.92
+version: 2.0.92

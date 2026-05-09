@@ -27,9 +27,11 @@ const USER_STATUS_PATH = '/exa.seat_management_pb.SeatManagementService/GetUserS
 const MODEL_CONFIGS_PATH = '/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs';
 const RATE_LIMIT_PATH = '/exa.api_server_pb.ApiServerService/CheckUserMessageRateLimit';
 
-// Tunnel HTTPS through an HTTP CONNECT proxy. Mirrors dashboard/windsurf-login.js
-// so per-account outbound IPs stay consistent across login and credit fetch.
+import { isSocks, createSocksTunnel } from './socks.js';
+
+// Tunnel HTTPS through an HTTP CONNECT proxy or SOCKS5 proxy.
 function createProxyTunnel(proxy, targetHost, targetPort) {
+  if (isSocks(proxy)) return createSocksTunnel(proxy, targetHost, targetPort);
   return new Promise((resolve, reject) => {
     const proxyHost = proxy.host.replace(/:\d+$/, '');
     const proxyPort = proxy.port || 8080;
@@ -74,7 +76,7 @@ function postJson(host, path, body, proxy) {
         'Content-Length': Buffer.byteLength(postData),
         'Connect-Protocol-Version': '1',
         'Accept': 'application/json',
-        'User-Agent': 'windsurf/1.108.2',
+        'User-Agent': 'windsurf/1.9600.41',
       },
     };
     const onRes = (res) => {
@@ -126,9 +128,9 @@ export async function getUserStatus(apiKey, proxy = null) {
     metadata: {
       apiKey,
       ideName: 'windsurf',
-      ideVersion: '1.108.2',
+      ideVersion: '1.9600.41',
       extensionName: 'windsurf',
-      extensionVersion: '1.108.2',
+      extensionVersion: '1.9600.41',
       locale: 'en',
     },
   };
@@ -147,7 +149,7 @@ export async function getUserStatus(apiKey, proxy = null) {
         return normalizeUserStatus(res.data);
       } catch (e) {
         lastErr = e;
-        log.debug(`GetUserStatus host ${host} failed: ${e.message}`);
+        log.debug(`getCreditUsage ${host} failed: ${e.message}`);
         if (px && isProxyError(e)) break; // skip second host, go straight to direct
       }
     }
@@ -214,9 +216,9 @@ function buildMetadata(apiKey) {
   return {
     apiKey,
     ideName: 'windsurf',
-    ideVersion: '1.108.2',
+    ideVersion: '1.9600.41',
     extensionName: 'windsurf',
-    extensionVersion: '1.108.2',
+    extensionVersion: '1.9600.41',
     locale: 'en',
   };
 }
@@ -259,6 +261,83 @@ export async function getCascadeModelConfigs(apiKey, proxy = null) {
 }
 
 /**
+ * Register a Codeium/Windsurf account from a Firebase ID token. v2.0.57:
+ * tries the new `register.windsurf.com/.../SeatManagementService/RegisterUser`
+ * Connect-RPC path first, then falls back to the legacy
+ * `api.codeium.com/register_user/` REST path. Windsurf migrated the seat-
+ * management surface in 2026 — the new path is the one wam-bundle and
+ * WindsurfSwitch use, and is what the official Windsurf 2.0.67 IDE talks
+ * to. The fallback keeps existing /auth/login flows alive even if the
+ * new host has a regional outage or a temporary 5xx.
+ *
+ * Optional `customRequest(url, opts, body)` lets callers (windsurf-login.js)
+ * inject fingerprint headers + proxy tunneling. When omitted we use the
+ * built-in postJson with no fingerprint and direct egress.
+ *
+ * @param {string} firebaseToken
+ * @param {object} [opts]
+ * @param {(url:string, opts:object, body:string) => Promise<{status:number,data:any,raw:string}>} [opts.requestFn]
+ *   Custom HTTP function. Receives full URL, fetch-like opts, and stringified body.
+ * @param {object} [opts.proxy]  Used by the default postJson path.
+ * @returns {Promise<{apiKey, name, apiServerUrl, source: 'new'|'legacy'}>}
+ */
+export async function registerWithFirebaseToken(firebaseToken, opts = {}) {
+  if (!firebaseToken || typeof firebaseToken !== 'string') {
+    throw new Error('registerWithFirebaseToken: firebase token required');
+  }
+  const body = { firebase_id_token: firebaseToken };
+  const bodyStr = JSON.stringify(body);
+  const proxy = opts.proxy || null;
+
+  // Connect-RPC compliant request to register.windsurf.com.
+  const newUrl = 'https://register.windsurf.com/exa.seat_management_pb.SeatManagementService/RegisterUser';
+  // Legacy REST endpoint at api.codeium.com.
+  const legacyUrl = 'https://api.codeium.com/register_user/';
+
+  const tryUrl = async (url, source) => {
+    if (typeof opts.requestFn === 'function') {
+      const headers = {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(bodyStr),
+        'Connect-Protocol-Version': '1',
+        'Accept': 'application/json',
+        'User-Agent': 'windsurf/1.9600.41',
+      };
+      const r = await opts.requestFn(url, { method: 'POST', headers }, bodyStr);
+      return { status: r.status, data: r.data, raw: r.raw, source };
+    }
+    // Default path: built-in postJson on the host of the URL.
+    const u = new URL(url);
+    const r = await postJson(u.hostname, u.pathname, body, proxy);
+    return { status: r.status, data: r.data, raw: r.raw, source };
+  };
+
+  const errors = [];
+  for (const [url, source] of [[newUrl, 'new'], [legacyUrl, 'legacy']]) {
+    try {
+      const r = await tryUrl(url, source);
+      // Both paths return either snake_case (api_key/name/api_server_url) or
+      // camelCase (apiKey/name/apiServerUrl) depending on the gateway.
+      const apiKey = r.data?.api_key || r.data?.apiKey;
+      const name = r.data?.name || '';
+      const apiServerUrl = r.data?.api_server_url || r.data?.apiServerUrl || '';
+      if (r.status < 400 && apiKey) {
+        if (source === 'legacy') {
+          log.warn(`RegisterUser fell back to legacy api.codeium.com (new endpoint failed)`);
+        } else {
+          log.info(`RegisterUser via register.windsurf.com OK (key=${apiKey.slice(0, 12)}...)`);
+        }
+        return { apiKey, name, apiServerUrl, source };
+      }
+      errors.push(`${source}=HTTP ${r.status} ${r.raw?.slice(0, 120) || '(empty)'}`);
+    } catch (e) {
+      errors.push(`${source}=${e.message}`);
+    }
+  }
+  throw new Error(`RegisterUser failed both endpoints: ${errors.join(' | ')}`);
+}
+
+/**
  * Pre-flight check: does this account still have message capacity?
  * Returns { hasCapacity, messagesRemaining, maxMessages }.
  * -1 means unlimited.
@@ -284,6 +363,7 @@ export async function checkMessageRateLimit(apiKey, proxy = null) {
           hasCapacity: res.data.hasCapacity !== false,
           messagesRemaining: res.data.messagesRemaining ?? -1,
           maxMessages: res.data.maxMessages ?? -1,
+          retryAfterMs: Number.isFinite(res.data.retryAfterMs) ? res.data.retryAfterMs : null,
         };
       } catch (e) {
         lastErr = e;
@@ -294,5 +374,5 @@ export async function checkMessageRateLimit(apiKey, proxy = null) {
   }
   // On failure, assume capacity so we don't block requests.
   log.warn(`CheckRateLimit failed: ${lastErr?.message}`);
-  return { hasCapacity: true, messagesRemaining: -1, maxMessages: -1 };
+  return { hasCapacity: true, messagesRemaining: -1, maxMessages: -1, retryAfterMs: null };
 }

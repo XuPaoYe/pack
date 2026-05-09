@@ -61,6 +61,17 @@ fi
 
 mkdir -p "$OUTPUT_DIR"
 
+repair_macos_binary() {
+  local bin="$1"
+  chmod +x "$bin"
+  if command -v xattr >/dev/null 2>&1; then
+    xattr -d com.apple.quarantine "$bin" 2>/dev/null || true
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - "$bin" >/dev/null 2>&1 || true
+  fi
+}
+
 # 1) 编译 WindsurfPoolAPI sidecar
 echo "▶ bun build --compile --target=$BUN_TARGET"
 SIDECAR_OUT="$OUTPUT_DIR/windsurfapi-$RUST_TRIPLE"
@@ -72,7 +83,7 @@ fi
 bun build --compile --target="$BUN_TARGET" \
   "$VENDOR_DIR/src/index.js" \
   --outfile "$SIDECAR_OUT"
-chmod +x "$SIDECAR_OUT"
+repair_macos_binary "$SIDECAR_OUT"
 echo "✓ $SIDECAR_OUT"
 
 # 2) 抽 Windsurf Language Server 二进制
@@ -81,7 +92,7 @@ LS_OUT="$OUTPUT_DIR/language_server-$RUST_TRIPLE$WINDOWS_SUFFIX"
 # 用户显式指定优先
 if [[ -n "${WINDSURF_LS_PATH:-}" && -f "$WINDSURF_LS_PATH" ]]; then
   cp "$WINDSURF_LS_PATH" "$LS_OUT"
-  chmod +x "$LS_OUT"
+  repair_macos_binary "$LS_OUT"
   echo "✓ $LS_OUT (来自 \$WINDSURF_LS_PATH)"
   exit 0
 fi
@@ -128,7 +139,7 @@ EOF
 fi
 
 cp "$found" "$LS_OUT"
-chmod +x "$LS_OUT"
+repair_macos_binary "$LS_OUT"
 echo "✓ $LS_OUT (来自 $found)"
 echo
 echo "🟢 sidecar 构建完成。可以 npm run tauri dev 了。"
