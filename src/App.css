@@ -2312,6 +2312,7 @@ textarea:focus {
 
 /* Windsurf 本地 API 服务 card */
 .account-row.windsurf-api-card {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 356px; /* 匹配标准卡片高度 */
@@ -2361,13 +2362,6 @@ textarea:focus {
   min-width: 0;
 }
 
-.windsurf-api-title-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-}
-
 .windsurf-api-title strong {
   font-size: 16px;
   font-weight: 600;
@@ -2378,12 +2372,14 @@ textarea:focus {
 }
 
 .windsurf-api-status-dot {
+  position: absolute;
+  top: 14px;
+  right: 14px;
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: var(--text-soft);
   transition: all 0.3s ease;
-  flex-shrink: 0;
 }
 
 .windsurf-api-status-dot.running {

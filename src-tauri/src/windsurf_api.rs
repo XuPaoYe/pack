@@ -315,3 +315,106 @@ fn models_payload() -> Value {
         .collect();
     json!({ "object": "list", "data": data })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    fn http_get(addr: &str, path: &str, auth: Option<&str>) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let auth_line = auth
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        let req =
+            format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_line}Connection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).unwrap();
+        let status = buf
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body = buf.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    fn http_post(addr: &str, path: &str, auth: &str, body: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {auth}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).unwrap();
+        let mut buf = String::new();
+        stream.read_to_string(&mut buf).unwrap();
+        let status = buf
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        let resp_body = buf.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, resp_body)
+    }
+
+    #[test]
+    fn lifecycle_and_routes() {
+        let key = "agt_wsf_test_key_12345";
+        let status = start("127.0.0.1", 0, key).expect("start");
+        assert!(status.running);
+        let port = status.actual_port.expect("actual port");
+        assert!(port > 0);
+        let addr = format!("127.0.0.1:{port}");
+
+        // 401 without auth
+        let (code, _) = http_get(&addr, "/v1/models", None);
+        assert_eq!(code, 401, "missing auth should be 401");
+
+        // 401 with wrong key
+        let (code, _) = http_get(&addr, "/v1/models", Some("wrong"));
+        assert_eq!(code, 401, "wrong key should be 401");
+
+        // 200 with right key
+        let (code, body) = http_get(&addr, "/v1/models", Some(key));
+        assert_eq!(code, 200);
+        assert!(body.contains("\"object\":\"list\""), "body: {body}");
+        assert!(body.contains("claude-sonnet-4"), "body: {body}");
+
+        // 404 unknown path
+        let (code, _) = http_get(&addr, "/nope", Some(key));
+        assert_eq!(code, 404);
+
+        // 501 chat completions placeholder
+        let (code, body) =
+            http_post(&addr, "/v1/chat/completions", key, r#"{"model":"x","messages":[]}"#);
+        assert_eq!(code, 501);
+        assert!(body.contains("not_implemented"), "body: {body}");
+
+        // stop is idempotent
+        stop().unwrap();
+        stop().unwrap();
+    }
+
+    #[test]
+    fn restart_picks_new_port() {
+        let key = "agt_wsf_restart_test";
+        let s1 = start("127.0.0.1", 0, key).unwrap();
+        let p1 = s1.actual_port.unwrap();
+        let s2 = start("127.0.0.1", 0, key).unwrap();
+        let p2 = s2.actual_port.unwrap();
+        assert!(p1 > 0 && p2 > 0);
+        // 重启服务可成功，端口可能相同也可能不同；关键是 RUNTIME 已替换
+        let cur = current_status("127.0.0.1", 0, key);
+        assert!(cur.running);
+        assert_eq!(cur.actual_port, Some(p2));
+        stop().unwrap();
+    }
+
+    #[test]
+    fn empty_key_rejected() {
+        let err = start("127.0.0.1", 0, "").unwrap_err();
+        assert!(err.contains("API Key"));
+    }
+}

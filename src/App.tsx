@@ -340,12 +340,10 @@ function WindsurfApiCard({
           <Server size={22} strokeWidth={1.8} />
         </div>
         <div className="windsurf-api-title">
-          <div className="windsurf-api-title-row">
-            <strong>API 服务 (Windsurf)</strong>
-            <div className={clsx("windsurf-api-status-dot", running && "running")} />
-          </div>
+          <strong>API 服务</strong>
           <span>支持本机与局域网调用</span>
         </div>
+        <div className={clsx("windsurf-api-status-dot", running && "running")} />
       </div>
 
       <dl className="windsurf-api-grid">

@@ -4368,21 +4368,15 @@ fn load_settings(app: tauri::AppHandle) -> Result<Option<AppSettings>, String> {
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
     apply_system_auto_launch(&app, settings.auto_launch)?;
-    let conn = open_app_db(&app)?;
-    let value_json =
-        serde_json::to_string(&settings).map_err(|error| format!("序列化设置失败: {error}"))?;
-    conn.execute(
-        r#"
-      INSERT INTO settings (key, value_json, updated_at)
-      VALUES ('app', ?1, ?2)
-      ON CONFLICT(key) DO UPDATE SET
-        value_json = excluded.value_json,
-        updated_at = excluded.updated_at
-      "#,
-        params![value_json, now_ts()],
-    )
-    .map_err(|error| format!("保存设置失败: {error}"))?;
-    Ok(())
+    // 前端不维护 windsurf_api_* 字段，从已有记录里继承，避免被默认值覆盖。
+    let mut merged = settings;
+    if let Ok(existing) = read_settings_record(&app) {
+        merged.windsurf_api_enabled = existing.windsurf_api_enabled;
+        merged.windsurf_api_host = existing.windsurf_api_host;
+        merged.windsurf_api_port = existing.windsurf_api_port;
+        merged.windsurf_api_key = existing.windsurf_api_key;
+    }
+    write_settings_record(&app, &merged)
 }
 
 #[tauri::command]
