@@ -141,9 +141,12 @@ AGENTS.md                AI 开发协作说明
 ```bash
 npm run dev                  # 用户版 App 开发启动
 npm run dev:full             # 完整信息版 App 开发启动
-npm run build                # 用户版 App 打包
-npm run build:full           # 完整信息版 App 打包
-npm run build:mac            # 用户版 mac universal App 打包
-npm run build:win:x64        # 用户版 Windows x64 App 打包
-npm run build:win:arm64      # 用户版 Windows ARM64 App 打包
+npm run build                # 当前平台，公开版
+npm run build:full           # 当前平台，完全版
+npm run build:mac            # mac universal，公开版
+npm run build:mac:full       # mac universal，完全版
+npm run build:win:x64        # Windows x64，公开版
+npm run build:win:x64:full   # Windows x64，完全版
+npm run build:win:arm64      # Windows ARM64，公开版
+npm run build:win:arm64:full # Windows ARM64，完全版
 ```

@@ -141,19 +141,46 @@ find_ls() {
   local env_name=""
   local candidates=()
 
+  # 多 app bundle 路径：用户经常把第二个架构的 Windsurf 装到 -arm64 / -x64
+  # 后缀，或者 ~/Applications；都纳入候选省掉手动设 env 的麻烦。
+  local mac_app_bundles=(
+    "/Applications/Windsurf-arm64.app"
+    "/Applications/Windsurf-arm.app"
+    "/Applications/Windsurf-x64.app"
+    "/Applications/Windsurf-intel.app"
+    "/Applications/Windsurf.app"
+    "$HOME/Applications/Windsurf-arm64.app"
+    "$HOME/Applications/Windsurf-arm.app"
+    "$HOME/Applications/Windsurf-x64.app"
+    "$HOME/Applications/Windsurf-intel.app"
+    "$HOME/Applications/Windsurf.app"
+  )
+
+  local win_install_dirs=(
+    "C:/Program Files/Windsurf"
+    "C:/Program Files (x86)/Windsurf"
+    "$HOME/AppData/Local/Programs/Windsurf"
+  )
+
   case "$rust_triple" in
     aarch64-apple-darwin)
       env_name="WINDSURF_LS_ARM64_PATH"
-      candidates+=(
-        "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm"
-        "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm64"
-      )
+      local app
+      for app in "${mac_app_bundles[@]}"; do
+        candidates+=(
+          "$app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm"
+          "$app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm64"
+        )
+      done
       ;;
     x86_64-apple-darwin)
       env_name="WINDSURF_LS_X64_PATH"
-      candidates+=(
-        "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64"
-      )
+      local app
+      for app in "${mac_app_bundles[@]}"; do
+        candidates+=(
+          "$app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64"
+        )
+      done
       ;;
     x86_64-unknown-linux-gnu)
       candidates+=("/opt/windsurf/language_server_linux_x64")
@@ -163,14 +190,20 @@ find_ls() {
       ;;
     x86_64-pc-windows-msvc)
       env_name="WINDSURF_LS_X64_PATH"
-      candidates+=("C:/Program Files/Windsurf/resources/app/extensions/windsurf/bin/language_server_windows_x64.exe")
+      local d
+      for d in "${win_install_dirs[@]}"; do
+        candidates+=("$d/resources/app/extensions/windsurf/bin/language_server_windows_x64.exe")
+      done
       ;;
     aarch64-pc-windows-msvc)
       env_name="WINDSURF_LS_ARM64_PATH"
-      candidates+=(
-        "C:/Program Files/Windsurf/resources/app/extensions/windsurf/bin/language_server_windows_arm64.exe"
-        "C:/Program Files/Windsurf/resources/app/extensions/windsurf/bin/language_server_windows_arm.exe"
-      )
+      local d
+      for d in "${win_install_dirs[@]}"; do
+        candidates+=(
+          "$d/resources/app/extensions/windsurf/bin/language_server_windows_arm64.exe"
+          "$d/resources/app/extensions/windsurf/bin/language_server_windows_arm.exe"
+        )
+      done
       ;;
   esac
 
@@ -206,11 +239,202 @@ EOF
   return 1
 }
 
+# LS 二进制是平台特定原生码（x64/arm64 + macos/linux/windows 互不通用）。
+# 自动获取来源按优先级：
+#   1) 本地 Windsurf 安装（find_ls 已搜过 mac/win/linux 的多个候选目录）
+#   2) GitHub Release（dwgx/WindsurfAPI、CaiJingLong/windsurf-linux-server-release）
+#      —— 仅 mac/linux 资产
+#   3) Windsurf 官方 archive（windsurf-stable.codeiumdata.com）
+#      —— Windows zip / Linux tar.gz / mac dmg / mac zip 都拿得到，需要解压
+# 下载产物缓存到 .vendor-build/ls-cache/，避免重复拉 ~150MB。
+LS_CACHE_DIR="$REPO_ROOT/.vendor-build/ls-cache"
+UPSTREAM_GH_PRIMARY="https://github.com/dwgx/WindsurfAPI/releases/latest/download"
+UPSTREAM_GH_FALLBACK="https://github.com/CaiJingLong/windsurf-linux-server-release/releases/latest/download"
+WSF_RELEASES_PAGE="https://windsurf.com/editor/releases"
+
+# 上游 Github release 直接发的扁平资产（仅 macOS/Linux）。
+upstream_asset_for_triple() {
+  case "$1" in
+    aarch64-apple-darwin)        echo "language_server_macos_arm" ;;
+    x86_64-apple-darwin)         echo "language_server_macos_x64" ;;
+    x86_64-unknown-linux-gnu)    echo "language_server_linux_x64" ;;
+    aarch64-unknown-linux-gnu)   echo "language_server_linux_arm" ;;
+    *) echo "" ;;
+  esac
+}
+
+download_ls_from_github() {
+  local rust_triple="$1"
+  local asset
+  asset="$(upstream_asset_for_triple "$rust_triple")"
+  [[ -z "$asset" ]] && return 1
+
+  local cached="$LS_CACHE_DIR/$asset"
+  if [[ -f "$cached" ]]; then
+    echo "$cached"
+    return 0
+  fi
+
+  local tmp="${cached}.partial.$$"
+  for base in "$UPSTREAM_GH_PRIMARY" "$UPSTREAM_GH_FALLBACK"; do
+    local url="$base/$asset"
+    echo "▶ curl $url" >&2
+    if curl -fL --progress-bar -o "$tmp" "$url" 2>/dev/null; then
+      mv -f "$tmp" "$cached"
+      chmod +x "$cached"
+      echo "$cached"
+      return 0
+    fi
+    rm -f "$tmp"
+  done
+  return 1
+}
+
+# Windsurf 官方 release 页里的 archive 直链（zip / tar.gz / dmg），
+# 解压后 LS 在 `resources/app/extensions/windsurf/bin/` 下。
+# 我们对每个 rust_triple 关心的：archive 类型路径 + 内层 LS 文件名 + 缓存名。
+release_archive_descriptor() {
+  case "$1" in
+    x86_64-pc-windows-msvc)
+      echo "win32-x64-archive|.zip|resources/app/extensions/windsurf/bin/language_server_windows_x64.exe|language_server_windows_x64.exe"
+      ;;
+    aarch64-pc-windows-msvc)
+      # 上游 archive 内层文件名是 _arm.exe（与 macOS arm 同样的简写习惯），
+      # 不是 _arm64.exe；曾因这里写错导致 unzip 静默失败。
+      echo "win32-arm64-archive|.zip|resources/app/extensions/windsurf/bin/language_server_windows_arm.exe|language_server_windows_arm.exe"
+      ;;
+    x86_64-apple-darwin)
+      # mac dmg 复杂，优先用 GitHub release；这里给个补救路径，用 zip archive。
+      echo "darwin-x64|.zip|Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64|language_server_macos_x64"
+      ;;
+    aarch64-apple-darwin)
+      echo "darwin-arm64|.zip|Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm|language_server_macos_arm"
+      ;;
+    x86_64-unknown-linux-gnu)
+      echo "linux-x64|.tar.gz|Windsurf/resources/app/extensions/windsurf/bin/language_server_linux_x64|language_server_linux_x64"
+      ;;
+    *) echo "" ;;
+  esac
+}
+
+# 抓 release 页第一条匹配前缀 + 后缀的 URL（按 stable 通道排序，第一条即最新）。
+fetch_release_url() {
+  local archive_path="$1"  # e.g. win32-x64-archive
+  local extension="$2"     # e.g. .zip
+  local cache="$LS_CACHE_DIR/.releases-page.html"
+  mkdir -p "$LS_CACHE_DIR"
+  if [[ ! -f "$cache" ]] || [[ $(($(date +%s) - $(stat -f %m "$cache" 2>/dev/null || echo 0))) -gt 3600 ]]; then
+    if ! curl -fsSL "$WSF_RELEASES_PAGE" -o "$cache.tmp"; then
+      rm -f "$cache.tmp"
+      return 1
+    fi
+    mv -f "$cache.tmp" "$cache"
+  fi
+  # release 页面里 stable 链接和 next 链接都有，优先 stable。
+  local pattern="https://windsurf-stable\\.codeiumdata\\.com/${archive_path}/stable/[^\" ]+${extension//./\\.}"
+  grep -oE "$pattern" "$cache" | head -1
+}
+
+extract_ls_from_archive() {
+  local archive="$1"        # 下载下来的 zip / tar.gz
+  local member="$2"         # archive 内 LS 路径
+  local out_name="$3"       # 抽出后存到 LS_CACHE_DIR 的文件名
+  local out="$LS_CACHE_DIR/$out_name"
+
+  case "$archive" in
+    *.zip)
+      # unzip -p 直接管到 stdout
+      if ! unzip -p "$archive" "$member" >"$out.partial" 2>/dev/null; then
+        rm -f "$out.partial"
+        return 1
+      fi
+      ;;
+    *.tar.gz|*.tgz)
+      if ! tar -xzf "$archive" -O "$member" >"$out.partial" 2>/dev/null; then
+        rm -f "$out.partial"
+        return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+
+  if [[ ! -s "$out.partial" ]]; then
+    rm -f "$out.partial"
+    return 1
+  fi
+  mv -f "$out.partial" "$out"
+  chmod +x "$out"
+  echo "$out"
+}
+
+download_ls_from_release_archive() {
+  local rust_triple="$1"
+  local desc
+  desc="$(release_archive_descriptor "$rust_triple")"
+  [[ -z "$desc" ]] && return 1
+
+  local archive_path extension member cache_name
+  IFS='|' read -r archive_path extension member cache_name <<<"$desc"
+
+  local cached="$LS_CACHE_DIR/$cache_name"
+  if [[ -f "$cached" ]]; then
+    echo "$cached"
+    return 0
+  fi
+
+  local url
+  url="$(fetch_release_url "$archive_path" "$extension")"
+  if [[ -z "$url" ]]; then
+    return 1
+  fi
+
+  local archive="$LS_CACHE_DIR/$(basename "$url")"
+  if [[ ! -f "$archive" ]]; then
+    echo "▶ curl $url" >&2
+    if ! curl -fL --progress-bar -o "$archive.partial" "$url"; then
+      rm -f "$archive.partial"
+      return 1
+    fi
+    mv -f "$archive.partial" "$archive"
+  fi
+
+  extract_ls_from_archive "$archive" "$member" "$cache_name" || return 1
+}
+
+download_ls() {
+  local rust_triple="$1"
+  if ! command -v curl >/dev/null 2>&1; then
+    return 1
+  fi
+  mkdir -p "$LS_CACHE_DIR"
+
+  # 1) GitHub release 直发资产：mac / linux 极快（小，~150MB 单文件）
+  if found="$(download_ls_from_github "$rust_triple")"; then
+    echo "$found"
+    return 0
+  fi
+  # 2) Windsurf 官方 archive：Windows / 兜底 mac+linux
+  if found="$(download_ls_from_release_archive "$rust_triple")"; then
+    echo "$found"
+    return 0
+  fi
+  return 1
+}
+
 copy_ls() {
   local rust_triple="$1"
   local out="$2"
-  local found
-  found="$(find_ls "$rust_triple")"
+  local found=""
+  if found="$(find_ls "$rust_triple" 2>/dev/null)"; then
+    :
+  else
+    echo "▶ 本地未找到 $rust_triple 的 LS，尝试从上游 release 下载..." >&2
+    if ! found="$(download_ls "$rust_triple")"; then
+      # 触发 find_ls 的清晰报错（候选列表）
+      find_ls "$rust_triple" >/dev/null
+      return 1
+    fi
+  fi
   cp "$found" "$out"
   repair_macos_binary "$out"
   echo "✓ $out (来自 $found)"

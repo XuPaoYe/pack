@@ -1,0 +1,105 @@
+name: release
+
+# 触发：
+#   1. 推 v* tag（如 v0.1.0）—— 自动出 release（draft）
+#   2. workflow_dispatch —— Actions 页面手动跑
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # 让 tauri-action 能创建 release 并上传产物
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      # 三个目标平台并行：mac universal 一个 dmg 覆盖 M+Intel；
+      # Windows 用原生 windows-latest runner 出 nsis exe + msi，零交叉编译。
+      matrix:
+        include:
+          - name: macOS (universal)
+            os: macos-latest
+            tauri_target: universal-apple-darwin
+            sidecar_target: universal-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - name: Windows x64
+            os: windows-latest
+            tauri_target: x86_64-pc-windows-msvc
+            sidecar_target: windows-x64
+            rust_targets: x86_64-pc-windows-msvc
+          - name: Windows arm64
+            os: windows-latest
+            tauri_target: aarch64-pc-windows-msvc
+            sidecar_target: windows-arm64
+            rust_targets: aarch64-pc-windows-msvc
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Bun（编 sidecar 要 bun --compile）
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          # 不同 target 的产物隔离，否则 mac/win 混存会反复重编
+          key: ${{ matrix.tauri_target }}
+
+      - name: Install npm deps
+        run: npm ci
+
+      # build-sidecar.sh 会：
+      #   1. bun build --compile 把 vendor/windsurfapi 打成 superai-api-<triple>(.exe)
+      #   2. 自动从 windsurf.com / GitHub Release 拉对应平台的 LS 二进制
+      #      → 写到 src-tauri/binaries/language_server-<triple>(.exe)
+      # tauri build 之后会被 externalBin 自动 bundle 进 dmg/exe/msi。
+      - name: Build sidecar binaries
+        shell: bash
+        env:
+          TARGET: ${{ matrix.sidecar_target }}
+        run: bash scripts/build-sidecar.sh
+
+      - name: Tauri build & release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # public 构建：邮箱 / token 脱敏，UI 显示 SUPERAI-XXXXXXX。
+          # 想发完全版改成不注入这一行，或者再加一个 release-full.yml。
+          VITE_SUPERAI_PUBLIC_BUILD: "1"
+          # 有 updater 私钥时打开（仓库 secret 里塞这两个就行）：
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Super AI ${{ github.ref_name }}"
+          releaseBody: |
+            See AGENTS.md / README for what's in this build.
+
+            Artifacts:
+            - macOS universal dmg (M-series + Intel)
+            - Windows x64 NSIS installer + MSI
+            - Windows arm64 NSIS installer + MSI
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.tauri_target }}
