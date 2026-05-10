@@ -164,7 +164,7 @@ Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authoriz
 [tiny_http 反向代理 @ src-tauri/src/windsurf_api.rs]
     | Bearer <inner_key>
     v
-[windsurfapi sidecar (bun --compile vendor/windsurfapi)]
+[superal-api sidecar (bun --compile vendor/windsurfapi)]
     | spawns
     v
 [language_server 二进制 (Windsurf 闭源 LS)]
@@ -172,7 +172,7 @@ Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authoriz
 
 - `vendor/windsurfapi/` 镜像了上游 [WindsurfPoolAPI](https://github.com/guanxiaol/WindsurfPoolAPI)（MIT），版本写在 `VERSION.txt`。不要直接改 vendor 里的 JS，要升级请 bump version 后重新拷贝。
 - `scripts/build-sidecar.sh` 用 `bun build --compile` 编当前平台的 sidecar，并从 `/Applications/Windsurf.app/...`（或 `WINDSURF_LS_PATH`）抽 LS 二进制，统一放到 `src-tauri/binaries/<name>-<rust-target-triple>(.exe)`。
-- `tauri.conf.json` 通过 `bundle.externalBin` 注册这两个二进制；dev 与打包时 Tauri-CLI 自动复制到 app 可执行同目录。
+- `tauri.conf.json` 通过 `bundle.externalBin` 注册 `binaries/superal-api` 与 `binaries/language_server`；dev 与打包时 Tauri-CLI 自动复制到 app 可执行同目录。
 - 启动流程：`start_windsurf_api` 命令 → 预挑两个空闲端口 → spawn sidecar 子进程 → 解析 stdout `Server on http://0.0.0.0:N` 拿 inner port → 起 tiny_http 反向代理。
 - 双层鉴权：外层 `agt_wsf_*` 由我们校验，内层 sidecar 用我们生成的随机 inner key（不持久化）。
 - 账号同步：`sync_windsurf_accounts_to_api` 命令把 DB 里的 Windsurf 账号映射成 `{refresh_token | api_key | token, label}` POST 到 sidecar `/auth/login`。`upsert_accounts_into_db` 写库后会在 API 服务运行时自动触发同步。
@@ -195,8 +195,7 @@ Run before handing off meaningful changes:
 npm run build:sidecar  # 第一次或 vendor 升级后
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
 cargo test --manifest-path src-tauri/Cargo.toml --lib windsurf_api -- --test-threads=1
-npm run build
-npm run lint
+npm run check  # = node scripts/app-build.mjs && npm run lint
 ```
 
 E2E 反向代理验证（需要 sidecar 已构建）：
