@@ -52,11 +52,6 @@
     --modal-line: rgba(255, 255, 255, 0.16);
     --modal-shadow: 0 28px 70px -24px rgba(0, 0, 0, 0.92), 0 0 0 1px rgba(255, 255, 255, 0.04);
   }
-
-  .failure-list {
-    background: #2a1d18;
-    border-color: #713f2a;
-  }
 }
 
 :root[data-theme="light"] {

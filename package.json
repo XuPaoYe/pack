@@ -4,16 +4,16 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
-    "web:dev": "vite",
+    "dev": "node scripts/dev.mjs",
+    "dev:full": "node scripts/dev.mjs full",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
     "tauri:build": "node scripts/tauri-build.mjs app",
+    "tauri:build:full": "node scripts/tauri-build.mjs app full",
     "tauri:build:dmg": "node scripts/tauri-build.mjs dmg",
+    "tauri:build:dmg:full": "node scripts/tauri-build.mjs dmg full",
     "build:sidecar": "bash scripts/build-sidecar.sh",
-    "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "check": "node scripts/app-build.mjs && npm run lint"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.0",

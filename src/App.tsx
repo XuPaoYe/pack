@@ -56,6 +56,8 @@ type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey";
 type OAuthProvider = "codex" | "gemini";
 type ThemeMode = "system" | "light" | "dark";
 
+const IS_PUBLIC_BUILD = import.meta.env.VITE_SUPERAI_PUBLIC_BUILD === "1";
+
 const themeOptions: Array<{ key: ThemeMode; label: string; icon: typeof Monitor }> = [
   { key: "system", label: "跟随系统", icon: Monitor },
   { key: "light", label: "浅色", icon: Sun },
@@ -183,9 +185,18 @@ function providerLabel(provider: Provider) {
 }
 
 function sanitizeUserFacingText(text: string) {
-  return text
+  let next = text
     .replaceAll("Windsurf", "SuperAl")
     .replaceAll("windsurfapi", "superal-sidecar");
+  if (IS_PUBLIC_BUILD) {
+    next = next
+      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account]")
+      .replace(/(password|pwd|api[_-]?key|session[_-]?token|auth1[_-]?token|refresh[_-]?token|access[_-]?token|id[_-]?token)(["'\s:=]+)([^"',\s}]+)/gi, "$1$2[secret]")
+      .replace(/\b(auth1_[A-Za-z0-9._-]+)/g, "[secret]")
+      .replace(/\b(devin-session-token\$[A-Za-z0-9._-]+)/g, "[secret]")
+      .replace(/\b(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)\b/g, "[secret]");
+  }
+  return next;
 }
 
 function isAppLogEntry(value: unknown): value is AppLogEntry {
@@ -213,7 +224,12 @@ function loadAppLogs() {
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
-    return pruneAppLogs(parsed.filter(isAppLogEntry));
+    return pruneAppLogs(
+      parsed.filter(isAppLogEntry).map((log) => ({
+        ...log,
+        text: sanitizeUserFacingText(log.text),
+      })),
+    );
   } catch {
     return [];
   }
@@ -241,6 +257,28 @@ function isCurrentAccount(account: ManagedAccount) {
   return account.status?.state === "available" && account.status.label === "当前";
 }
 
+function accountTitle(account: ManagedAccount) {
+  return account.email || account.displayName || account.accountId || account.id;
+}
+
+function publicAccountCode(account: ManagedAccount, prefix: string) {
+  const input = `${account.provider}:${account.id}:${account.email}:${account.accountId ?? ""}`;
+  let hash = 2166136261;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${prefix}-${(hash >>> 0).toString(36).toUpperCase().padStart(7, "0").slice(0, 7)}`;
+}
+
+function shouldHideAccountDetails(account: ManagedAccount) {
+  return IS_PUBLIC_BUILD && account.provider === "windsurf";
+}
+
+function accountDisplayLabel(account: ManagedAccount) {
+  return shouldHideAccountDetails(account) ? publicAccountCode(account, "SUPERAI") : account.email;
+}
+
 function sortAccountsForView(items: ManagedAccount[]) {
   return [...items].sort((a, b) => {
     const currentDelta = Number(isCurrentAccount(b)) - Number(isCurrentAccount(a));
@@ -255,13 +293,17 @@ function AccountStateCorner({ account }: { account: ManagedAccount }) {
   const status = account.status ?? fallbackStatus(account);
   const isCurrent = isCurrentAccount(account);
   return (
-    <span className={clsx("state-corner", status.state, isCurrent && "current")} title={isCurrent ? "当前启用账号" : (status.reason ?? stateLabel(status.state))}>
+    <span className={clsx("state-corner", status.state, isCurrent && "current")} title={shouldHideAccountDetails(account) ? undefined : isCurrent ? "当前启用账号" : (status.reason ?? stateLabel(status.state))}>
       {isCurrent ? "启用" : stateLabel(status.state)}
     </span>
   );
 }
 
 function AccountPlanBadge({ account }: { account: ManagedAccount }) {
+  if (shouldHideAccountDetails(account)) {
+    return <span className="pill plan unknown">{publicAccountCode(account, "TIER")}</span>;
+  }
+
   const badge = resolvePlanBadge(account);
   return <span className={clsx("pill", "plan", badge.tone)}>{badge.label}</span>;
 }
@@ -276,25 +318,31 @@ function localizeQuotaLabel(label: string): string {
 
 function QuotaMeters({ account }: { account: ManagedAccount }) {
   const isUnavailable = account.status?.state === "unavailable";
-  const metrics =
+  const rawMetrics =
     account.quota?.metrics?.length
       ? account.quota.metrics
       : [
           { key: "codex-5h", label: "5H", remainingPercent: 0 },
           { key: "codex-weekly", label: "周限", remainingPercent: 0 },
         ];
+  const metrics =
+    shouldHideAccountDetails(account)
+      ? rawMetrics.filter((metric) => metric.key === "windsurf-daily" || localizeQuotaLabel(metric.label) === "日限")
+      : rawMetrics;
 
   return (
     <div className="quota-meters">
       {metrics.slice(0, 3).map((metric) => {
         const remaining = isUnavailable ? 0 : metric.remainingPercent;
         const state = isUnavailable ? "unavailable" : (metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available"));
-        const resetText = isUnavailable ? "--" : (formatResetTime(metric.resetAt) ?? "--");
+        const shouldHideReset = shouldHideAccountDetails(account);
+        const resetText = shouldHideReset ? "" : isUnavailable ? "--" : (formatResetTime(metric.resetAt) ?? "--");
+        const meterTitle = shouldHideAccountDetails(account) ? localizeQuotaLabel(metric.label) : metric.detail ?? account.quota?.error ?? metric.label;
         return (
-          <div className={clsx("quota-meter", state)} key={metric.key} title={metric.detail ?? account.quota?.error ?? metric.label}>
+          <div className={clsx("quota-meter", state)} key={metric.key} title={meterTitle}>
             <div className="quota-meter-head">
               <span>{localizeQuotaLabel(metric.label)}</span>
-              <time className="quota-meter-reset">{resetText}</time>
+              <time className={clsx("quota-meter-reset", shouldHideReset && "hidden")}>{resetText}</time>
               <div className="quota-meter-value">
                 <strong>{remaining === undefined ? "N/A" : `${remaining}%`}</strong>
               </div>
@@ -891,7 +939,7 @@ function AppModal({
 
 function App() {
   const [accounts, setAccounts] = useState<ManagedAccount[]>([]);
-  const [activeProvider, setActiveProvider] = useState<Provider>("codex");
+  const [activeProvider, setActiveProvider] = useState<Provider>("windsurf");
   const [mode, setMode] = useState<ImportMode>(defaultImportMode);
   const [pasteValue, setPasteValue] = useState("");
   const [windsurfBatchKeys, setWindsurfBatchKeys] = useState("");
@@ -1513,7 +1561,7 @@ function App() {
         sortAccountsForView(current.map((item) => providerAccounts.find((changed) => changed.id === item.id) ?? item)),
       );
       setAccountPage(1);
-      showNotice("success", `已启用 ${account.email}`);
+      showNotice("success", `已启用 ${accountDisplayLabel(account)}`);
     } catch (error) {
       showNotice("error", `启用账号失败：${String(error)}`);
     } finally {
@@ -1527,7 +1575,7 @@ function App() {
     try {
       const refreshed = await invoke<ManagedAccount>("refresh_account", { accountId: account.id });
       setAccounts((current) => sortAccountsForView(current.map((item) => (item.id === refreshed.id ? refreshed : item))));
-      showNotice("success", `已刷新 ${refreshed.email}`);
+      showNotice("success", `已刷新 ${accountDisplayLabel(refreshed)}`);
     } catch (error) {
       showNotice("error", `刷新账号失败：${String(error)}`);
     } finally {
@@ -1558,7 +1606,9 @@ function App() {
   const handleExportAccount = async (account: ManagedAccount) => {
     let payload: string;
     try {
-      payload = await invoke<string>("export_account", { accountId: account.id });
+      payload = shouldHideAccountDetails(account)
+        ? await invoke<string>("export_public_windsurf_account", { accountId: account.id })
+        : await invoke<string>("export_account", { accountId: account.id });
     } catch (error) {
       showNotice("error", `导出账号失败：${String(error)}`);
       return;
@@ -1570,10 +1620,10 @@ function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${preview.account.provider}-${preview.account.email.replace(/[^a-z0-9._-]+/gi, "_")}.json`;
+    a.download = `${preview.account.provider}-${accountDisplayLabel(preview.account).replace(/[^a-z0-9._-]+/gi, "_")}.json`;
     a.click();
     URL.revokeObjectURL(url);
-    showNotice("success", `已下载 ${preview.account.email}`);
+    showNotice("success", `已下载 ${accountDisplayLabel(preview.account)}`);
   };
   const copyExportPreview = async (preview: ExportPreview) => {
     try {
@@ -1595,7 +1645,7 @@ function App() {
       const nextAccounts = await invoke<ManagedAccount[]>("delete_account", { accountId: account.id });
       setAccounts(nextAccounts);
       setPendingDeleteAccount(null);
-      showNotice("success", `已删除 ${account.email}`);
+      showNotice("success", `已删除 ${accountDisplayLabel(account)}`);
     } catch (error) {
       showNotice("error", `删除账号失败：${String(error)}`);
     } finally {
@@ -1912,21 +1962,40 @@ function App() {
                       <AccountStateCorner account={account} />
                       <div className="account-main">
                         <div className="account-title">
-                          <strong>{account.displayName || account.email}</strong>
+                          {shouldHideAccountDetails(account) ? (
+                            <strong>{publicAccountCode(account, "SUPERAI")}</strong>
+                          ) : (
+                            <strong>{accountTitle(account)}</strong>
+                          )}
                           <AccountPlanBadge account={account} />
                         </div>
                         <div className="account-subtitle">
-                          <span>
-                            <b>邮箱</b>
-                            {account.email}
-                          </span>
-                          {account.accountId && (
-                            <span>
-                              <b>账号</b>
-                              {account.accountId}
-                            </span>
+                          {shouldHideAccountDetails(account) ? (
+                            <>
+                              <span>
+                                <b>名称</b>
+                                {publicAccountCode(account, "USER")}
+                              </span>
+                              <span>
+                                <b>账号</b>
+                                {publicAccountCode(account, "ACCT")}
+                              </span>
+                            </>
+                          ) : (
+                            <>
+                              <span>
+                                <b>名称</b>
+                                {account.email}
+                              </span>
+                              {account.accountId && (
+                                <span>
+                                  <b>账号</b>
+                                  {account.accountId}
+                                </span>
+                              )}
+                            </>
                           )}
-                          {account.organizationId && (
+                          {!shouldHideAccountDetails(account) && account.organizationId && (
                             <span>
                               <b>组织</b>
                               {account.organizationId}
@@ -2286,7 +2355,7 @@ function App() {
       {exportPreview && (
         <AppModal
           title="导出账号"
-          description={exportPreview.account.email}
+          description={accountDisplayLabel(exportPreview.account)}
           closeLabel="关闭导出账号"
           className="export-panel"
           onClose={() => setExportPreview(null)}
@@ -2315,7 +2384,7 @@ function App() {
             </div>
             <div className="confirm-copy">
               <h2>删除账号</h2>
-              <p>{pendingDeleteAccount.email}</p>
+              <p>{accountDisplayLabel(pendingDeleteAccount)}</p>
               <span>只会从 Super AI 的账号库移除，不会删除本机 Codex/Gemini 当前配置。</span>
             </div>
             <div className="confirm-actions">

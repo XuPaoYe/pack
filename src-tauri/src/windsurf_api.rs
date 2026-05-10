@@ -398,8 +398,7 @@ fn spawn_sidecar(
                         }
                     }
                 }
-                let line = line.replace("Windsurf", "SuperAl").replace("windsurf", "superal");
-                eprintln!("[SuperAl sidecar] {line}");
+                eprintln!("[SuperAl sidecar] {}", sanitize_sidecar_log_line(&line));
             }
         })
         .map_err(|error| format!("无法启动 stdout 读线程: {error}"))?;
@@ -410,8 +409,7 @@ fn spawn_sidecar(
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
-                let line = line.replace("Windsurf", "SuperAl").replace("windsurf", "superal");
-                eprintln!("[SuperAl sidecar:err] {line}");
+                eprintln!("[SuperAl sidecar:err] {}", sanitize_sidecar_log_line(&line));
             }
         })
         .map_err(|error| format!("无法启动 stderr 读线程: {error}"))?;
@@ -462,6 +460,51 @@ fn parse_listen_port(line: &str) -> Option<u16> {
     let after_colon = tail.split(':').nth(1)?;
     let port_str: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
     port_str.parse::<u16>().ok()
+}
+
+fn sanitize_sidecar_log_line(line: &str) -> String {
+    let mut text = line.replace("Windsurf", "SuperAl").replace("windsurf", "superal");
+    let mut sanitized = String::with_capacity(text.len());
+    let mut token = String::new();
+
+    let flush_token = |token: &mut String, sanitized: &mut String| {
+        if token.is_empty() {
+            return;
+        }
+        let lower = token.to_ascii_lowercase();
+        let is_email = token.contains('@') && token.contains('.');
+        let is_jwt = token.starts_with("eyJ") && token.matches('.').count() >= 1;
+        let is_known_secret = lower.starts_with("auth1_")
+            || lower.starts_with("devin-session-token$")
+            || lower.starts_with("agt_wsf_")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
+            || lower.contains("session_token")
+            || lower.contains("auth1_token")
+            || lower.contains("refresh_token")
+            || lower.contains("access_token")
+            || lower.contains("id_token")
+            || lower.contains("password");
+        if is_email {
+            sanitized.push_str("[account]");
+        } else if is_jwt || is_known_secret {
+            sanitized.push_str("[secret]");
+        } else {
+            sanitized.push_str(token);
+        }
+        token.clear();
+    };
+
+    for ch in text.drain(..) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '@' | '.' | '_' | '-' | '$' | '%' | '+') {
+            token.push(ch);
+        } else {
+            flush_token(&mut token, &mut sanitized);
+            sanitized.push(ch);
+        }
+    }
+    flush_token(&mut token, &mut sanitized);
+    sanitized
 }
 
 // ---------- 启停 ----------

@@ -657,7 +657,7 @@ h2 {
   position: relative;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .account-scroll-shell {
@@ -665,10 +665,9 @@ h2 {
   height: 100%;
   min-width: 0;
   min-height: 0;
-  padding: 0 18px 0 0;
+  padding: 0;
   overflow-y: scroll;
   overflow-x: hidden;
-  scrollbar-gutter: stable;
   scrollbar-width: none;
 }
 
@@ -694,7 +693,7 @@ h2 {
 .account-scrollbar {
   position: absolute;
   top: 0;
-  right: 2px;
+  right: -14px;
   bottom: 0;
   width: 8px;
   opacity: 0;
@@ -1401,6 +1400,10 @@ h2 {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.quota-meter-reset.hidden {
+  visibility: hidden;
 }
 
 .validity-line.expired {
@@ -2301,19 +2304,19 @@ textarea:focus {
   gap: 6px;
   margin: 0 16px 16px;
   padding: 14px;
-  border: 1px solid #f2c8b6;
+  border: 1px solid color-mix(in srgb, #ef4444 32%, var(--line));
   border-radius: 10px;
-  background: #fff7ed;
+  background: color-mix(in srgb, #ef4444 8%, var(--surface));
 }
 
 .failure-list strong {
-  color: #9a3412;
+  color: color-mix(in srgb, #ef4444 80%, var(--text-strong));
   font-size: 14px;
   font-weight: 600;
 }
 
 .failure-list p {
-  color: #9a3412;
+  color: color-mix(in srgb, #ef4444 74%, var(--text));
   font-size: 13px;
   line-height: 1.4;
 }

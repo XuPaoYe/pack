@@ -257,12 +257,8 @@ function deriveStatus(value: JsonObject, tokenMeta: ManagedAccount["tokenMeta"],
   }
 
   const expiresAt = normalizeUnixSeconds(tokenMeta.expiresAt);
-  if (expiresAt && expiresAt <= now) {
+  if (expiresAt && expiresAt <= now && !tokenMeta.hasRefreshToken) {
     return { state: "unavailable", label: "不可用", reason: "本地 token 已过期" };
-  }
-
-  if (quota?.metrics.some((metric) => metric.remainingPercent === 0)) {
-    return { state: "unavailable", label: "不可用", reason: "至少一个额度窗口剩余 0%" };
   }
 
   if (quota?.error) {

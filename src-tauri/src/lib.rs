@@ -1,6 +1,8 @@
 mod windsurf_api;
 
+use aes::Aes256;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use rusqlite::{params, Connection};
@@ -69,6 +71,13 @@ const WINDSURF_USER_STATUS_PATH: &str =
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
 const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.3-codex";
+const SUPERAI_AES_KEY_HEX: &str =
+    "b9c1e79783adb25cdb3667ae62c168e18868438d62a47428abeb7b41491ff2ee";
+const SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
+
+fn is_public_build() -> bool {
+    option_env!("VITE_SUPERAI_PUBLIC_BUILD") == Some("1")
+}
 
 #[derive(Debug, Clone, Default)]
 struct WindsurfPostAuthResult {
@@ -173,6 +182,12 @@ struct ImportFailure {
 struct ImportResult {
     imported: Vec<ManagedAccount>,
     failed: Vec<ImportFailure>,
+}
+
+struct WindsurfBatchCredential {
+    account: String,
+    password: String,
+    expires_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -454,11 +469,87 @@ fn read_accounts_from_conn(conn: &Connection) -> Result<Vec<ManagedAccount>, Str
     let mut accounts = Vec::new();
     for row in rows {
         let account_json = row.map_err(|error| format!("读取账号记录失败: {error}"))?;
-        let account = serde_json::from_str::<ManagedAccount>(&account_json)
-            .map_err(|error| format!("解析账号记录失败: {error}"))?;
+        let account = parse_stored_account_json(&account_json)?;
         accounts.push(account);
     }
     Ok(accounts)
+}
+
+fn delete_expired_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
+    let accounts = read_accounts_from_conn(conn)?;
+    let expired_ids = accounts
+        .into_iter()
+        .filter(|account| account.provider == "windsurf")
+        .filter_map(|account| {
+            windsurf_license_expires_at(&account)
+                .filter(|expires_at| windsurf_license_expired_at(*expires_at))
+                .map(|_| account.id)
+        })
+        .collect::<Vec<_>>();
+    for id in &expired_ids {
+        conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])
+            .map_err(|error| format!("删除过期 SuperAl 账号失败: {error}"))?;
+    }
+    Ok(expired_ids.len())
+}
+
+fn encrypt_plain_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
+    let mut stmt = conn
+        .prepare("SELECT id, account_json FROM accounts WHERE provider = 'windsurf'")
+        .map_err(|error| format!("读取 SuperAl 账号记录失败: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|error| format!("读取 SuperAl 账号记录失败: {error}"))?;
+    let mut migrated = 0usize;
+    for row in rows {
+        let (id, account_json) = row.map_err(|error| format!("读取 SuperAl 账号记录失败: {error}"))?;
+        let value: Value = match serde_json::from_str(&account_json) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value
+            .get("encrypted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if value.get("provider").and_then(Value::as_str) != Some("windsurf") {
+            continue;
+        }
+        let account = serde_json::from_value::<ManagedAccount>(value)
+            .map_err(|error| format!("解析 SuperAl 明文账号失败: {error}"))?;
+        let encrypted_json = serialize_account_for_storage(&account)?;
+        conn.execute(
+            "UPDATE accounts SET email = ?1, display_name = NULL, account_json = ?2 WHERE id = ?3",
+            params![account.id, encrypted_json, id],
+        )
+        .map_err(|error| format!("迁移 SuperAl 加密账号失败: {error}"))?;
+        migrated += 1;
+    }
+    Ok(migrated)
+}
+
+fn parse_stored_account_json(account_json: &str) -> Result<ManagedAccount, String> {
+    let value: Value = serde_json::from_str(account_json)
+        .map_err(|error| format!("解析账号记录失败: {error}"))?;
+    if value
+        .get("encrypted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && value.get("provider").and_then(Value::as_str) == Some("windsurf")
+    {
+        let payload = value
+            .get("payload")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "SuperAl 加密账号记录缺少 payload".to_string())?;
+        let decrypted = superai_decrypt_text(payload)?;
+        serde_json::from_str::<ManagedAccount>(&decrypted)
+            .map_err(|error| format!("解析 SuperAl 加密账号记录失败: {error}"))
+    } else {
+        serde_json::from_value::<ManagedAccount>(value)
+            .map_err(|error| format!("解析账号记录失败: {error}"))
+    }
 }
 
 fn is_current_status(status: &Option<AccountStatus>) -> bool {
@@ -486,6 +577,24 @@ fn mark_account_available(account: &mut ManagedAccount) {
     });
 }
 
+fn account_for_frontend(account: &ManagedAccount) -> ManagedAccount {
+    let mut redacted = account.clone();
+    redacted.auth_payload = None;
+    redacted
+}
+
+fn accounts_for_frontend(accounts: Vec<ManagedAccount>) -> Vec<ManagedAccount> {
+    accounts
+        .into_iter()
+        .map(|account| account_for_frontend(&account))
+        .collect()
+}
+
+fn import_result_for_frontend(mut result: ImportResult) -> ImportResult {
+    result.imported = accounts_for_frontend(result.imported);
+    result
+}
+
 fn enforce_single_current_account(conn: &Connection) -> Result<(), String> {
     let mut accounts = read_accounts_from_conn(conn)?;
     let mut current_ids = accounts
@@ -502,8 +611,7 @@ fn enforce_single_current_account(conn: &Connection) -> Result<(), String> {
     for account in &mut accounts {
         if account.id != keep_id && is_current_status(&account.status) {
             mark_account_available(account);
-            let account_json = serde_json::to_string(account)
-                .map_err(|error| format!("序列化账号失败: {error}"))?;
+            let account_json = serialize_account_for_storage(account)?;
             conn.execute(
                 "UPDATE accounts SET account_json = ?1, updated_at = ?2 WHERE id = ?3",
                 params![account_json, account.updated_at, account.id],
@@ -522,12 +630,18 @@ fn load_account_from_db(conn: &Connection, account_id: &str) -> Result<ManagedAc
             |row| row.get::<_, String>(0),
         )
         .map_err(|error| format!("账号不存在或读取失败: {error}"))?;
-    serde_json::from_str::<ManagedAccount>(&account_json)
-        .map_err(|error| format!("解析账号记录失败: {error}"))
+    parse_stored_account_json(&account_json)
 }
 
 fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), String> {
     let mut account_to_write = account.clone();
+    if account_to_write.auth_payload.is_none() {
+        if let Ok(existing) = load_account_from_db(conn, &account.id) {
+            if existing.provider == account.provider {
+                account_to_write.auth_payload = existing.auth_payload;
+            }
+        }
+    }
     if !is_current_status(&account_to_write.status) {
         if let Ok(existing) = load_account_from_db(conn, &account.id) {
             if existing.provider == account.provider && is_current_status(&existing.status) {
@@ -540,8 +654,7 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
         for existing in &mut accounts {
             if existing.id != account_to_write.id && is_current_status(&existing.status) {
                 mark_account_available(existing);
-                let existing_json = serde_json::to_string(existing)
-                    .map_err(|error| format!("序列化账号失败: {error}"))?;
+                let existing_json = serialize_account_for_storage(existing)?;
                 conn.execute(
                     "UPDATE accounts SET account_json = ?1, updated_at = ?2 WHERE id = ?3",
                     params![existing_json, existing.updated_at, existing.id],
@@ -550,8 +663,17 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
             }
         }
     }
-    let account_json = serde_json::to_string(&account_to_write)
-        .map_err(|error| format!("序列化账号失败: {error}"))?;
+    let account_json = serialize_account_for_storage(&account_to_write)?;
+    let stored_email = if account_to_write.provider == "windsurf" {
+        account_to_write.id.clone()
+    } else {
+        account_to_write.email.clone()
+    };
+    let stored_display_name = if account_to_write.provider == "windsurf" {
+        None
+    } else {
+        account_to_write.display_name.clone()
+    };
     conn.execute(
         r#"
       INSERT INTO accounts (
@@ -567,8 +689,8 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
         params![
             account_to_write.id,
             account_to_write.provider,
-            account_to_write.email,
-            account_to_write.display_name,
+            stored_email,
+            stored_display_name,
             account_json,
             account_to_write.created_at,
             account_to_write.updated_at
@@ -576,6 +698,21 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
     )
     .map_err(|error| format!("写入账号 SQLite 失败: {error}"))?;
     Ok(())
+}
+
+fn serialize_account_for_storage(account: &ManagedAccount) -> Result<String, String> {
+    let account_json = serde_json::to_string(account)
+        .map_err(|error| format!("序列化账号失败: {error}"))?;
+    if account.provider != "windsurf" {
+        return Ok(account_json);
+    }
+    let encrypted = superai_encrypt_text(&account_json)?;
+    let wrapper = serde_json::json!({
+        "encrypted": true,
+        "provider": "windsurf",
+        "payload": encrypted,
+    });
+    serde_json::to_string(&wrapper).map_err(|error| format!("序列化 SuperAl 加密账号失败: {error}"))
 }
 
 fn upsert_accounts_into_db(
@@ -661,6 +798,83 @@ fn number_field(value: Option<&Value>) -> Option<i64> {
         Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
         _ => None,
     }
+}
+
+fn normalize_unix_seconds_str(value: &str) -> Option<i64> {
+    let parsed = value.trim().parse::<i64>().ok()?;
+    if parsed > 1_000_000_000_000 {
+        Some(parsed / 1000)
+    } else if parsed > 0 {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
+fn normalize_unix_seconds_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64().and_then(|value| {
+            if value > 1_000_000_000_000 {
+                Some(value / 1000)
+            } else if value > 0 {
+                Some(value)
+            } else {
+                None
+            }
+        }),
+        Value::String(text) => normalize_unix_seconds_str(text),
+        _ => None,
+    }
+}
+
+fn windsurf_license_expired_at(expires_at: i64) -> bool {
+    expires_at != i64::MAX && now_ts() / 60 >= expires_at / 60
+}
+
+fn windsurf_license_expires_at(account: &ManagedAccount) -> Option<i64> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    payload
+        .get("license_expires_at")
+        .and_then(normalize_unix_seconds_value)
+}
+
+fn apply_windsurf_license_expiry(account: &mut ManagedAccount) {
+    if account.provider != "windsurf" {
+        return;
+    }
+    if let Some(expires_at) = windsurf_license_expires_at(account) {
+        account.subscription_active_until = Some(Value::Number(expires_at.into()));
+    }
+}
+
+fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
+    let key = hex::decode(SUPERAI_AES_KEY_HEX).map_err(|error| format!("解析 SuperAl AES key 失败: {error}"))?;
+    let iv = hex::decode(SUPERAI_AES_IV_HEX).map_err(|error| format!("解析 SuperAl AES iv 失败: {error}"))?;
+    let key: [u8; 32] = key.try_into().map_err(|_| "SuperAl AES key 长度必须为 32 字节".to_string())?;
+    let iv: [u8; 16] = iv.try_into().map_err(|_| "SuperAl AES iv 长度必须为 16 字节".to_string())?;
+    Ok((key, iv))
+}
+
+fn superai_encrypt_text(plain: &str) -> Result<String, String> {
+    type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+    let (key, iv) = superai_aes_key_iv()?;
+    let encrypted = Aes256CbcEnc::new(&key.into(), &iv.into())
+        .encrypt_padded_vec_mut::<Pkcs7>(plain.as_bytes());
+    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
+}
+
+fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
+    type Aes256CbcDec = cbc::Decryptor<Aes256>;
+    let (key, iv) = superai_aes_key_iv()?;
+    let raw = cipher_text.trim();
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(raw))
+        .map_err(|_| "AES 密文不是有效 base64".to_string())?;
+    let decrypted = Aes256CbcDec::new(&key.into(), &iv.into())
+        .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
+        .map_err(|_| "AES 解密失败或 PKCS#7 填充无效".to_string())?;
+    String::from_utf8(decrypted).map_err(|_| "AES 明文不是有效 UTF-8".to_string())
 }
 
 fn bool_field(value: Option<&Value>) -> Option<bool> {
@@ -958,22 +1172,6 @@ fn derive_status(
             label: "不可用".to_string(),
             reason: Some("本地 token 已过期".to_string()),
             updated_at: None,
-        };
-    }
-
-    if quota
-        .map(|q| {
-            q.metrics
-                .iter()
-                .any(|metric| metric.remaining_percent == Some(0))
-        })
-        .unwrap_or(false)
-    {
-        return AccountStatus {
-            state: "unavailable".to_string(),
-            label: "不可用".to_string(),
-            reason: Some("至少一个额度窗口剩余 0%".to_string()),
-            updated_at: quota.and_then(|q| q.last_updated),
         };
     }
 
@@ -1489,6 +1687,7 @@ async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result
         None => {
             if windsurf_payload_string(account, "api_key").is_some() {
                 refresh_windsurf_account_by_api_key(account).await?;
+                apply_windsurf_license_expiry(account);
                 account.token_meta.has_access_token = true;
                 return Ok(());
             }
@@ -1518,6 +1717,7 @@ async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result
             }
             if windsurf_payload_string(account, "session_token").is_some() {
                 enrich_windsurf_account_remote(account).await?;
+                apply_windsurf_license_expiry(account);
                 account.token_meta.has_access_token = true;
                 return Ok(());
             }
@@ -1597,6 +1797,7 @@ async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result
         updated_at: Some(account.updated_at),
     });
     let _ = enrich_windsurf_account_remote(account).await;
+    apply_windsurf_license_expiry(account);
     Ok(())
 }
 
@@ -2782,7 +2983,7 @@ async fn add_windsurf_account_by_password(
                 .ok_or_else(|| "构建 SuperAl 账号记录失败".to_string())?;
             let _ = enrich_windsurf_account_remote(&mut account).await;
             upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
-            return Ok(account);
+            return Ok(account_for_frontend(&account));
         }
         Err(auth1_error) => {
             if auth1_error.contains("没有设置邮箱密码")
@@ -2855,24 +3056,28 @@ async fn add_windsurf_account_by_password(
     let account = parse_windsurf_account(&Value::Object(payload), "password")
         .ok_or_else(|| "构建 SuperAl 账号记录失败".to_string())?;
     upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
-    Ok(account)
+    Ok(account_for_frontend(&account))
 }
 
-fn parse_windsurf_batch_key_line(line: &str) -> Result<(String, String), String> {
+fn parse_windsurf_batch_key_line(line: &str) -> Result<WindsurfBatchCredential, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Err("密钥为空".to_string());
     }
 
-    let candidates = [trimmed.to_string(), decode_batch_key_text(trimmed).unwrap_or_default()];
+    let candidates = [
+        trimmed.to_string(),
+        decode_batch_key_text(trimmed).unwrap_or_default(),
+        superai_decrypt_text(trimmed).unwrap_or_default(),
+    ];
     for candidate in candidates.iter().filter(|value| !value.trim().is_empty()) {
         if let Ok(value) = serde_json::from_str::<Value>(candidate) {
-            if let Some((account, password)) = account_password_from_value(&value) {
-                return Ok((account, password));
+            if let Some(credential) = account_password_from_value(&value) {
+                return Ok(credential);
             }
         }
-        if let Some((account, password)) = split_account_password(candidate) {
-            return Ok((account, password));
+        if let Some(credential) = split_account_password(candidate) {
+            return Ok(credential);
         }
     }
 
@@ -2896,23 +3101,47 @@ fn decode_batch_key_text(value: &str) -> Option<String> {
     None
 }
 
-fn account_password_from_value(value: &Value) -> Option<(String, String)> {
+fn account_password_from_value(value: &Value) -> Option<WindsurfBatchCredential> {
     let obj = value.as_object()?;
     let account = string_field(obj.get("account"))
         .or_else(|| string_field(obj.get("username")))
         .or_else(|| string_field(obj.get("email")))?;
     let password = string_field(obj.get("password"))
         .or_else(|| string_field(obj.get("pwd")))?;
-    Some((account, password))
+    let expires_at = number_field(obj.get("expires_at"))
+        .or_else(|| number_field(obj.get("expiresAt")))
+        .or_else(|| number_field(obj.get("expiry")))
+        .or_else(|| number_field(obj.get("expired_at")))?;
+    Some(WindsurfBatchCredential {
+        account,
+        password,
+        expires_at,
+    })
 }
 
-fn split_account_password(value: &str) -> Option<(String, String)> {
+fn split_account_password(value: &str) -> Option<WindsurfBatchCredential> {
     for delimiter in ["----", "｜", "|", "\t", ","] {
-        if let Some((account, password)) = value.split_once(delimiter) {
+        let parts = value.split(delimiter).map(str::trim).collect::<Vec<_>>();
+        if parts.len() >= 3 {
+            let account = parts[0];
+            let password = parts[1];
+            let expires_at = parts[2].parse::<i64>().ok()?;
+            if !account.is_empty() && !password.is_empty() && expires_at > 0 {
+                return Some(WindsurfBatchCredential {
+                    account: account.to_string(),
+                    password: password.to_string(),
+                    expires_at,
+                });
+            }
+        } else if let Some((account, password)) = value.split_once(delimiter) {
             let account = account.trim();
             let password = password.trim();
             if !account.is_empty() && !password.is_empty() {
-                return Some((account.to_string(), password.to_string()));
+                return Some(WindsurfBatchCredential {
+                    account: account.to_string(),
+                    password: password.to_string(),
+                    expires_at: i64::MAX,
+                });
             }
         }
     }
@@ -2929,19 +3158,30 @@ async fn add_windsurf_accounts_by_batch_keys(
 
     for (index, key) in keys.into_iter().enumerate() {
         let label = format!("第 {} 行", index + 1);
-        let (account, password) = match parse_windsurf_batch_key_line(&key) {
+        let credential = match parse_windsurf_batch_key_line(&key) {
             Ok(value) => value,
             Err(reason) => {
                 failed.push(ImportFailure { label, reason });
                 continue;
             }
         };
+        if windsurf_license_expired_at(credential.expires_at) {
+            failed.push(ImportFailure {
+                label,
+                reason: "账号已到期".to_string(),
+            });
+            continue;
+        }
 
-        match add_windsurf_account_by_password(app.clone(), account, password).await {
-            Ok(mut account) => {
-                attach_windsurf_batch_key(&mut account, &key);
-                upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
-                imported.push(account);
+        match add_windsurf_account_by_password(app.clone(), credential.account, credential.password).await {
+            Ok(account) => {
+                let mut full_account = {
+                    let conn = open_app_db(&app)?;
+                    load_account_from_db(&conn, &account.id)?
+                };
+                attach_windsurf_batch_key(&mut full_account, &key, credential.expires_at);
+                upsert_accounts_into_db(&app, std::slice::from_ref(&full_account))?;
+                imported.push(account_for_frontend(&full_account));
             }
             Err(error) => failed.push(ImportFailure { label, reason: error }),
         }
@@ -2950,7 +3190,7 @@ async fn add_windsurf_accounts_by_batch_keys(
     Ok(ImportResult { imported, failed })
 }
 
-fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str) {
+fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str, expires_at: i64) {
     let mut payload = account
         .auth_payload
         .take()
@@ -2960,7 +3200,71 @@ fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str) {
         "batch_key".to_string(),
         Value::String(key.trim().to_string()),
     );
+    payload.insert(
+        "license_expires_at".to_string(),
+        Value::Number(expires_at.into()),
+    );
     account.auth_payload = Some(Value::Object(payload));
+    account.subscription_active_until = Some(Value::Number(expires_at.into()));
+}
+
+fn public_export_encrypt(value: &str, account: &ManagedAccount, field: &str) -> String {
+    let key_material = format!("{}:{}:{}", account.id, account.provider, field);
+    let mut output = Vec::with_capacity(value.len());
+    let mut counter = 0u64;
+    while output.len() < value.len() {
+        let mut hasher = Sha256::new();
+        hasher.update(key_material.as_bytes());
+        hasher.update(counter.to_le_bytes());
+        let block = hasher.finalize();
+        for byte in block {
+            if output.len() >= value.len() {
+                break;
+            }
+            output.push(byte);
+        }
+        counter += 1;
+    }
+    let encrypted: Vec<u8> = value
+        .as_bytes()
+        .iter()
+        .zip(output.iter())
+        .map(|(left, right)| left ^ right)
+        .collect();
+    URL_SAFE_NO_PAD.encode(encrypted)
+}
+
+fn public_windsurf_export_payload(account: &ManagedAccount) -> Result<Value, String> {
+    if account.provider != "windsurf" {
+        return Err("只支持导出 SuperAl 用户版数据".to_string());
+    }
+    let payload = account.auth_payload.as_ref().and_then(Value::as_object);
+    let credential = payload
+        .and_then(|payload| payload.get("batch_key"))
+        .and_then(Value::as_str)
+        .and_then(|key| parse_windsurf_batch_key_line(key).ok())
+        .unwrap_or_else(|| WindsurfBatchCredential {
+            account: account.email.clone(),
+            password: String::new(),
+            expires_at: windsurf_license_expires_at(account).unwrap_or_default(),
+        });
+    let expires_at = account
+        .subscription_active_until
+        .as_ref()
+        .and_then(normalize_unix_seconds_value)
+        .or_else(|| {
+            windsurf_payload_string(account, "expires_at")
+                .as_deref()
+                .and_then(normalize_unix_seconds_str)
+        })
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    Ok(serde_json::json!({
+        "provider": "superai",
+        "account": public_export_encrypt(&credential.account, account, "account"),
+        "password": public_export_encrypt(&credential.password, account, "password"),
+        "expires_at": public_export_encrypt(&expires_at, account, "expires_at"),
+    }))
 }
 
 #[tauri::command]
@@ -3026,7 +3330,7 @@ async fn add_windsurf_account_by_token(
     let account = parse_windsurf_account(&Value::Object(payload), "windsurf_token")
         .ok_or_else(|| "构建 SuperAl 账号记录失败".to_string())?;
     upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
-    Ok(account)
+    Ok(account_for_frontend(&account))
 }
 
 fn codex_access_token(account: &ManagedAccount) -> Option<String> {
@@ -3510,7 +3814,7 @@ fn persist_and_refresh_imported(
 ) -> Result<ImportResult, String> {
     upsert_accounts_into_db(&app, &result.imported)?;
     refresh_imported_accounts_in_background(app, result.imported.clone());
-    Ok(result)
+    Ok(import_result_for_frontend(result))
 }
 
 fn oauth_pending_get(login_id: &str) -> Result<Option<OAuthPending>, String> {
@@ -4570,8 +4874,13 @@ fn start_window_drag(window: tauri::Window) -> Result<(), String> {
 #[tauri::command]
 fn list_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
+    encrypt_plain_windsurf_accounts(&conn)?;
+    let removed = delete_expired_windsurf_accounts(&conn)?;
+    if removed > 0 {
+        schedule_windsurf_sync(app.clone());
+    }
     enforce_single_current_account(&conn)?;
-    read_accounts_from_conn(&conn)
+    read_accounts_from_conn(&conn).map(accounts_for_frontend)
 }
 
 #[tauri::command]
@@ -4617,7 +4926,7 @@ async fn refresh_account(
     if written.is_empty() {
         return Err("账号已被删除，刷新结果已丢弃".to_string());
     }
-    Ok(account)
+    Ok(account_for_frontend(&account))
 }
 
 #[tauri::command]
@@ -4658,13 +4967,18 @@ async fn refresh_provider_accounts(
         }
     }
 
-    upsert_existing_accounts_into_db(&app, &accounts)
+    upsert_existing_accounts_into_db(&app, &accounts).map(accounts_for_frontend)
 }
 
 #[tauri::command]
 async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
     let mut accounts = {
         let conn = open_app_db(&app)?;
+        encrypt_plain_windsurf_accounts(&conn)?;
+        let removed = delete_expired_windsurf_accounts(&conn)?;
+        if removed > 0 {
+            schedule_windsurf_sync(app.clone());
+        }
         read_accounts_from_conn(&conn)?
     };
 
@@ -4688,7 +5002,7 @@ async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccoun
         }
     }
 
-    upsert_existing_accounts_into_db(&app, &accounts)
+    upsert_existing_accounts_into_db(&app, &accounts).map(accounts_for_frontend)
 }
 
 #[tauri::command]
@@ -4704,7 +5018,7 @@ fn delete_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
     let accounts = read_accounts_from_conn(&conn)?;
     drop(conn);
     schedule_windsurf_sync(app);
-    Ok(accounts)
+    Ok(accounts_for_frontend(accounts))
 }
 
 #[tauri::command]
@@ -4720,7 +5034,7 @@ fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
         }
         other => return Err(format!("不支持的账号类型: {other}")),
     }
-    set_account_current_state(&conn, &account.provider, &account.id)
+    set_account_current_state(&conn, &account.provider, &account.id).map(accounts_for_frontend)
 }
 
 #[tauri::command]
@@ -4735,7 +5049,7 @@ fn sync_windsurf_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedAcco
     else {
         return Ok(Vec::new());
     };
-    set_account_current_state(&conn, "windsurf", &account.id)
+    set_account_current_state(&conn, "windsurf", &account.id).map(accounts_for_frontend)
 }
 
 #[tauri::command]
@@ -4746,9 +5060,21 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
     let value = match account.provider.as_str() {
         "codex" => build_codex_auth_payload(&account)?,
         "gemini" => build_gemini_oauth_payload(&account)?,
+        "windsurf" if is_public_build() => {
+            return Err("用户版不允许导出 SuperAl 原始凭证".to_string());
+        }
         "windsurf" => build_windsurf_payload(&account)?,
         _ => serde_json::to_value(&account).map_err(|error| format!("序列化账号失败: {error}"))?,
     };
+    serde_json::to_string_pretty(&value).map_err(|error| format!("序列化导出内容失败: {error}"))
+}
+
+#[tauri::command]
+#[allow(non_snake_case)]
+fn export_public_windsurf_account(app: tauri::AppHandle, accountId: String) -> Result<String, String> {
+    let conn = open_app_db(&app)?;
+    let account = load_account_from_db(&conn, &accountId)?;
+    let value = public_windsurf_export_payload(&account)?;
     serde_json::to_string_pretty(&value).map_err(|error| format!("序列化导出内容失败: {error}"))
 }
 
@@ -5295,6 +5621,7 @@ pub fn run() {
             delete_account,
             switch_account,
             export_account,
+            export_public_windsurf_account,
             load_settings,
             save_settings,
             import_accounts_from_json,

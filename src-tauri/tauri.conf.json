@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:5173",
-    "beforeDevCommand": "npm run web:dev -- --host 127.0.0.1",
-    "beforeBuildCommand": "npm run build"
+    "beforeDevCommand": "npm exec vite -- --host 127.0.0.1",
+    "beforeBuildCommand": "node scripts/app-build.mjs"
   },
   "app": {
     "windows": [
