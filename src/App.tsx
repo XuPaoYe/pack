@@ -943,7 +943,6 @@ function App() {
   const [mode, setMode] = useState<ImportMode>(defaultImportMode);
   const [pasteValue, setPasteValue] = useState("");
   const [windsurfBatchKeys, setWindsurfBatchKeys] = useState("");
-  const [failures, setFailures] = useState<ImportFailure[]>([]);
   const [query, setQuery] = useState("");
   const [accountPage, setAccountPage] = useState(1);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -1169,10 +1168,6 @@ function App() {
   }, [appendAppLog]);
 
   useEffect(() => {
-    setFailures([]);
-  }, [activeProvider, mode]);
-
-  useEffect(() => {
     if (import.meta.env.DEV || !isTauri()) return;
     let isCancelled = false;
 
@@ -1329,7 +1324,6 @@ function App() {
     } else {
       showNotice("info", "没有发现可添加的账号");
     }
-    setFailures(result.failed);
   };
 
   const parseWithBackend = async (content: string, label: string) => {
@@ -1362,7 +1356,6 @@ function App() {
           { imported: allImported, failed: allFailures },
         );
       } else {
-        setFailures(allFailures);
         showNotice("error", allFailures[0]?.reason ?? "没有发现可添加的账号");
       }
     } finally {
@@ -1383,7 +1376,6 @@ function App() {
 
   const handleLocalImport = async (provider: OAuthProvider) => {
     setIsBusy(true);
-    setFailures([]);
     try {
       const command = provider === "codex" ? "import_codex_from_local" : "import_gemini_from_local";
       const result = await invoke<BackendImportResult>(command);
@@ -1391,7 +1383,6 @@ function App() {
         result,
       );
     } catch (error) {
-      setFailures([]);
       showNotice("error", `读取本机 ${providerLabel(provider)} 失败：${String(error)}`);
     } finally {
       setIsBusy(false);
@@ -1502,7 +1493,6 @@ function App() {
     close();
   };
   const handleAddAccount = () => {
-    setFailures([]);
     setMode(defaultImportModeForProvider(activeProvider));
     setIsImportModalOpen(true);
   };
@@ -1517,7 +1507,6 @@ function App() {
       return;
     }
     setIsBusy(true);
-    setFailures([]);
     try {
       const result = await invoke<BackendImportResult>("add_windsurf_accounts_by_batch_keys", { keys });
       applyImportResult(result, {
@@ -2178,16 +2167,6 @@ function App() {
 
             </div>
 
-            {failures.length > 0 && (
-              <div className="failure-list">
-                <strong>未添加项</strong>
-                {failures.slice(0, 4).map((failure) => (
-                  <p key={`${failure.label}:${failure.reason}`}>
-                    {failure.label}: {failure.reason}
-                  </p>
-                ))}
-              </div>
-            )}
         </AppModal>
       )}
 
