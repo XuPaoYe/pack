@@ -46,7 +46,7 @@
       "icons/icon.ico"
     ],
     "externalBin": [
-      "binaries/superal-api",
+      "binaries/superai-api",
       "binaries/language_server"
     ],
     "android": {

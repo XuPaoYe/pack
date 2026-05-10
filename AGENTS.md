@@ -164,18 +164,70 @@ Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authoriz
 [tiny_http 反向代理 @ src-tauri/src/windsurf_api.rs]
     | Bearer <inner_key>
     v
-[superal-api sidecar (bun --compile vendor/windsurfapi)]
+[superai-api sidecar (bun --compile vendor/windsurfapi)]
     | spawns
     v
 [language_server 二进制 (Windsurf 闭源 LS)]
 ```
 
 - `vendor/windsurfapi/` 镜像了上游 [WindsurfPoolAPI](https://github.com/guanxiaol/WindsurfPoolAPI)（MIT），版本写在 `VERSION.txt`。不要直接改 vendor 里的 JS，要升级请 bump version 后重新拷贝。
-- `scripts/build-sidecar.sh` 用 `bun build --compile` 编当前平台的 sidecar，并从 `/Applications/Windsurf.app/...`（或 `WINDSURF_LS_PATH`）抽 LS 二进制，统一放到 `src-tauri/binaries/<name>-<rust-target-triple>(.exe)`。
-- `tauri.conf.json` 通过 `bundle.externalBin` 注册 `binaries/superal-api` 与 `binaries/language_server`；dev 与打包时 Tauri-CLI 自动复制到 app 可执行同目录。
-- 启动流程：`start_windsurf_api` 命令 → 预挑两个空闲端口 → spawn sidecar 子进程 → 解析 stdout `Server on http://0.0.0.0:N` 拿 inner port → 起 tiny_http 反向代理。
+- `scripts/scrub-vendor.mjs` 把 vendor 复制到 `.vendor-build/windsurfapi/` 并替换掉用户可见的 `Windsurf` / `WindsurfAPI` / `windsurfapi` / `_windsurf_id` / `org-windsurf-proxy` 字面量，同时给 `models.js` 的 `owned_by`、`dashboard/logger.js` 的落盘 JSONL 打补丁。协议字面量（`'windsurf'` 在 protobuf metadata、URL 里的 `windsurf.com`、`MODEL_PROVIDER_WINDSURF`、`WINDSURF_*`/`WINDSURFAPI_*` 环境变量、`User-Agent`）保留不动。
+- `scripts/build-sidecar.sh` 先跑 scrub-vendor，再用 `bun build --compile` 编 `.vendor-build/windsurfapi/src/index.js` 为当前平台的 sidecar，并从 `/Applications/Windsurf.app/...`（或 `WINDSURF_LS_PATH`）抽 LS 二进制，统一放到 `src-tauri/binaries/<name>-<rust-target-triple>(.exe)`。
+- `tauri.conf.json` 通过 `bundle.externalBin` 注册 `binaries/superai-api` 与 `binaries/language_server`；dev 与打包时 Tauri-CLI 自动复制到 app 可执行同目录。
+- 启动流程：`start_api_service` 命令 → 预挑两个空闲端口 → spawn sidecar 子进程 → 解析 stdout `Server on http://0.0.0.0:N` 拿 inner port → 起 tiny_http 反向代理。
 - 双层鉴权：外层 `agt_wsf_*` 由我们校验，内层 sidecar 用我们生成的随机 inner key（不持久化）。
-- 账号同步：`sync_windsurf_accounts_to_api` 命令把 DB 里的 Windsurf 账号映射成 `{refresh_token | api_key | token, label}` POST 到 sidecar `/auth/login`。`upsert_accounts_into_db` 写库后会在 API 服务运行时自动触发同步。
+- 账号同步：`sync_superai_accounts_to_api` 命令把 DB 里的 Windsurf 账号映射成 `{refresh_token | api_key | token, label}` POST 到 sidecar `/auth/login`。`upsert_accounts_into_db` 写库后会在 API 服务运行时自动触发同步。
+
+## 品牌脱敏规则（永久执行）
+
+> **必须遵守**：所有用户可见 / 可观察的位置，凡是出现 `Windsurf` 都改成 `SuperAI`。任何新增代码、UI 文本、CSS 类名、IPC 命令名、emit 事件名、日志字符串都直接用 SuperAI / superai。Vendor 升级后跑 `npm run build:sidecar` 会自动经 `scripts/scrub-vendor.mjs` 完成同样替换。
+
+**强制替换映射**（任何 PR / commit 不得偏离）：
+
+| 原始 | 替换 |
+|---|---|
+| `Windsurf` / `WindsurfAPI` / `Windsurf API`（用户可见英文）| `SuperAI` |
+| `windsurfapi`（项目 / 路径代号） | `superai-sidecar` |
+| `_windsurf_id`（/v1/models 输出字段） | `_internal_id` |
+| `owned_by: 'windsurf'`（/v1/models 输出） | `owned_by: 'superai'` |
+| `org-windsurf-proxy`（响应头） | `org-superai-proxy` |
+| Tauri command `*_windsurf_*` / `*_windsurf_api*` | `*_api_service*` 或 `*_superai_*` |
+| `AppSettings` 字段 `windsurf_api_*` | `api_service_*`（必须挂 `serde(alias = "windsurfApi*")` 兼容老 settings） |
+| CSS class `.windsurf-*` | `.superai-*` |
+| localStorage key `super-ai:windsurf-*` | `super-ai:api-service-*` 或 `super-ai:superai-*` |
+| emit event `windsurf-*` | `superai-*` 或 `api-service-*` |
+
+**TS / JS 字面量要绕过 esbuild / vite 常量折叠**。直接 `String.fromCharCode(87,...)` 会被构建器在编译期折叠成 `"Windsurf"` 又塞回 bundle。统一用：
+
+```ts
+const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
+  .map((c) => String.fromCharCode(c))
+  .join("") as "windsurf";
+```
+
+`.map(...).join("")` 形式 esbuild 不会折叠，dist 里就拿不到字面量。`src/App.tsx` 和 `src/lib/authParser.ts` 顶部已有此模式，新增组件请复用同样的 `PROVIDER_WSF` 常量，不要手写新的 `"windsurf"` 字符串字面量。
+
+**Rust 同样规则**：`src-tauri/src/windsurf_api.rs::sanitize_sidecar_log_line` 给 sidecar 转发到主进程 stderr 的日志做兜底替换；新增 sidecar 输出处理路径必须经过它。
+
+**协议字面量保留**（动了会立即坏功能，不要替换）：
+- protobuf metadata 里的 `'windsurf'`（`writeStringField(1,'windsurf')` / `(12,'windsurf')`）—— 上游服务端校验 ide_name / extension_name
+- URL 里的 `windsurf.com`、`server.self-serve.windsurf.com` 等 —— 上游 API 域名
+- `User-Agent: windsurf/...` —— 上游校验
+- `MODEL_PROVIDER_WINDSURF` 等 ALL_CAPS 常量、`WINDSURF_*` / `WINDSURFAPI_*` 环境变量名 —— 内部路由 / 配置开关
+- 内部 model provider tag `provider: 'windsurf'` —— 走 `models.js` 的 `owned_by` 收口替换，不要改值本身
+- DB 里 `provider = 'windsurf'` 行 —— 用户开 sqlite cli 才看得到，改它要 schema 迁移，风险/收益不划算
+
+**回归检查命令**（每次有可能影响外观的改动后跑）：
+
+```bash
+npm run check                       # vite build
+grep -c Windsurf dist/assets/*.js   # 必须为 0
+grep -c windsurf dist/assets/*.js   # 必须为 0
+grep -ic windsurf dist/assets/*.css # 必须为 0
+strings src-tauri/binaries/superai-api-* | grep -c Windsurf  # 必须为 0
+```
+
+任何一项 `> 0`，新增的字面量必须按上面规则消化掉再合并。
 
 开发前必跑（否则 Tauri 找不到 sidecar 会报错）：
 
@@ -196,6 +248,12 @@ npm run build:sidecar  # 第一次或 vendor 升级后
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
 cargo test --manifest-path src-tauri/Cargo.toml --lib windsurf_api -- --test-threads=1
 npm run check  # = node scripts/app-build.mjs && npm run lint
+
+# 品牌脱敏回归（详见上一节"品牌脱敏规则"）
+grep -c Windsurf dist/assets/*.js                        # 必须为 0
+grep -c windsurf dist/assets/*.js                        # 必须为 0
+grep -ic windsurf dist/assets/*.css                      # 必须为 0
+strings src-tauri/binaries/superai-api-* | grep -c Windsurf  # 必须为 0
 ```
 
 E2E 反向代理验证（需要 sidecar 已构建）：

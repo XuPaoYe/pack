@@ -60,7 +60,7 @@ npm run tauri:build:dmg
 npm run tauri:build:dmg:full
 ```
 
-## Windsurf Sidecar
+## API Sidecar
 
 第一次开发或升级 vendor 后先构建 sidecar：
 
@@ -68,7 +68,7 @@ npm run tauri:build:dmg:full
 npm run build:sidecar
 ```
 
-需要 `bun >= 1.3`，并安装 Windsurf 应用，或设置 `WINDSURF_LS_PATH`。
+需要 `bun >= 1.3`，并提前安装好对应的本地 IDE 客户端，或通过环境变量指向 language server 二进制（详见 `scripts/build-sidecar.sh`）。
 
 ## 检查
 
@@ -120,7 +120,7 @@ npm run dev:full             # 完整信息版 App 开发启动
 npm run tauri:build          # 用户版 App 打包
 npm run tauri:build:full     # 完整信息版 App 打包
 npm run tauri:build:dmg      # 用户版 macOS DMG
-npm run build:sidecar        # 构建 Windsurf sidecar
+npm run build:sidecar        # 构建本地 API sidecar
 npm run check                # 构建 App 前端资源并 lint
 npm run lint                 # 代码检查
 ```

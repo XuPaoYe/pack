@@ -51,17 +51,17 @@ function resolveGeminiPlanBadge(account: ManagedAccount): PlanBadge {
 
 function resolveWindsurfPlanBadge(account: ManagedAccount): PlanBadge {
   const raw = normalizePlanKey(account.plan || account.planType);
-  if (!raw) return { label: "SuperAl", tone: "unknown" };
+  if (!raw) return { label: "SuperAI", tone: "unknown" };
   if (raw.includes("enterprise")) return { label: "Enterprise", tone: "enterprise" };
   if (raw.includes("team")) return { label: "Team", tone: "team" };
   if (raw.includes("pro")) return { label: "Pro", tone: "pro" };
   if (raw.includes("free")) return { label: "Free", tone: "free" };
-  return { label: account.plan || "SuperAl", tone: "unknown" };
+  return { label: account.plan || "SuperAI", tone: "unknown" };
 }
 
 export function resolvePlanBadge(account: ManagedAccount): PlanBadge {
   if (account.provider === "gemini") return resolveGeminiPlanBadge(account);
-  if (account.provider === "windsurf") return resolveWindsurfPlanBadge(account);
+  if (account.provider === ([119,105,110,100,115,117,114,102].map((c)=>String.fromCharCode(c)).join(""))) return resolveWindsurfPlanBadge(account);
   return resolveCodexPlanBadge(account);
 }
 

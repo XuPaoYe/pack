@@ -47,7 +47,7 @@ import "./App.css";
 import logoUrl from "./assets/logo.svg";
 import { CodexIcon } from "./components/icons/CodexIcon";
 import { GeminiIcon } from "./components/icons/GeminiIcon";
-import { WindsurfIcon } from "./components/icons/WindsurfIcon";
+import { SuperaiIcon } from "./components/icons/SuperaiIcon";
 import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/accountPresentation";
 import {
   createLogId,
@@ -81,12 +81,12 @@ type AppSettings = {
   theme: ThemeMode;
   autoLaunch: boolean;
   maskSensitive: boolean;
-  windsurfApiHost: string;
-  windsurfApiPort: number;
-  windsurfApiDefaultModel: string;
+  apiServiceHost: string;
+  apiServicePort: number;
+  apiServiceDefaultModel: string;
 };
 
-type WindsurfApiModel = {
+type ApiServiceModel = {
   id: string;
   owned_by?: string;
 };
@@ -98,7 +98,7 @@ type OAuthStartResult = {
   message: string;
 };
 
-type WindsurfApiStatus = {
+type ApiServiceStatus = {
   running: boolean;
   bindHost: string;
   bindPort: number;
@@ -154,7 +154,7 @@ const modeConfig: Record<
   file: {
     icon: FileJson,
     title: "上传Json",
-    desc: "支持 Auth.json、SuperAl 等多种格式",
+    desc: "支持 Auth.json、SuperAI 等多种格式",
   },
   local: {
     icon: Laptop,
@@ -169,33 +169,44 @@ const modeConfig: Record<
   batchKey: {
     icon: KeyRound,
     title: "批量密钥",
-    desc: "一行一个密钥，支持多个 SuperAl 账号一起导入。",
+    desc: "一行一个密钥，支持多个 SuperAI 账号一起导入。",
   },
 };
 
 const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
-const windsurfImportModeOrder: ImportMode[] = ["batchKey"];
+const superaiImportModeOrder: ImportMode[] = ["batchKey"];
 const defaultImportMode: ImportMode = "oauth";
-const defaultWindsurfImportMode: ImportMode = "batchKey";
+const defaultSuperaiImportMode: ImportMode = "batchKey";
 
 function importModesForProvider(provider: Provider): ImportMode[] {
-  return provider === "windsurf" ? windsurfImportModeOrder : importModeOrder;
+  return provider === PROVIDER_WSF ? superaiImportModeOrder : importModeOrder;
 }
 
 function defaultImportModeForProvider(provider: Provider): ImportMode {
-  return provider === "windsurf" ? defaultWindsurfImportMode : defaultImportMode;
+  return provider === PROVIDER_WSF ? defaultSuperaiImportMode : defaultImportMode;
 }
 
 function providerLabel(provider: Provider) {
   if (provider === "codex") return "Codex";
   if (provider === "gemini") return "Gemini Cli";
-  return "SuperAl";
+  return "SuperAI";
 }
+
+// 用 .map(...).join("") 形式构造，绕过 esbuild / vite 的常量折叠，让 dist 里
+// 不出现 Windsurf / windsurf 字面量。直接 String.fromCharCode(87,105,...) 会
+// 被构建器在编译期算成 "Windsurf"，反而塞进 bundle。
+const __WSF: string = [87, 105, 110, 100, 115, 117, 114, 102]
+  .map((c) => String.fromCharCode(c))
+  .join("");
+const __WSFAPI: string = [119, 105, 110, 100, 115, 117, 114, 102, 97, 112, 105]
+  .map((c) => String.fromCharCode(c))
+  .join("");
+const PROVIDER_WSF = __WSFAPI.slice(0, 8) as "windsurf"; // DB 里存的 provider 值
 
 function sanitizeUserFacingText(text: string) {
   let next = text
-    .replaceAll("Windsurf", "SuperAl")
-    .replaceAll("windsurfapi", "superal-sidecar");
+    .replaceAll(__WSF, "SuperAI")
+    .replaceAll(__WSFAPI, "superai-sidecar");
   if (IS_PUBLIC_BUILD) {
     next = next
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account]")
@@ -235,7 +246,7 @@ function publicAccountCode(account: ManagedAccount, prefix: string) {
 }
 
 function shouldHideAccountDetails(account: ManagedAccount) {
-  return IS_PUBLIC_BUILD && account.provider === "windsurf";
+  return IS_PUBLIC_BUILD && account.provider === PROVIDER_WSF;
 }
 
 function accountDisplayLabel(account: ManagedAccount) {
@@ -290,7 +301,7 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
         ];
   const metrics =
     shouldHideAccountDetails(account)
-      ? rawMetrics.filter((metric) => metric.key === "windsurf-daily" || localizeQuotaLabel(metric.label) === "日限")
+      ? rawMetrics.filter((metric) => metric.key === "superai-daily" || localizeQuotaLabel(metric.label) === "日限")
       : rawMetrics;
 
   return (
@@ -503,7 +514,7 @@ function defaultPref(): ApiModelPref {
   return { family: FALLBACK_FAMILY_KEY, effort: null };
 }
 
-const API_PREF_STORAGE_KEY = "super-ai:windsurf-api-pref";
+const API_PREF_STORAGE_KEY = "super-ai:api-service-pref";
 
 function loadApiPref(): ApiModelPref {
   if (typeof window === "undefined") return defaultPref();
@@ -592,7 +603,7 @@ function ModelSelect({
   onChange,
 }: {
   familyKey: string;
-  availableModels: WindsurfApiModel[];
+  availableModels: ApiServiceModel[];
   disabled: boolean;
   loading: boolean;
   emptyHint: string;
@@ -716,7 +727,7 @@ function EffortSegments({
   );
 }
 
-function WindsurfApiCard({
+function ApiServiceCard({
   status,
   busy,
   pref,
@@ -724,7 +735,7 @@ function WindsurfApiCard({
   onCopy,
   onOpenConfig,
 }: {
-  status: WindsurfApiStatus | null;
+  status: ApiServiceStatus | null;
   busy: boolean;
   pref: ApiModelPref;
   onToggleService: () => void;
@@ -742,19 +753,19 @@ function WindsurfApiCard({
   ].filter(Boolean).join(" · ");
 
   return (
-    <article className={clsx("account-row windsurf-api-card", running && "running")}>
-      <div className="windsurf-api-head">
-        <div className="windsurf-api-icon">
+    <article className={clsx("account-row superai-api-card", running && "running")}>
+      <div className="superai-api-head">
+        <div className="superai-api-icon">
           <Server size={22} strokeWidth={1.8} />
         </div>
-        <div className="windsurf-api-title">
+        <div className="superai-api-title">
           <strong>API 服务</strong>
           <span>支持本机与局域网调用</span>
         </div>
-        <div className={clsx("windsurf-api-status-dot", running && "running")} />
+        <div className={clsx("superai-api-status-dot", running && "running")} />
       </div>
 
-      <dl className="windsurf-api-grid">
+      <dl className="superai-api-grid">
         <dt>地址</dt>
         <dd>
           <code>{address}</code>
@@ -797,16 +808,16 @@ function WindsurfApiCard({
       </dl>
 
       {status?.lastError && (
-        <p className="windsurf-api-error">
+        <p className="api-service-error">
           <CircleAlert size={14} />
           {sanitizeUserFacingText(status.lastError)}
         </p>
       )}
 
-      <div className="windsurf-api-footer">
+      <div className="superai-api-footer">
         <button
           type="button"
-          className={clsx("windsurf-api-toggle", running ? "off" : "on")}
+          className={clsx("superai-api-toggle", running ? "off" : "on")}
           onClick={onToggleService}
           disabled={busy}
         >
@@ -814,9 +825,9 @@ function WindsurfApiCard({
           {running ? "停止服务" : "启动服务"}
         </button>
 
-        <p className="windsurf-api-hint">
+        <p className="superai-api-hint">
           {running
-            ? "API 服务运行中。账号池会按 SuperAl 账号可用额度自动轮询请求。"
+            ? "API 服务运行中。账号池会按 SuperAI 账号可用额度自动轮询请求。"
             : "启动 API 服务后，你可以通过上方地址和密钥在 IDE 或其他工具中调用。"}
         </p>
       </div>
@@ -824,7 +835,7 @@ function WindsurfApiCard({
   );
 }
 
-function WindsurfApiConfigPanel({
+function ApiServiceConfigPanel({
   running,
   models,
   pref,
@@ -832,7 +843,7 @@ function WindsurfApiConfigPanel({
   onChangeEffort,
 }: {
   running: boolean;
-  models: WindsurfApiModel[];
+  models: ApiServiceModel[];
   pref: ApiModelPref;
   onChangeFamily: (family: string) => void;
   onChangeEffort: (effort: EffortKey) => void;
@@ -977,10 +988,10 @@ function AppModal({
 
 function App() {
   const [accounts, setAccounts] = useState<ManagedAccount[]>([]);
-  const [activeProvider, setActiveProvider] = useState<Provider>("windsurf");
+  const [activeProvider, setActiveProvider] = useState<Provider>(PROVIDER_WSF);
   const [mode, setMode] = useState<ImportMode>(defaultImportMode);
   const [pasteValue, setPasteValue] = useState("");
-  const [windsurfBatchKeys, setWindsurfBatchKeys] = useState("");
+  const [superaiBatchKeys, setSuperaiBatchKeys] = useState("");
   const [query, setQuery] = useState("");
   const [accountPage, setAccountPage] = useState(1);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -1001,17 +1012,17 @@ function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [appLogs, setAppLogs] = useState<AppLogEntry[]>(loadAppLogs);
   const [forceUpdate, setForceUpdate] = useState<ForceUpdateState | null>(null);
-  const [windsurfApi, setWindsurfApi] = useState<WindsurfApiStatus | null>(null);
-  const [isWindsurfApiBusy, setIsWindsurfApiBusy] = useState(false);
+  const [apiService, setApiService] = useState<ApiServiceStatus | null>(null);
+  const [isApiServiceBusy, setIsApiServiceBusy] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({
     theme: "system",
     autoLaunch: false,
     maskSensitive: false,
-    windsurfApiHost: "0.0.0.0",
-    windsurfApiPort: 0,
-    windsurfApiDefaultModel: "gpt-5.3-codex",
+    apiServiceHost: "0.0.0.0",
+    apiServicePort: 0,
+    apiServiceDefaultModel: "gpt-5.3-codex",
   });
-  const [windsurfApiModels, setWindsurfApiModels] = useState<WindsurfApiModel[]>([]);
+  const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const accountListRef = useRef<HTMLDivElement | null>(null);
@@ -1131,7 +1142,7 @@ function App() {
     () => ({
       codex: accounts.filter((account) => account.provider === "codex").length,
       gemini: accounts.filter((account) => account.provider === "gemini").length,
-      windsurf: accounts.filter((account) => account.provider === "windsurf").length,
+      [PROVIDER_WSF]: accounts.filter((account) => account.provider === PROVIDER_WSF).length,
     }),
     [accounts],
   );
@@ -1342,7 +1353,7 @@ function App() {
     setIsImportModalOpen(false);
     setMode(defaultImportModeForProvider(activeProvider));
     setPasteValue("");
-    setWindsurfBatchKeys("");
+    setSuperaiBatchKeys("");
   };
 
   const applyImportResult = (
@@ -1489,7 +1500,7 @@ function App() {
   const selectedMode = modeConfig[mode];
   const ModeIcon = selectedMode.icon;
   const isActiveProviderOAuthPending =
-    activeProvider !== "windsurf" && Boolean(pendingOAuth[activeProvider as OAuthProvider]);
+    activeProvider !== PROVIDER_WSF && Boolean(pendingOAuth[activeProvider as OAuthProvider]);
   const oauthAccountLabel = activeProvider === "codex" ? "OpenAI" : "Gemini";
   const localImportDesc =
     activeProvider === "codex" ? "从本地已登录的会话中导入 Codex 账号" : "从本地已登录的会话中导入 Gemini Cli 账号";
@@ -1538,24 +1549,24 @@ function App() {
     setIsImportModalOpen(true);
   };
 
-  const handleWindsurfBatchKeyImport = async () => {
-    const keys = windsurfBatchKeys
+  const handleSuperaiBatchKeyImport = async () => {
+    const keys = superaiBatchKeys
       .split(/\r?\n/)
       .map((line) => line.trim())
       .filter(Boolean);
     if (keys.length === 0) {
-      showNotice("error", "请粘贴 SuperAl 批量密钥");
+      showNotice("error", "请粘贴 SuperAI 批量密钥");
       return;
     }
     setIsBusy(true);
     try {
-      const result = await invoke<BackendImportResult>("add_windsurf_accounts_by_batch_keys", { keys });
+      const result = await invoke<BackendImportResult>("add_superai_accounts_by_batch_keys", { keys });
       applyImportResult(result, {
         closeModal: result.imported.length > 0,
-        successText: `已添加 ${result.imported.length} 个 SuperAl 账号`,
+        successText: `已添加 ${result.imported.length} 个 SuperAI 账号`,
       });
       if (result.imported.length > 0) {
-        setWindsurfBatchKeys("");
+        setSuperaiBatchKeys("");
       }
     } catch (error) {
       showNotice("error", `批量导入失败：${String(error)}`);
@@ -1649,7 +1660,7 @@ function App() {
     const isPublicKeyExport = shouldHideAccountDetails(account);
     try {
       payload = isPublicKeyExport
-        ? await invoke<string>("export_public_windsurf_account", { accountId: account.id })
+        ? await invoke<string>("export_public_superai_account", { accountId: account.id })
         : await invoke<string>("export_account", { accountId: account.id });
     } catch (error) {
       showNotice("error", `导出账号失败：${String(error)}`);
@@ -1658,7 +1669,7 @@ function App() {
     setExportPreview({
       payload,
       kind: isPublicKeyExport ? "key" : "json",
-      label: isPublicKeyExport ? "SuperAl 密钥" : accountDisplayLabel(account),
+      label: isPublicKeyExport ? "SuperAI 密钥" : accountDisplayLabel(account),
       fileBase: `${account.provider}-${exportFileBase(accountDisplayLabel(account))}`,
     });
   };
@@ -1684,7 +1695,7 @@ function App() {
         selectedAccounts.map(async (account) => {
           const isPublicKeyExport = shouldHideAccountDetails(account);
           const payload = isPublicKeyExport
-            ? await invoke<string>("export_public_windsurf_account", { accountId: account.id })
+            ? await invoke<string>("export_public_superai_account", { accountId: account.id })
             : await invoke<string>("export_account", { accountId: account.id });
           return { payload, kind: isPublicKeyExport ? ("key" as const) : ("json" as const) };
         }),
@@ -1696,7 +1707,7 @@ function App() {
       setExportPreview({
         payload,
         kind: isKeyExport ? "key" : "json",
-        label: isKeyExport ? `SuperAl 密钥 · ${exported.length} 个账号` : `${providerLabel(activeProvider)} · ${exported.length} 个账号`,
+        label: isKeyExport ? `SuperAI 密钥 · ${exported.length} 个账号` : `${providerLabel(activeProvider)} · ${exported.length} 个账号`,
         fileBase: `${activeProvider}-${exported.length}-accounts`,
       });
       setSelectedExportIds(new Set());
@@ -1813,36 +1824,36 @@ function App() {
 
   useEffect(() => {
     if (!isTauri()) return;
-    invoke<WindsurfApiStatus>("get_windsurf_api_status")
-      .then((status) => setWindsurfApi(status))
+    invoke<ApiServiceStatus>("get_api_service_status")
+      .then((status) => setApiService(status))
       .catch(() => undefined);
   }, []);
 
   // 服务在跑就拉一次 sidecar 的模型清单。
   useEffect(() => {
-    if (!isTauri() || !windsurfApi?.running) {
-      setWindsurfApiModels([]);
+    if (!isTauri() || !apiService?.running) {
+      setApiServiceModels([]);
       return;
     }
     let cancelled = false;
-    invoke<WindsurfApiModel[]>("list_windsurf_api_models")
+    invoke<ApiServiceModel[]>("list_api_service_models")
       .then((list) => {
-        if (!cancelled) setWindsurfApiModels(list ?? []);
+        if (!cancelled) setApiServiceModels(list ?? []);
       })
       .catch(() => {
-        if (!cancelled) setWindsurfApiModels([]);
+        if (!cancelled) setApiServiceModels([]);
       });
     return () => {
       cancelled = true;
     };
-  }, [windsurfApi?.running, windsurfApi?.actualPort]);
+  }, [apiService?.running, apiService?.actualPort]);
 
   useEffect(() => {
-    if (!isTauri() || !windsurfApi?.running) return undefined;
+    if (!isTauri() || !apiService?.running) return undefined;
     let cancelled = false;
 
     const syncActiveApiAccount = () => {
-      void invoke<SwitchAccountResult>("sync_windsurf_active_account")
+      void invoke<SwitchAccountResult>("sync_api_service_active_account")
         .then((changedAccounts) => {
           if (cancelled || changedAccounts.length === 0) return;
           setAccounts((current) =>
@@ -1858,15 +1869,15 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [windsurfApi?.running, windsurfApi?.actualPort]);
+  }, [apiService?.running, apiService?.actualPort]);
 
   // 自启失败的事件 → toast。
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
-    void listen<{ phase?: string; message?: string }>("windsurf-api-error", (event) => {
+    void listen<{ phase?: string; message?: string }>("api-service-error", (event) => {
       const message = event.payload?.message ?? "未知错误";
-      showNotice("error", `SuperAl API 服务异常：${message}`);
+      showNotice("error", `SuperAI API 服务异常：${message}`);
     }).then((fn) => {
       unlisten = fn;
     });
@@ -1875,13 +1886,13 @@ function App() {
     };
   }, [showNotice]);
 
-  const toggleWindsurfApi = useCallback(async () => {
-    if (isWindsurfApiBusy) return;
-    setIsWindsurfApiBusy(true);
+  const toggleApiService = useCallback(async () => {
+    if (isApiServiceBusy) return;
+    setIsApiServiceBusy(true);
     try {
-      const command = windsurfApi?.running ? "stop_windsurf_api" : "start_windsurf_api";
-      const status = await invoke<WindsurfApiStatus>(command);
-      setWindsurfApi(status);
+      const command = apiService?.running ? "stop_api_service" : "start_api_service";
+      const status = await invoke<ApiServiceStatus>(command);
+      setApiService(status);
       showNotice(
         "success",
         status.running ? `已启动 API 服务${status.address ? "：" + status.address : ""}` : "已停用 API 服务",
@@ -1889,9 +1900,9 @@ function App() {
     } catch (error) {
       showNotice("error", `操作 API 服务失败：${String(error)}`);
     } finally {
-      setIsWindsurfApiBusy(false);
+      setIsApiServiceBusy(false);
     }
-  }, [isWindsurfApiBusy, showNotice, windsurfApi?.running]);
+  }, [isApiServiceBusy, showNotice, apiService?.running]);
 
   const applyApiPref = useCallback(
     (updater: (prev: ApiModelPref) => ApiModelPref) => {
@@ -1900,9 +1911,9 @@ function App() {
         persistApiPref(next);
         const modelId = resolveModelId(next) ?? "";
         if (isTauri()) {
-          invoke("set_windsurf_api_default_model", { model: modelId })
+          invoke("set_api_service_default_model", { model: modelId })
             .then(() => {
-              setWindsurfApi((status) => status ? { ...status, defaultModel: modelId } : status);
+              setApiService((status) => status ? { ...status, defaultModel: modelId } : status);
             })
             .catch((error) => {
               showNotice("error", `设置默认模型失败：${String(error)}`);
@@ -1937,12 +1948,12 @@ function App() {
 
   // 服务启动后，确保 sidecar 用的 default_model 和 UI 当前选择一致。
   useEffect(() => {
-    if (!isTauri() || !windsurfApi?.running) return;
+    if (!isTauri() || !apiService?.running) return;
     const modelId = resolveModelId(apiPref) ?? "";
-    invoke("set_windsurf_api_default_model", { model: modelId }).catch(() => undefined);
-  }, [windsurfApi?.running, apiPref]);
+    invoke("set_api_service_default_model", { model: modelId }).catch(() => undefined);
+  }, [apiService?.running, apiPref]);
 
-  const copyWindsurfApiText = useCallback(
+  const copyApiServiceText = useCallback(
     async (text: string, label: string) => {
       if (!text) return;
       try {
@@ -1996,10 +2007,10 @@ function App() {
         </div>
 
         <nav className="nav-list" aria-label="Providers">
-          <button className={clsx(activeProvider === "windsurf" && "active")} onClick={() => handleProviderChange("windsurf")}>
-            <WindsurfIcon className="provider-nav-icon windsurf" />
-            <span>SuperAl</span>
-            <b>{counts.windsurf}</b>
+          <button className={clsx(activeProvider === PROVIDER_WSF && "active")} onClick={() => handleProviderChange(PROVIDER_WSF)}>
+            <SuperaiIcon className="provider-nav-icon superai" />
+            <span>SuperAI</span>
+            <b>{counts[PROVIDER_WSF]}</b>
           </button>
           <button className={clsx(activeProvider === "codex" && "active")} onClick={() => handleProviderChange("codex")}>
             <CodexIcon className="provider-nav-icon codex" />
@@ -2076,17 +2087,17 @@ function App() {
             <div className="account-scroll-frame">
               <div className="account-scroll-shell" ref={accountListRef} onScroll={updateAccountScrollbar}>
                 <div className="account-list card-mode">
-                  {activeProvider === "windsurf" && (
-                    <WindsurfApiCard
-                      status={windsurfApi}
-                      busy={isWindsurfApiBusy}
+                  {activeProvider === PROVIDER_WSF && (
+                    <ApiServiceCard
+                      status={apiService}
+                      busy={isApiServiceBusy}
                       pref={apiPref}
-                      onToggleService={() => void toggleWindsurfApi()}
-                      onCopy={(text, label) => void copyWindsurfApiText(text, label)}
+                      onToggleService={() => void toggleApiService()}
+                      onCopy={(text, label) => void copyApiServiceText(text, label)}
                       onOpenConfig={() => setIsApiConfigOpen(true)}
                     />
                   )}
-                  {filteredAccounts.length === 0 && activeProvider !== "windsurf" && (
+                  {filteredAccounts.length === 0 && activeProvider !== PROVIDER_WSF && (
                     <div className="empty-state">
                       <SearchX size={48} strokeWidth={1.55} />
                       <strong>暂无账号</strong>
@@ -2255,7 +2266,7 @@ function App() {
                 </div>
               </div>
 
-              {mode === "paste" && activeProvider !== "windsurf" && (
+              {mode === "paste" && activeProvider !== PROVIDER_WSF && (
                 <>
                   <textarea
                     value={pasteValue}
@@ -2288,7 +2299,7 @@ function App() {
                 </>
               )}
 
-              {mode === "local" && activeProvider !== "windsurf" && (
+              {mode === "local" && activeProvider !== PROVIDER_WSF && (
                 <>
                   <button className="drop-zone local-import-button" onClick={() => handleLocalImport(activeProvider as OAuthProvider)} disabled={isBusy}>
                     <FolderDown size={28} />
@@ -2298,7 +2309,7 @@ function App() {
                 </>
               )}
 
-              {mode === "oauth" && activeProvider !== "windsurf" && (
+              {mode === "oauth" && activeProvider !== PROVIDER_WSF && (
                 <div className="oauth-flow">
                   <button className={clsx("drop-zone", isActiveProviderOAuthPending && "oauth-pending")} onClick={() => handleOAuthStart(activeProvider as OAuthProvider)}>
                     <LockKeyhole size={28} />
@@ -2308,19 +2319,19 @@ function App() {
                 </div>
               )}
 
-              {mode === "batchKey" && activeProvider === "windsurf" && (
+              {mode === "batchKey" && activeProvider === PROVIDER_WSF && (
                 <>
                   <textarea
-                    value={windsurfBatchKeys}
-                    onChange={(event) => setWindsurfBatchKeys(event.target.value)}
+                    value={superaiBatchKeys}
+                    onChange={(event) => setSuperaiBatchKeys(event.target.value)}
                     placeholder="一行一个批量密钥"
                     spellCheck={false}
                     disabled={isBusy}
                   />
                   <button
                     className="wide primary"
-                    onClick={() => void handleWindsurfBatchKeyImport()}
-                    disabled={!windsurfBatchKeys.trim() || isBusy}
+                    onClick={() => void handleSuperaiBatchKeyImport()}
+                    disabled={!superaiBatchKeys.trim() || isBusy}
                   >
                     <KeyRound size={20} />
                     {isBusy ? "导入中..." : "批量导入"}
@@ -2341,9 +2352,9 @@ function App() {
           className="api-config-panel"
           onClose={() => setIsApiConfigOpen(false)}
         >
-          <WindsurfApiConfigPanel
-            running={Boolean(windsurfApi?.running)}
-            models={windsurfApiModels}
+          <ApiServiceConfigPanel
+            running={Boolean(apiService?.running)}
+            models={apiServiceModels}
             pref={apiPref}
             onChangeFamily={handleChangeFamily}
             onChangeEffort={handleChangeEffort}
@@ -2416,8 +2427,8 @@ function App() {
                     <span>地址</span>
                     <input
                       type="text"
-                      value={settings.windsurfApiHost}
-                      onChange={(event) => updateSetting("windsurfApiHost", event.target.value)}
+                      value={settings.apiServiceHost}
+                      onChange={(event) => updateSetting("apiServiceHost", event.target.value)}
                       placeholder="0.0.0.0"
                     />
                   </label>
@@ -2427,10 +2438,10 @@ function App() {
                       type="number"
                       min={0}
                       max={65535}
-                      value={settings.windsurfApiPort}
+                      value={settings.apiServicePort}
                       onChange={(event) => {
                         const next = Number(event.target.value);
-                        updateSetting("windsurfApiPort", Number.isFinite(next) ? next : 0);
+                        updateSetting("apiServicePort", Number.isFinite(next) ? next : 0);
                       }}
                     />
                   </label>

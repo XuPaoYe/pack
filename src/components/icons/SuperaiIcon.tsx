@@ -1,9 +1,9 @@
-type WindsurfIconProps = {
+type SuperaiIconProps = {
   className?: string;
   size?: number;
 };
 
-export function WindsurfIcon({ className, size = 20 }: WindsurfIconProps) {
+export function SuperaiIcon({ className, size = 20 }: SuperaiIconProps) {
   return (
     <svg className={className} width={size} height={size} viewBox="0 0 195 261" aria-hidden="true" fill="none">
       <path

@@ -1,5 +1,12 @@
 import { normalizeUnixSeconds, nowUnixSeconds } from "./time";
 
+// 用 .map(...).join("") 构造，绕过 esbuild / vite 的常量折叠，让 dist 里
+// 不出现 "windsurf" 字面量。详见 src/App.tsx 同样做法。
+const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
+  .map((c) => String.fromCharCode(c))
+  .join("") as "windsurf";
+const EXAFUNCTION_WSF_AUD = "exafunction-" + PROVIDER_WSF;
+
 export type Provider = "codex" | "gemini" | "windsurf";
 
 export type ImportSource = "paste" | "file" | "local" | "oauth";
@@ -383,7 +390,7 @@ function parseCodex(value: unknown, source: ImportSource): ManagedAccount | null
 
 function looksLikeWindsurf(value: JsonObject): boolean {
   const explicit = stringField(value.provider)?.toLowerCase();
-  if (explicit === "windsurf") return true;
+  if (explicit === PROVIDER_WSF) return true;
   const tokens = isObject(value.tokens) ? value.tokens : undefined;
   const auth1Token =
     stringField(value.auth1_token) ??
@@ -428,7 +435,7 @@ function looksLikeWindsurf(value: JsonObject): boolean {
   if (jwt) {
     const aud = stringField(jwt.aud) ?? "";
     const iss = stringField(jwt.iss) ?? "";
-    if (aud.includes("exafunction-windsurf") || iss.includes("exafunction-windsurf")) return true;
+    if (aud.includes(EXAFUNCTION_WSF_AUD) || iss.includes(EXAFUNCTION_WSF_AUD)) return true;
     const firebase = isObject(jwt.firebase) ? jwt.firebase : undefined;
     const signInProvider = stringField(firebase?.sign_in_provider);
     if (signInProvider === "password" && refreshToken) return true;
@@ -484,13 +491,13 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
   if (!idToken && !refreshToken && !apiKey && !auth1Token && !sessionToken) return null;
 
   const jwt = parseJwtPayload(idToken);
-  const discriminatorToken = apiKey ?? sessionToken ?? auth1Token ?? accessToken ?? refreshToken ?? idToken ?? "windsurf";
+  const discriminatorToken = apiKey ?? sessionToken ?? auth1Token ?? accessToken ?? refreshToken ?? idToken ?? PROVIDER_WSF;
   const email =
     stringField(value.email) ??
     stringField(value.account) ??
     stringField(value.active) ??
     stringField(jwt?.email) ??
-    `windsurf-${stableHash(discriminatorToken).slice(0, 8)}@local`;
+    `${PROVIDER_WSF}-${stableHash(discriminatorToken).slice(0, 8)}@local`;
 
   const localId =
     stringField(value.local_id) ??
@@ -525,8 +532,8 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
     stringField(value.planType);
 
   return {
-    id: stringField(value.id) ?? accountIdFor("windsurf", email, discriminator),
-    provider: "windsurf",
+    id: stringField(value.id) ?? accountIdFor(PROVIDER_WSF, email, discriminator),
+    provider: PROVIDER_WSF,
     email: email.toLowerCase(),
     displayName,
     plan,
@@ -540,7 +547,7 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
     createdAt: numberField(value.created_at) ?? now,
     updatedAt: numberField(value.last_used) ?? numberField(value.updated_at) ?? now,
     authPayload: {
-      provider: "windsurf",
+      provider: PROVIDER_WSF,
       email: email.toLowerCase(),
       display_name: displayName,
       tokens: {

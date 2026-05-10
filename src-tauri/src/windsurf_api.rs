@@ -1,8 +1,8 @@
-//! SuperAl 本地 API 服务（阶段 2）
+//! SuperAI 本地 API 服务（阶段 2）
 //!
 //! 我们对外暴露 OpenAI / Anthropic 兼容入口（`/v1/...`），
-//! 实际由打包进 Tauri 的 `superal-api` sidecar（bun --compile）+
-//! SuperAl runtime 二进制处理推理。
+//! 实际由打包进 Tauri 的 `superai-api` sidecar（bun --compile）+
+//! SuperAI runtime 二进制处理推理。
 //!
 //! 本模块负责：
 //! - 起停服务（spawn sidecar 子进程 + tiny_http 反向代理）
@@ -113,7 +113,7 @@ static RUNTIME: LazyLock<Mutex<Option<Runtime>>> = LazyLock::new(|| Mutex::new(N
 static LAST_USED_ACCOUNT_EMAIL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Runtime>> {
-    RUNTIME.lock().expect("SuperAl API 运行态锁失败")
+    RUNTIME.lock().expect("SuperAI API 运行态锁失败")
 }
 
 pub fn last_used_account_email() -> Option<String> {
@@ -422,7 +422,7 @@ fn spawn_sidecar(
 
     // stdout 解析端口；同步打到主进程 stderr 便于调试
     let stdout_join = thread::Builder::new()
-        .name("superal-api-stdout".into())
+        .name("superai-api-stdout".into())
         .spawn(move || {
             let reader = BufReader::new(stdout);
             let mut sent_port = false;
@@ -435,18 +435,18 @@ fn spawn_sidecar(
                         }
                     }
                 }
-                eprintln!("[SuperAl sidecar] {}", sanitize_sidecar_log_line(&line));
+                eprintln!("[SuperAI sidecar] {}", sanitize_sidecar_log_line(&line));
             }
         })
         .map_err(|error| format!("无法启动 stdout 读线程: {error}"))?;
 
     let stderr_join = thread::Builder::new()
-        .name("superal-api-stderr".into())
+        .name("superai-api-stderr".into())
         .spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
-                eprintln!("[SuperAl sidecar:err] {}", sanitize_sidecar_log_line(&line));
+                eprintln!("[SuperAI sidecar:err] {}", sanitize_sidecar_log_line(&line));
             }
         })
         .map_err(|error| format!("无法启动 stderr 读线程: {error}"))?;
@@ -500,7 +500,7 @@ fn parse_listen_port(line: &str) -> Option<u16> {
 }
 
 fn sanitize_sidecar_log_line(line: &str) -> String {
-    let mut text = line.replace("Windsurf", "SuperAl").replace("windsurf", "superal");
+    let mut text = line.replace("Windsurf", "SuperAI").replace("windsurf", "superai");
     let mut sanitized = String::with_capacity(text.len());
     let mut token = String::new();
 
@@ -559,21 +559,21 @@ pub fn start(
     }
     stop()?;
 
-    let sidecar_bin = resolve_bundled_binary("superal-api").ok_or_else(|| {
+    let sidecar_bin = resolve_bundled_binary("superai-api").ok_or_else(|| {
         format!(
             "未找到 sidecar 二进制 {}。请先运行 `npm run build:sidecar`",
-            binary_filename("superal-api")
+            binary_filename("superai-api")
         )
     })?;
     let ls_bin = resolve_bundled_binary("language_server").ok_or_else(|| {
         format!(
-            "未找到 SuperAl runtime 二进制 {}。请先运行 `npm run build:sidecar`",
+            "未找到 SuperAI runtime 二进制 {}。请先运行 `npm run build:sidecar`",
             binary_filename("language_server")
         )
     })?;
 
     let inner_key = generate_inner_key();
-    let sidecar_data_dir = app_data_dir.join("superal-api");
+    let sidecar_data_dir = app_data_dir.join("superai-api");
     let (sidecar, sidecar_port) =
         spawn_sidecar(&sidecar_bin, &ls_bin, &sidecar_data_dir, &inner_key)?;
 
@@ -856,7 +856,7 @@ fn post_sidecar_dashboard_api(
 pub fn activate_account_by_email(email: &str) -> Result<(), String> {
     let wanted_email = email.trim().to_ascii_lowercase();
     if wanted_email.is_empty() {
-        return Err("SuperAl 账号缺少 email，无法同步 API 启用状态".to_string());
+        return Err("SuperAI 账号缺少 email，无法同步 API 启用状态".to_string());
     }
 
     let target = clone_target()?;
@@ -892,7 +892,7 @@ pub fn activate_account_by_email(email: &str) -> Result<(), String> {
                 }
             })
         })
-        .ok_or_else(|| format!("API 服务中未找到 SuperAl 账号: {email}"))?;
+        .ok_or_else(|| format!("API 服务中未找到 SuperAI 账号: {email}"))?;
 
     let resp = client
         .patch(format!(
@@ -1001,7 +1001,7 @@ fn handle_request(mut request: Request, api_key: &str, target: Option<&ProxyTarg
                 501,
                 &json!({
                     "error": {
-                        "message": "SuperAl 本地 API 服务尚未接入运行时，请等待后续版本。",
+                        "message": "SuperAI 本地 API 服务尚未接入运行时，请等待后续版本。",
                         "type": "not_implemented",
                         "code": "ls_unavailable",
                     }
@@ -1057,7 +1057,7 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
                     forced_model = Some(target.default_model.clone());
                     if requested_model != target.default_model {
                         eprintln!(
-                            "[SuperAl API] model override: {requested_model} -> {}",
+                            "[SuperAI API] model override: {requested_model} -> {}",
                             target.default_model
                         );
                     }
@@ -1435,7 +1435,7 @@ mod tests {
     }
 
     /// 真跑：spawn sidecar + 反向代理 /v1/models。
-    /// 依赖 src-tauri/binaries/{superal-api,language_server}-<triple> 已经构建好；
+    /// 依赖 src-tauri/binaries/{superai-api,language_server}-<triple> 已经构建好；
     /// 默认忽略，按需 `cargo test windsurf_api -- --ignored --test-threads=1` 跑。
     #[test]
     #[ignore = "needs prebuilt sidecar binaries; run with --ignored"]

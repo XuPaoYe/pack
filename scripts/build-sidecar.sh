@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 构建 SuperAl 本地 API 服务所需的两个 sidecar 二进制：
-#   1) superal-api-<target>     —— 用 bun --compile 把 vendor 里的上游服务打成单文件
+# 构建 SuperAI 本地 API 服务所需的两个 sidecar 二进制：
+#   1) superai-api-<target>     —— 用 bun --compile 把 vendor 里的上游服务打成单文件
 #   2) language_server_<target> —— 从已安装的运行时应用 / 用户指定路径里抽
 #
 # 输出统一放到 src-tauri/binaries/，遵循 Tauri externalBin 的 <name>-<rust-target-triple>
@@ -13,11 +13,20 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENDOR_DIR="$REPO_ROOT/vendor/windsurfapi"
+VENDOR_SRC_DIR="$REPO_ROOT/vendor/windsurfapi"
+# scrub-vendor.mjs 会把原始 vendor 复制到这里，并替换掉用户可见的
+# Windsurf 字面量；bun --compile 实际读取的是这份副本。
+SCRUBBED_DIR="$REPO_ROOT/.vendor-build/windsurfapi"
+VENDOR_DIR="$SCRUBBED_DIR"
 OUTPUT_DIR="$REPO_ROOT/src-tauri/binaries"
 
-if [[ ! -d "$VENDOR_DIR/src" ]]; then
+if [[ ! -d "$VENDOR_SRC_DIR/src" ]]; then
   echo "❌ 未找到 vendor/windsurfapi/src，先把上游代码 vendor 进来" >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "❌ 需要 node 来跑 scripts/scrub-vendor.mjs" >&2
   exit 1
 fi
 
@@ -25,6 +34,9 @@ if ! command -v bun >/dev/null 2>&1; then
   echo "❌ 需要 bun (>=1.3) 来编译 sidecar，请先安装：https://bun.sh" >&2
   exit 1
 fi
+
+echo "▶ scripts/scrub-vendor.mjs"
+node "$REPO_ROOT/scripts/scrub-vendor.mjs"
 
 # 推断当前平台的 bun target + Rust target triple
 detect_target() {
@@ -74,7 +86,7 @@ repair_macos_binary() {
 
 # 1) 编译本地 API sidecar
 echo "▶ bun build --compile --target=$BUN_TARGET"
-SIDECAR_OUT="$OUTPUT_DIR/superal-api-$RUST_TRIPLE"
+SIDECAR_OUT="$OUTPUT_DIR/superai-api-$RUST_TRIPLE"
 WINDOWS_SUFFIX=""
 if [[ "$RUST_TRIPLE" == *windows* ]]; then
   WINDOWS_SUFFIX=".exe"
@@ -130,7 +142,7 @@ done
 
 if [[ -z "$found" ]]; then
   cat >&2 <<EOF
-❌ 没找到 SuperAl runtime 二进制
+❌ 没找到 SuperAI runtime 二进制
    请安装运行时应用后重试，或手动设置 WINDSURF_LS_PATH 指向已有的 LS 文件。
    候选位置：
 $(printf '   - %s\n' "${candidates[@]}")

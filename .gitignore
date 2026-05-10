@@ -43,3 +43,6 @@ src-tauri/binaries/*
 
 # bun --compile temp files
 .*-*.bun-build
+
+# scrubbed vendor copy used by scripts/build-sidecar.sh
+.vendor-build/
