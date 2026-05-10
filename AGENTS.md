@@ -239,6 +239,124 @@ npm run build:sidecar
 
 不要把 sidecar / LS 二进制提交到 Git，`.gitignore` 已经覆盖。
 
+## 构建模式：Public（默认） vs Full
+
+### 中文术语映射（强制使用）
+
+用户与代码沟通统一使用：
+
+| 中文 | 英文 / 代码标志 | 含义 |
+|---|---|---|
+| **公开版** | public build / `VITE_SUPERAI_PUBLIC_BUILD=1` | 默认构建，对外分发给最终用户。脱敏 + 批量密钥导入 + 本地累计用量 |
+| **完全版** | full build / 不注入环境变量 | 内部 / 开发自用，无脱敏、显示真 email、可导出原始凭证、有完整模型族 |
+
+> 用户日常说"公开版 / 完全版"时，对应英文文档里的 public / full。新增代码、commit message、内部讨论统一沿用这两个中文词，不要写成"用户版 / 内部版 / pro 版 / lite 版"等其他叫法。
+
+通过环境变量 `VITE_SUPERAI_PUBLIC_BUILD=1` 切换。两个 npm 脚本入口：
+
+| 脚本 | 模式 | 注入的 env |
+|---|---|---|
+| `npm run dev` / `npm run tauri:build` / `tauri:build:dmg` | **public**（默认） | `VITE_SUPERAI_PUBLIC_BUILD=1` |
+| `npm run dev:full` / `tauri:build:full` / `tauri:build:dmg:full` | **full** | 不注入 |
+
+读取入口：
+- 前端：`@/src/App.tsx` 顶部 `IS_PUBLIC_BUILD = import.meta.env.VITE_SUPERAI_PUBLIC_BUILD === "1"`
+- Rust：`@/src-tauri/src/lib.rs` `fn is_public_build()` 用 `option_env!("VITE_SUPERAI_PUBLIC_BUILD")`
+- 类型声明：`@/src/vite-env.d.ts` 已声明 `VITE_SUPERAI_PUBLIC_BUILD?: string`
+
+### 行为差异完整盘点
+
+新增 build-aware 逻辑必须更新本表。
+
+| # | 功能点 | 文件 | public（默认） | full |
+|---|---|---|---|---|
+| 1 | 邮箱/token 文本脱敏 | `App.tsx` `sanitizeUserFacingText` | ✅ regex 替成 `[account]`/`[secret]` | ❌ 原样 |
+| 2 | windsurf 账号卡片身份 | `App.tsx` `shouldHideAccountDetails` / `accountDisplayLabel` | ✅ 显示 `SUPERAI-XXXXXXX` | ❌ 真 email |
+| 3 | API 服务模型族选项 | `App.tsx` `modelFamiliesForBuild` | ✅ 仅 `PUBLIC_MODEL_FAMILY_KEYS` | ❌ 全部 `MODEL_FAMILIES` |
+| 4 | 单号导出格式 | `App.tsx` `handleExportAccount` + Rust `export_account` / `export_public_superai_account` | ✅ 走 `export_public_superai_account` 返 batch_key | ❌ 走 `export_account` 返原始 JSON |
+| 5 | 批量导出格式 | `App.tsx` `handleBatchExport` 同上分支 | ✅ 同 #4 | ❌ 同 #4 |
+| 6 | Rust 兜底拒绝原始凭证导出 | `lib.rs` `export_account` 中 `is_public_build()` | ✅ `Err("公开版不允许导出 SuperAI 原始凭证")` | ❌ 走 `build_windsurf_payload` |
+| 7 | 账号本地累计用量 | `lib.rs` `bump_public_usage` 等（详见下节） | ✅ 触发条件：账号 `auth_payload` 含 `batch_key`，只有公开版的批量密钥导入路径会写这个字段 | ❌ 不写 batch_key，helper 全部 no-op |
+| 8 | windsurf 卡片配额面板可见 metric | `App.tsx` 配额渲染处 | ✅ 仅 `superai-daily` / `superai-public` / 标签为"日限"的 metric；缺失时强制兜底 0% 进度条（公开版下 `superai-public` 的标签也固定为"日限"，UI 不暴露"额度"二字） | ❌ 全部 metric |
+
+### 与构建模式无关（不要错误地包条件）
+
+下面这些是**所有构建**都启用，**不要**给它们加 `IS_PUBLIC_BUILD` / `is_public_build()` 判：
+
+- **DB 加密**（`@/src-tauri/src/lib.rs` `serialize_account_for_storage` / `superai_encrypt_text`）：所有 windsurf 行 AES 加密 + email 列填合成 ID + display_name 置 NULL。判定按 `provider == "windsurf"`，不按 build。
+- **vendor scrub**（`@/scripts/scrub-vendor.mjs`）：脱敏 `Windsurf`/`windsurfapi` 字面量、改写 `models.js` `owned_by`、给 `dashboard/logger.js` JSONL 落盘加 sanitize、把 `auth.js` 的 `saveAccounts` / `saveAccountsSync` no-op 化。所有构建都跑。
+- **sidecar accounts.json 不落盘**：scrub-vendor 的 no-op patch 让 `saveAccounts` 一直空转，应用关闭 = 内存账号池蒸发。所有构建都生效。
+- **3 秒 IPC `sync_api_service_active_account` 缓存短路**（`@/src-tauri/src/windsurf_api.rs` `LAST_SYNCED_ACTIVE_EMAIL`）：所有构建都启用。
+- **DB / 3DES / refresh / sidecar 反代行为**：所有构建一致。
+- **导入面板的可选模式**：由 provider 决定，**不**由 build 决定。windsurf provider 永远只显示"批量密钥"（`superaiImportModeOrder = ["batchKey"]`），codex/gemini 永远显示 oauth/paste/local/file。两种构建在这块表现一致，请勿误加 `IS_PUBLIC_BUILD` 判。
+
+## 公开版账号"本地累计用量"机制
+
+**只对 windsurf provider 且 auth_payload 含 `batch_key` 的账号生效**。full 版用其他导入路径（密码/token/OAuth）入库的号没有 `batch_key`，所有 helper 自动 no-op，对 full 流程零影响。
+
+### 数据字段（`auth_payload` 内，随 windsurf 行 AES 加密落盘）
+
+| 字段 | 含义 |
+|---|---|
+| `batch_key` | 公开版批量密钥原文，导出时复用 |
+| `license_expires_at` | 批量密钥到期 unix 时间，到期由 `delete_expired_windsurf_accounts` 删账号 |
+| `usage_baseline_remaining` | 入库时上游 weekly% 快照（仅记录用，不参与 diff） |
+| `usage_last_remote_remaining` | 上次刷新拿到的上游 weekly%；下次比对差值 |
+| `usage_consumed_local` | 本地累计已用 0..100，**单调递增不可回退** |
+| `usage_exhausted_at` | 用满 unix 时间戳；存在即视为已耗尽 |
+
+### 累计算法（`bump_public_usage`）
+
+```
+首次（last_remote 缺失）:
+  baseline = last_remote = 当前 weekly%
+  consumed 保持 0
+后续:
+  diff = last_remote - this_weekly
+  diff > 0  → consumed = clamp(consumed + diff, 0, 100)
+  diff <= 0 → 上游重置或抖动，不动 consumed
+  无论正负都更新 last_remote = this_weekly
+触达 100:
+  写 usage_exhausted_at
+  status = unavailable / "已耗尽" / reason="本地累计额度已用满"
+```
+
+### 集成点（不要漏写）
+
+新增 windsurf refresh 路径必须在收尾调 `apply_public_usage_after_refresh`：
+
+| 调用位置 | 何时 |
+|---|---|
+| `attach_windsurf_batch_key` 末尾 | 批量密钥入库即刻初始化 baseline |
+| `refresh_account` windsurf 分支后 | 单号刷新（含 15s active-account 静默刷新） |
+| `refresh_provider_accounts` 循环内 | 整个 provider 手动刷新 |
+| `refresh_all_accounts` 当前**未**接 windsurf 路径，新增 windsurf 分支时务必同步加 hook |
+
+耗尽事件链：
+
+1. `bump_public_usage` 返回 `(just_exhausted=true, _)`
+2. caller emit `account-exhausted` 给前端（`@/src-tauri/src/lib.rs` `emit_account_exhausted`）
+3. caller `schedule_windsurf_sync(app)` 触发 reconcile
+4. `windsurf_account_to_sidecar_payload` 看到 `public_usage_is_exhausted` → 返 None
+5. `reconcile_accounts` desired_emails 不含此号 → DELETE 到 sidecar `/auth/accounts/:id`
+6. 前端 `account-exhausted` listener toast + 重读 `list_accounts`
+
+### UI 显示约束
+
+`rewrite_quota_for_public_usage` 在公开版账号上把 `quota.metrics` 整段改写成单条 `superai-public` metric，`remainingPercent = 100 - consumed_local`。这意味着：
+
+- UI 进度条对公开版账号显示**本地剩余**，不是上游 weekly%
+- 上游周重置不会让 UI 进度条假性回血
+- full 版 / 非公开版 windsurf 号（无 batch_key）不被改写，照旧显示上游 daily/weekly
+
+### 不要做的事
+
+- 不要让 `bump_public_usage` 在 diff < 0 时回退 consumed（会造成"上游重置 → 我们送配额"）
+- 不要在 full 版导入路径写 `batch_key` 字段（会让 full 用户也被本地配额限制）
+- 不要在 `apply_windsurf_plan_status` 之前调 bump（顺序：先 apply_*_remote → 再 apply_public_usage_after_refresh，否则 status 会被覆盖回"可用"）
+- 不要直接在前端读写 usage 字段（`auth_payload` 在 `account_for_frontend` 里被 redact，前端拿不到原始 payload）
+- 新增可能改 `account.status` 或 `quota` 的代码路径，必须考虑"已耗尽"账号不能被重置回"可用"
+
 ## Verification
 
 Run before handing off meaningful changes:

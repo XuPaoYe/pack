@@ -301,10 +301,21 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
           { key: "codex-5h", label: "5H", remainingPercent: 0 },
           { key: "codex-weekly", label: "周限", remainingPercent: 0 },
         ];
-  const metrics =
-    shouldHideAccountDetails(account)
-      ? rawMetrics.filter((metric) => metric.key === "superai-daily" || localizeQuotaLabel(metric.label) === "日限")
-      : rawMetrics;
+  const hideDetails = shouldHideAccountDetails(account);
+  let metrics = rawMetrics;
+  if (hideDetails) {
+    metrics = rawMetrics.filter(
+      (metric) =>
+        metric.key === "superai-daily" ||
+        metric.key === "superai-public" ||
+        localizeQuotaLabel(metric.label) === "日限",
+    );
+    // 公开版兜底：daily 用完后上游可能走 credits 分支或 metric 缺失，
+    // 此时也强制显示一根 0% 进度条，避免"用完就不见"。
+    if (metrics.length === 0) {
+      metrics = [{ key: "superai-daily", label: "日限", remainingPercent: 0, state: "unavailable" }];
+    }
+  }
 
   return (
     <div className="quota-meters">
@@ -1881,6 +1892,27 @@ function App() {
       const message = event.payload?.message ?? "未知错误";
       showNotice("error", `SuperAI API 服务异常：${message}`);
     }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [showNotice]);
+
+  // 公开版账号本地累计达到 100% 时由 Rust 主动 emit；前端弹 toast 并重读账号列表，
+  // 让"已耗尽"红字立刻显示出来。
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    void listen<{ id?: string; provider?: string; consumed_percent?: number }>(
+      "account-exhausted",
+      () => {
+        showNotice("info", "有账号本地额度已用满，已自动停用");
+        void invoke<ManagedAccount[]>("list_accounts")
+          .then((next) => setAccounts(sortAccountsForView(next)))
+          .catch(() => undefined);
+      },
+    ).then((fn) => {
       unlisten = fn;
     });
     return () => {

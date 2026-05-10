@@ -3221,11 +3221,216 @@ fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str, expires_at
     );
     account.auth_payload = Some(Value::Object(payload));
     account.subscription_active_until = Some(Value::Number(expires_at.into()));
+    // 入库时立刻初始化本地累计：把当前上游 weekly% 当 baseline，consumed 从 0 起算。
+    // bump_public_usage 自带初始化分支。
+    let _ = bump_public_usage(account);
+    rewrite_quota_for_public_usage(account);
+}
+
+// ---------------------------------------------------------------------------
+// 公开版（批量密钥）账号的"本地累计用量"独立追踪
+//
+// 上游 windsurf 的 weekly% 会按计费周期重置，但我们卖给用户的是固定额度：
+// 入库时记录 baseline，之后每次刷新做 max(0, last_remote - weekly) 单调累加，
+// 累计 100% 即软停用账号（保留记录给 license 到期时由删号路径自然清理）。
+// 仅 windsurf provider + 含 batch_key 的账号生效，其他账号 helper 全部 no-op。
+// ---------------------------------------------------------------------------
+
+const PUBLIC_USAGE_KEY_BASELINE: &str = "usage_baseline_remaining";
+const PUBLIC_USAGE_KEY_LAST_REMOTE: &str = "usage_last_remote_remaining";
+const PUBLIC_USAGE_KEY_CONSUMED: &str = "usage_consumed_local";
+const PUBLIC_USAGE_KEY_EXHAUSTED_AT: &str = "usage_exhausted_at";
+
+fn windsurf_payload_get_value(account: &ManagedAccount, key: &str) -> Option<Value> {
+    account
+        .auth_payload
+        .as_ref()?
+        .as_object()?
+        .get(key)
+        .cloned()
+}
+
+fn windsurf_payload_set_value(account: &mut ManagedAccount, key: &str, value: Value) {
+    let payload = account
+        .auth_payload
+        .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    }
+}
+
+fn has_public_usage_tracking(account: &ManagedAccount) -> bool {
+    // 完全版（full build）即便账号 auth_payload 残留 batch_key（例如公开版导入后切到完全版）
+    // 也不应把 quota 改写成单一 superai-public 额度条 —— 完全版需要保留 windsurf-daily / windsurf-weekly。
+    is_public_build()
+        && account.provider == "windsurf"
+        && account
+            .auth_payload
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(|obj| obj.contains_key("batch_key"))
+            .unwrap_or(false)
+}
+
+fn public_usage_consumed_percent(account: &ManagedAccount) -> i64 {
+    windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_CONSUMED)
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 100)
+}
+
+fn public_usage_is_exhausted(account: &ManagedAccount) -> bool {
+    has_public_usage_tracking(account)
+        && (windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_EXHAUSTED_AT).is_some()
+            || public_usage_consumed_percent(account) >= 100)
+}
+
+fn current_weekly_remaining_from_account(account: &ManagedAccount) -> Option<i64> {
+    account
+        .quota
+        .as_ref()?
+        .metrics
+        .iter()
+        .find(|m| m.key == "windsurf-weekly")
+        .and_then(|m| m.remaining_percent)
+}
+
+/// 把上游 weekly% 的下降量累计到本地。返回 (是否本次首次耗尽, 当前 consumed%)。
+///
+/// 语义：
+///   - 第一次记录：以当前 weekly% 当 baseline + last_remote，consumed 起步 0。
+///   - 后续：diff = last_remote - this_weekly；diff > 0 才累加（单调递增）。
+///   - 上游重置（this_weekly > last_remote）：丢弃负 diff，只更新 last_remote。
+///   - consumed 永远 clamp 在 [0,100]；触达 100 即标 unavailable + 已耗尽。
+fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
+    if !has_public_usage_tracking(account) {
+        return (false, 0);
+    }
+    let Some(weekly) = current_weekly_remaining_from_account(account) else {
+        // 公开版账号刚导入但还没有 quota（极少见），保留当前状态等下次刷新。
+        return (false, public_usage_consumed_percent(account));
+    };
+    let weekly = weekly.clamp(0, 100);
+
+    let already_exhausted =
+        windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_EXHAUSTED_AT).is_some();
+    let mut consumed = public_usage_consumed_percent(account);
+    let last_remote = windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_LAST_REMOTE)
+        .and_then(|v| v.as_i64())
+        .map(|v| v.clamp(0, 100));
+
+    if last_remote.is_none() {
+        windsurf_payload_set_value(
+            account,
+            PUBLIC_USAGE_KEY_BASELINE,
+            Value::Number(weekly.into()),
+        );
+        windsurf_payload_set_value(
+            account,
+            PUBLIC_USAGE_KEY_LAST_REMOTE,
+            Value::Number(weekly.into()),
+        );
+        if windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_CONSUMED).is_none() {
+            windsurf_payload_set_value(
+                account,
+                PUBLIC_USAGE_KEY_CONSUMED,
+                Value::Number(0.into()),
+            );
+        }
+        return (false, consumed);
+    }
+
+    let last_remote = last_remote.unwrap();
+    let diff = last_remote - weekly;
+    if diff > 0 {
+        consumed = (consumed + diff).clamp(0, 100);
+        windsurf_payload_set_value(
+            account,
+            PUBLIC_USAGE_KEY_CONSUMED,
+            Value::Number(consumed.into()),
+        );
+    }
+    // 不论 diff 正负都更新 last_remote；上游重置后从新 100% 起继续观察。
+    windsurf_payload_set_value(
+        account,
+        PUBLIC_USAGE_KEY_LAST_REMOTE,
+        Value::Number(weekly.into()),
+    );
+
+    let just_exhausted = !already_exhausted && consumed >= 100;
+    if consumed >= 100 {
+        let now = now_ts();
+        if !already_exhausted {
+            windsurf_payload_set_value(
+                account,
+                PUBLIC_USAGE_KEY_EXHAUSTED_AT,
+                Value::Number(now.into()),
+            );
+        }
+        // 每次 refresh 都覆盖 status，避免被后续 apply_windsurf_plan_status 改回"可用"。
+        account.status = Some(AccountStatus {
+            state: "unavailable".to_string(),
+            label: "已耗尽".to_string(),
+            reason: Some("本地累计额度已用满".to_string()),
+            updated_at: Some(now),
+        });
+        account.updated_at = now;
+    }
+    (just_exhausted, consumed)
+}
+
+/// 公开版下用本地 consumed 覆盖 quota.metrics，UI 进度条因此显示"还剩 N%"
+/// 而不是上游 windsurf weekly%（避免上游重置后 UI 假性回血）。
+fn rewrite_quota_for_public_usage(account: &mut ManagedAccount) {
+    if !has_public_usage_tracking(account) {
+        return;
+    }
+    let consumed = public_usage_consumed_percent(account);
+    let remaining = (100 - consumed).max(0);
+    let now = now_ts();
+    let last_updated = account
+        .quota
+        .as_ref()
+        .and_then(|q| q.last_updated)
+        .or(Some(now));
+    let error = account.quota.as_ref().and_then(|q| q.error.clone());
+    let metric = QuotaMetric {
+        key: "superai-public".to_string(),
+        label: "日限".to_string(),
+        remaining_percent: Some(remaining),
+        reset_at: account.subscription_active_until.clone(),
+        detail: Some(format!("已用 {consumed}%")),
+        state: Some(quota_state_from_remaining(remaining)),
+    };
+    account.quota = Some(AccountQuota {
+        metrics: vec![metric],
+        last_updated,
+        error,
+        is_forbidden: Some(false),
+    });
+}
+
+/// 在 refresh 完成后调一次：累计 + 改写 quota。返回是否本次首次耗尽（上层用于 emit）。
+fn apply_public_usage_after_refresh(account: &mut ManagedAccount) -> bool {
+    let (just_exhausted, _) = bump_public_usage(account);
+    rewrite_quota_for_public_usage(account);
+    just_exhausted
+}
+
+fn emit_account_exhausted(app: &tauri::AppHandle, account: &ManagedAccount) {
+    let _ = app.emit(
+        "account-exhausted",
+        serde_json::json!({
+            "id": account.id,
+            "provider": account.provider,
+            "consumed_percent": public_usage_consumed_percent(account),
+        }),
+    );
 }
 
 fn public_windsurf_export_key(account: &ManagedAccount) -> Result<String, String> {
     if account.provider != "windsurf" {
-        return Err("只支持导出 SuperAI 用户版数据".to_string());
+        return Err("只支持导出 SuperAI 公开版数据".to_string());
     }
     let payload = account.auth_payload.as_ref().and_then(Value::as_object);
     let credential = payload
@@ -4903,13 +5108,18 @@ async fn refresh_account(
         }
         other => return Err(format!("不支持的账号类型: {other}")),
     }
-    if was_current {
+    let just_exhausted = apply_public_usage_after_refresh(&mut account);
+    if was_current && !public_usage_is_exhausted(&account) {
         mark_account_current(&mut account);
     }
 
     let written = upsert_existing_accounts_into_db(&app, &[account.clone()])?;
     if written.is_empty() {
         return Err("账号已被删除，刷新结果已丢弃".to_string());
+    }
+    if just_exhausted {
+        emit_account_exhausted(&app, &account);
+        schedule_windsurf_sync(app.clone());
     }
     Ok(account_for_frontend(&account))
 }
@@ -4947,12 +5157,21 @@ async fn refresh_provider_accounts(
             }
             _ => {}
         }
-        if was_current {
+        let just_exhausted = apply_public_usage_after_refresh(account);
+        if was_current && !public_usage_is_exhausted(account) {
             mark_account_current(account);
+        }
+        if just_exhausted {
+            emit_account_exhausted(&app, account);
         }
     }
 
-    upsert_existing_accounts_into_db(&app, &accounts).map(accounts_for_frontend)
+    let any_exhausted = accounts.iter().any(public_usage_is_exhausted);
+    let result = upsert_existing_accounts_into_db(&app, &accounts).map(accounts_for_frontend)?;
+    if any_exhausted {
+        schedule_windsurf_sync(app.clone());
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -5046,6 +5265,15 @@ fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedA
     let Some(email) = windsurf_api::last_used_account_email() else {
         return Ok(Vec::new());
     };
+    // 幂等短路：sidecar 上次挑的还是这个号 → 我们已经把 "当前" 标签打过，
+    // 不必再开 sqlite + AES 解密 + 全表 upsert。前端 setInterval 3s 也几乎零开销。
+    if windsurf_api::last_synced_active_email()
+        .as_deref()
+        .map(|prev| prev.eq_ignore_ascii_case(&email))
+        .unwrap_or(false)
+    {
+        return Ok(Vec::new());
+    }
     let conn = open_app_db(&app)?;
     let Some(account) = read_accounts_from_conn(&conn)?
         .into_iter()
@@ -5053,7 +5281,9 @@ fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedA
     else {
         return Ok(Vec::new());
     };
-    set_account_current_state(&conn, "windsurf", &account.id).map(accounts_for_frontend)
+    let result = set_account_current_state(&conn, "windsurf", &account.id).map(accounts_for_frontend)?;
+    windsurf_api::record_synced_active_email(email.to_ascii_lowercase());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -5065,7 +5295,7 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
         "codex" => build_codex_auth_payload(&account)?,
         "gemini" => build_gemini_oauth_payload(&account)?,
         "windsurf" if is_public_build() => {
-            return Err("用户版不允许导出 SuperAI 原始凭证".to_string());
+            return Err("公开版不允许导出 SuperAI 原始凭证".to_string());
         }
         "windsurf" => build_windsurf_payload(&account)?,
         _ => serde_json::to_value(&account).map_err(|error| format!("序列化账号失败: {error}"))?,
@@ -5530,6 +5760,11 @@ fn set_api_service_default_model(
 /// 持久化里只剩 refresh_token 的老账号不能同步进 sidecar，需要用户重新用 token 或邮箱密码导入。
 fn windsurf_account_to_sidecar_payload(account: &ManagedAccount) -> Option<serde_json::Value> {
     if account.provider != "windsurf" {
+        return None;
+    }
+    // 公开版账号本地累计已用满 → 不参与 sidecar 同步。reconcile_accounts
+    // 拿到的 desired_emails 不再包含它，会主动 DELETE 到 sidecar /auth/accounts/:id。
+    if public_usage_is_exhausted(account) {
         return None;
     }
     let label = if !account.email.is_empty() {

@@ -113,6 +113,10 @@ struct Runtime {
 
 static RUNTIME: LazyLock<Mutex<Option<Runtime>>> = LazyLock::new(|| Mutex::new(None));
 static LAST_USED_ACCOUNT_EMAIL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+/// `sync_api_service_active_account` 上次成功打过"当前"标签的 email。
+/// 命中时直接返回空 vec，跳过 sqlite 解密 + 全表 upsert。前端 setInterval
+/// 调到 3s 也几乎零开销。start/stop 时清空，避免跨服务生命周期串号。
+static LAST_SYNCED_ACTIVE_EMAIL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Runtime>> {
     RUNTIME.lock().expect("SuperAI API 运行态锁失败")
@@ -128,6 +132,31 @@ pub fn last_used_account_email() -> Option<String> {
 fn set_last_used_account_email(email: String) {
     if let Ok(mut current) = LAST_USED_ACCOUNT_EMAIL.lock() {
         *current = Some(email);
+    }
+}
+
+/// 取上次同步过的 email；命令端用它做幂等短路。
+pub fn last_synced_active_email() -> Option<String> {
+    LAST_SYNCED_ACTIVE_EMAIL
+        .lock()
+        .ok()
+        .and_then(|email| email.clone())
+}
+
+/// 标记本轮同步完成的 email。
+pub fn record_synced_active_email(email: String) {
+    if let Ok(mut current) = LAST_SYNCED_ACTIVE_EMAIL.lock() {
+        *current = Some(email);
+    }
+}
+
+/// 服务启停时清掉 active email 缓存，避免新一轮启动后用陈旧值短路。
+pub fn clear_synced_active_email() {
+    if let Ok(mut current) = LAST_SYNCED_ACTIVE_EMAIL.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = LAST_USED_ACCOUNT_EMAIL.lock() {
+        *current = None;
     }
 }
 
@@ -563,6 +592,7 @@ pub fn start(
         return Err("API Key 为空，无法启动".to_string());
     }
     stop()?;
+    clear_synced_active_email();
 
     let sidecar_bin = resolve_bundled_binary("superai-api").ok_or_else(|| {
         format!(
@@ -920,6 +950,7 @@ pub fn activate_account_by_email(email: &str) -> Result<(), String> {
 
 /// 停止服务（幂等）。
 pub fn stop() -> Result<(), String> {
+    clear_synced_active_email();
     let runtime = { lock().take() };
     let Some(mut runtime) = runtime else {
         return Ok(());

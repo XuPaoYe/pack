@@ -143,4 +143,61 @@ const loggerPath = join(OUT_DIR, "src", "dashboard", "logger.js");
   writeFileSync(loggerPath, next);
 }
 
+// auth.js：禁掉 accounts.json 落盘。我们的 sidecar 由 Tauri 子进程托管，
+// 启动时 windsurf_api::start 会主动删旧 accounts.json 并通过 reconcile_accounts
+// 把 SuperAI DB 里的账号 POST 到 sidecar /auth/login 重建池子。落盘的 JSON
+// 含明文 email/apiKey/refreshToken，是被人拿走 app data 目录后最大的泄漏面。
+// 改成 no-op 后所有运行期状态只活在内存里，应用关闭即销毁。
+//
+// 不影响：
+//   - 请求热路径（getApiKey 是纯内存读，从不调 saveAccounts）
+//   - 启动重建（reconcile_accounts → /auth/login，与磁盘无关）
+//   - 配额刷新（GetUserStatus 走网络，更新内存即可）
+//
+// 唯一代价：sidecar 进程内 banned 状态 / blockedModels / tierManual 在进程
+// 重启后丢失，会被下次 reconcile 后的 probe-all + refresh-credits 重建。
+// SuperAI 不暴露 sidecar dashboard 给终端用户，可接受。
+const authPath = join(OUT_DIR, "src", "auth.js");
+{
+  const src = readFileSync(authPath, "utf8");
+
+  const saveAnchor = "function saveAccounts() {\n  if (_saveInFlight) { _savePending = true; return; }";
+  if (!src.includes(saveAnchor)) {
+    console.error("[scrub-vendor] auth.js saveAccounts anchor not found; aborting");
+    process.exit(2);
+  }
+  const saveSyncAnchor = "export function saveAccountsSync() {\n  const tempFile = ACCOUNTS_FILE + '.shutdown.tmp';";
+  if (!src.includes(saveSyncAnchor)) {
+    console.error("[scrub-vendor] auth.js saveAccountsSync anchor not found; aborting");
+    process.exit(2);
+  }
+
+  // 用正则吃掉两个完整函数（含函数体），整段替换成 no-op。
+  // 函数体里没有嵌套独立顶层 `^}`，所以 /^}/m 就能稳定匹配右括号。
+  const saveRe = /function saveAccounts\(\) \{[\s\S]*?\n\}\n/;
+  const saveSyncRe = /export function saveAccountsSync\(\) \{[\s\S]*?\n\}\n/;
+  if (!saveRe.test(src) || !saveSyncRe.test(src)) {
+    console.error("[scrub-vendor] auth.js saveAccounts/saveAccountsSync body regex failed; aborting");
+    process.exit(2);
+  }
+
+  const noopSave = `function saveAccounts() {
+  // SuperAI patch: 禁止 accounts.json 落盘，参见 scripts/scrub-vendor.mjs。
+  // 保留 _saveInFlight / _savePending 引用避免未使用变量在严格模式下警告。
+  void _saveInFlight; void _savePending;
+}
+`;
+  const noopSaveSync = `export function saveAccountsSync() {
+  // SuperAI patch: 关闭流程也不落盘，内存数据随进程销毁。
+}
+`;
+
+  const next = src.replace(saveRe, noopSave).replace(saveSyncRe, noopSaveSync);
+  if (next === src) {
+    console.error("[scrub-vendor] auth.js no-op patch produced no change; aborting");
+    process.exit(2);
+  }
+  writeFileSync(authPath, next);
+}
+
 console.log(`[scrub-vendor] ${OUT_DIR} ready (rewrote ${changed} files)`);
