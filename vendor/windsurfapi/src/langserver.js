@@ -65,7 +65,11 @@ let _defaultPort = DEFAULT_PORT;
 // `customer-...-zone-` patterns. Static-IP proxies whose username is
 // a bare login (no provider-specific markers) still skip
 // segregation, so memory stays bounded.
-const STICKY_USER_RE = /(?:[_-](?:sid|session|sessid|sticky|sess)|[+]ws_|^brd-customer-|customer-[^-]+-(?:cc|zone|country|state|city)-|-zone-[a-z]+|-cc-[a-z]{2})/i;
+// v2.0.93: expanded sticky detection. Any proxy username with a provider-
+// specific token, session marker, or non-trivial structure gets its own LS.
+// This catches more providers (iproyal, webshare, proxy-seller, etc) and
+// reduces cross-account LS sharing which triggers upstream rate limits.
+const STICKY_USER_RE = /(?:[_-](?:sid|session|sessid|sticky|sess|token|res|rotating|sticky|ip[_-]?[0-9])|[+]ws_|^brd-customer-|^customer-|^user-|^res-|^sticky-|-zone-[a-z]+|-cc-[a-z]{2}|-country-|-state-|-city-|-session-|-sess-|-sticky-|-res-|-rotating-)/i;
 function isStickyUsername(u) {
   if (typeof u !== 'string' || u.length < 4) return false;
   return STICKY_USER_RE.test(u);
@@ -301,9 +305,6 @@ export async function ensureLs(proxy = null) {
       `--register_user_url=https://api.codeium.com/register_user/`,
       `--codeium_dir=${dataDir}`,
       `--database_dir=${dataDir}/db`,
-      '--enable_local_search=false',
-      '--enable_index_service=false',
-      '--enable_lsp=false',
       '--detect_proxy=false',
     ];
 
@@ -335,13 +336,8 @@ export async function ensureLs(proxy = null) {
       }
     });
     proc.stderr.on('data', (data) => {
-      const lines = data.toString().trim().split('\n');
-      for (const line of lines) {
-        if (!line) continue;
-        if (/F\d{4}|ERROR|error|failed|panic/i.test(line)) log.error(`[LS:${key}:err] ${line}`);
-        else if (/W\d{4}|WARN|warn/i.test(line)) log.warn(`[LS:${key}:err] ${line}`);
-        else log.debug(`[LS:${key}:err] ${line}`);
-      }
+      const line = data.toString().trim();
+      if (line) log.warn(`[LS:${key}:err] ${line}`);
     });
     proc.on('exit', (code, signal) => {
       log.warn(`LS instance ${key} exited: code=${code} signal=${signal}`);

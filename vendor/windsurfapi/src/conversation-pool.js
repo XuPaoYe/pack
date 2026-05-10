@@ -63,15 +63,6 @@ const META_TAG_NAMES = new Set([
   'analysis',
   'summary',
   'example',
-  // Common IDE/agent context tags. These are structured caller metadata,
-  // not suspicious model-visible XML, and logging them on every turn makes
-  // normal third-party clients look broken.
-  'system_info',
-  'read_file',
-  'ls_dir',
-  'get_dir_tree',
-  'query',
-  'html',
 ]);
 
 function buildMetaTagRe() {

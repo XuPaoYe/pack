@@ -1728,6 +1728,6 @@ export async function initAuth() {
   if (counts.total > 0) {
     log.info(`Auth pool: ${counts.active} active, ${counts.error} error, ${counts.total} total`);
   } else {
-    log.info('No accounts configured yet; waiting for /auth/login or Super AI account sync.');
+    log.warn('No accounts configured. Add via POST /auth/login');
   }
 }

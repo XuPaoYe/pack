@@ -5015,11 +5015,30 @@ fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
         "codex" => write_codex_auth(&account)?,
         "gemini" => write_gemini_auth(&account)?,
         "windsurf" => {
-            // SuperAl 是 Web 端账号，没有本机配置文件需要写入；仅在数据库中标记为当前。
+            activate_windsurf_account_for_api(&app, &account)?;
         }
         other => return Err(format!("不支持的账号类型: {other}")),
     }
     set_account_current_state(&conn, &account.provider, &account.id).map(accounts_for_frontend)
+}
+
+fn activate_windsurf_account_for_api(
+    app: &tauri::AppHandle,
+    account: &ManagedAccount,
+) -> Result<(), String> {
+    if !windsurf_api::is_running_with_sidecar() {
+        return Ok(());
+    }
+
+    match windsurf_api::activate_account_by_email(&account.email) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            sync_windsurf_accounts_to_api(app.clone())?;
+            windsurf_api::activate_account_by_email(&account.email).map_err(|second_error| {
+                format!("启用 API 账号失败: {second_error}; 同步前错误: {first_error}")
+            })
+        }
+    }
 }
 
 #[tauri::command]

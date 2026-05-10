@@ -76,7 +76,10 @@ impl Drop for Sidecar {
         #[cfg(not(unix))]
         let _ = self.child.kill();
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // SIGTERM 后给 sidecar 1s 执行自身 cleanup（关 HTTP + kill LS 子进程）；
+        // 之前是 2s 偏保守，实测 bun 的 SIGTERM handler 百毫秒级完成，
+        // 1s 足够；超时也有后面的 cleanup_language_server_processes 兜底。
+        let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             match self.child.try_wait() {
                 Ok(Some(_)) => break,
@@ -284,6 +287,10 @@ fn cleanup_language_server_processes(ls_bin: &Path) {
         }
         matched_pids.push(pid);
     }
+    // 没扫到残留 LS 进程就直接返回，省掉一次 300ms 硬等 —— stop→start 热路径最常见场景。
+    if matched_pids.is_empty() {
+        return;
+    }
     thread::sleep(Duration::from_millis(300));
     for pid in matched_pids {
         unsafe {
@@ -299,6 +306,30 @@ fn cleanup_language_server_processes(_ls_bin: &Path) {}
 
 #[cfg(target_os = "macos")]
 fn repair_macos_binary(path: &Path) {
+    use std::collections::HashSet;
+    use std::time::SystemTime;
+
+    // 缓存同一 App 生命周期内 (canonical path, mtime, size) 已修复过的二进制，
+    // 避免每次 start 都跑 codesign --verify（对 ~100MB 的 bun/LS 二进制要 1~4s）。
+    // 文件被替换（mtime/size 变）会自动失效，重新走一遍修复流程。
+    type CacheKey = (PathBuf, SystemTime, u64);
+    static REPAIRED: LazyLock<Mutex<HashSet<CacheKey>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+
+    let cache_key: Option<CacheKey> = path.canonicalize().ok().and_then(|canonical| {
+        let meta = std::fs::metadata(&canonical).ok()?;
+        let mtime = meta.modified().ok()?;
+        Some((canonical, mtime, meta.len()))
+    });
+
+    if let Some(key) = cache_key.as_ref() {
+        if let Ok(set) = REPAIRED.lock() {
+            if set.contains(key) {
+                return;
+            }
+        }
+    }
+
     let _ = Command::new("xattr")
         .arg("-d")
         .arg("com.apple.quarantine")
@@ -315,6 +346,12 @@ fn repair_macos_binary(path: &Path) {
             .args(["--force", "--sign", "-"])
             .arg(path)
             .output();
+    }
+
+    if let Some(key) = cache_key {
+        if let Ok(mut set) = REPAIRED.lock() {
+            set.insert(key);
+        }
     }
 }
 
@@ -814,6 +851,66 @@ fn post_sidecar_dashboard_api(
         Ok(value) => json!({ "ok": true, "body": value }),
         Err(_) => json!({ "ok": true, "body": body }),
     }
+}
+
+pub fn activate_account_by_email(email: &str) -> Result<(), String> {
+    let wanted_email = email.trim().to_ascii_lowercase();
+    if wanted_email.is_empty() {
+        return Err("SuperAl 账号缺少 email，无法同步 API 启用状态".to_string());
+    }
+
+    let target = clone_target()?;
+    let client = build_inner_client()?;
+    let list_resp = client
+        .get(format!("{}/auth/accounts", target.base_url))
+        .header("Authorization", format!("Bearer {}", target.inner_key))
+        .send()
+        .map_err(|error| format!("调用 sidecar /auth/accounts 失败: {error}"))?;
+    if !list_resp.status().is_success() {
+        return Err(format!(
+            "sidecar /auth/accounts HTTP {}",
+            list_resp.status()
+        ));
+    }
+    let list_body: Value = list_resp
+        .json()
+        .map_err(|error| format!("解析 sidecar 账号列表失败: {error}"))?;
+    let account_id = list_body
+        .get("accounts")
+        .and_then(Value::as_array)
+        .and_then(|accounts| {
+            accounts.iter().find_map(|account| {
+                let sidecar_email = account
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if sidecar_email == wanted_email {
+                    account.get("id").and_then(Value::as_str).map(str::to_string)
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or_else(|| format!("API 服务中未找到 SuperAl 账号: {email}"))?;
+
+    let resp = client
+        .patch(format!(
+            "{}/dashboard/api/accounts/{}",
+            target.base_url, account_id
+        ))
+        .header("Authorization", format!("Bearer {}", target.inner_key))
+        .json(&json!({ "status": "active", "resetErrors": true }))
+        .send()
+        .map_err(|error| format!("调用 sidecar 启用账号失败: {error}"))?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    Err(format!(
+        "sidecar 启用账号 HTTP {}: {}",
+        resp.status(),
+        resp.text().unwrap_or_default()
+    ))
 }
 
 /// 停止服务（幂等）。

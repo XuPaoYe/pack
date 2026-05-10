@@ -49,6 +49,14 @@ import { CodexIcon } from "./components/icons/CodexIcon";
 import { GeminiIcon } from "./components/icons/GeminiIcon";
 import { WindsurfIcon } from "./components/icons/WindsurfIcon";
 import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/accountPresentation";
+import {
+  createLogId,
+  loadAppLogs as loadAppLogsRaw,
+  persistAppLogs,
+  pruneAppLogs,
+  type AppLogEntry,
+  type NoticeTone,
+} from "./lib/appLogs";
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
@@ -102,9 +110,7 @@ type WindsurfApiStatus = {
 };
 
 type SwitchAccountResult = ManagedAccount[];
-type NoticeTone = "success" | "error" | "info";
 type Notice = { tone: NoticeTone; text: string };
-type AppLogEntry = { id: string; tone: NoticeTone; text: string; createdAt: number };
 type ExportPreview = {
   payload: string;
   kind: "json" | "key";
@@ -122,9 +128,6 @@ type ForceUpdateState = {
 };
 
 const NOTICE_TIMEOUT_MS = 7000;
-const APP_LOG_STORAGE_KEY = "super-ai:app-logs";
-const APP_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
-const APP_LOG_LIMIT = 300;
 const ACCOUNT_PAGE_SIZE = 12;
 const ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS = 15_000;
 const API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS = 3_000;
@@ -204,53 +207,8 @@ function sanitizeUserFacingText(text: string) {
   return next;
 }
 
-function isAppLogEntry(value: unknown): value is AppLogEntry {
-  if (!value || typeof value !== "object") return false;
-  const item = value as Partial<AppLogEntry>;
-  return (
-    typeof item.id === "string" &&
-    typeof item.text === "string" &&
-    typeof item.createdAt === "number" &&
-    (item.tone === "success" || item.tone === "error" || item.tone === "info")
-  );
-}
-
-function pruneAppLogs(logs: AppLogEntry[]) {
-  const cutoff = Date.now() - APP_LOG_RETENTION_MS;
-  return logs
-    .filter((log) => log.createdAt >= cutoff)
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .slice(0, APP_LOG_LIMIT);
-}
-
 function loadAppLogs() {
-  try {
-    const raw = window.localStorage.getItem(APP_LOG_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return pruneAppLogs(
-      parsed.filter(isAppLogEntry).map((log) => ({
-        ...log,
-        text: sanitizeUserFacingText(log.text),
-      })),
-    );
-  } catch {
-    return [];
-  }
-}
-
-function persistAppLogs(logs: AppLogEntry[]) {
-  try {
-    window.localStorage.setItem(APP_LOG_STORAGE_KEY, JSON.stringify(pruneAppLogs(logs)));
-  } catch {
-    // Local logging is best effort only.
-  }
-}
-
-function createLogId() {
-  if (typeof crypto !== "undefined" && "randomUUID" in crypto) return crypto.randomUUID();
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return loadAppLogsRaw(sanitizeUserFacingText);
 }
 
 function stateLabel(state: AccountState) {
@@ -385,9 +343,10 @@ function mergeAccounts(current: ManagedAccount[], next: ManagedAccount[]) {
   return sortAccountsForView([...map.values()]);
 }
 
-type EffortKey = "low" | "medium" | "high" | "xhigh";
+type EffortKey = "minimal" | "low" | "medium" | "high" | "xhigh";
 
 const EFFORT_LABELS: Record<EffortKey, string> = {
+  minimal: "Minimal",
   low: "Low",
   medium: "Medium",
   high: "High",
@@ -463,12 +422,56 @@ const MODEL_FAMILIES: ModelFamily[] = [
     resolveId: (effort) => (effort ? `claude-opus-4.7-${effort}` : "claude-opus-4.7-medium"),
   },
   {
-    key: "deepseek-v4",
-    label: "DeepSeek V4",
-    aliases: ["DeepSeek V4", "DeepSeekV4"],
+    key: "kimi-k2-6",
+    label: "Kimi K2.6",
+    aliases: ["Kimi K2.6", "kimi-k2.6", "kimi-k2-6"],
     efforts: [],
     knownAvailable: true,
-    resolveId: () => "deepseek-v4",
+    resolveId: () => "kimi-k2-6",
+  },
+  {
+    key: "glm-5.1",
+    label: "GLM 5.1",
+    aliases: ["GLM 5.1", "glm-5-1"],
+    efforts: [],
+    knownAvailable: true,
+    resolveId: () => "glm-5.1",
+  },
+  {
+    key: "gemini-2.5-pro",
+    label: "Gemini 2.5 Pro",
+    aliases: ["Gemini 2.5 Pro"],
+    efforts: [],
+    knownAvailable: true,
+    resolveId: () => "gemini-2.5-pro",
+  },
+  {
+    key: "gemini-3.0-flash",
+    label: "Gemini 3.0 Flash",
+    aliases: ["Gemini 3.0 Flash", "gemini-3-0-flash"],
+    // 上游 vendor/windsurfapi/src/models.js:155-158 提供 minimal / low / medium / high
+    // 四个档位；bare `gemini-3.0-flash` 等同 medium。
+    efforts: ["minimal", "low", "medium", "high"],
+    defaultEffort: "medium",
+    knownAvailable: true,
+    resolveId: (effort) => {
+      if (!effort || effort === "medium") return "gemini-3.0-flash";
+      if (effort === "xhigh") return null;
+      return `gemini-3.0-flash-${effort}`;
+    },
+  },
+  {
+    key: "gemini-3.1-pro",
+    label: "Gemini 3.1 Pro",
+    aliases: ["Gemini 3.1 Pro", "gemini-3-1-pro"],
+    // 上游只暴露 low / high 两档，没有 medium/xhigh/minimal。
+    efforts: ["low", "high"],
+    defaultEffort: "low",
+    knownAvailable: true,
+    resolveId: (effort) => {
+      if (effort === "high") return "gemini-3.1-pro-high";
+      return "gemini-3.1-pro-low";
+    },
   },
 ];
 
@@ -492,7 +495,17 @@ function loadApiPref(): ApiModelPref {
     if (!raw) return defaultPref();
     const parsed = JSON.parse(raw) as Partial<ApiModelPref>;
     const fam = MODEL_FAMILIES.find((f) => f.key === parsed.family);
-    if (!fam) return defaultPref();
+    if (!fam) {
+      // 之前选过的模型已被下架（例如旧的 deepseek-v4）——
+      // 直接在这里把 localStorage 重置成默认值，避免下次启动还读到脏数据。
+      const fallback = defaultPref();
+      try {
+        window.localStorage.setItem(API_PREF_STORAGE_KEY, JSON.stringify(fallback));
+      } catch {
+        /* ignore */
+      }
+      return fallback;
+    }
     const effort = parsed.effort && fam.efforts.includes(parsed.effort)
       ? parsed.effort
       : fam.defaultEffort ?? null;
@@ -779,7 +792,7 @@ function WindsurfApiCard({
           disabled={busy}
         >
           <Power size={14} />
-          {running ? "停止服务" : "启动 API 服务"}
+          {running ? "停止服务" : "启动服务"}
         </button>
 
         <p className="windsurf-api-hint">
@@ -816,7 +829,7 @@ function WindsurfApiConfigPanel({
           <p>选择 API 服务默认使用的模型家族</p>
         </div>
         <ModelSelect
-          familyKey={pref.family}
+          familyKey={family.key}
           availableModels={models}
           disabled={!running}
           loading={running && models.length === 0}
@@ -957,11 +970,12 @@ function App() {
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
+  const [pendingBatchDelete, setPendingBatchDelete] = useState<ManagedAccount[] | null>(null);
   const [isBusy, setIsBusy] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
   const [isFileImporting, setIsFileImporting] = useState(false);
   const [refreshingAccountIds, setRefreshingAccountIds] = useState<Set<string>>(() => new Set());
-  const [refreshingProvider, setRefreshingProvider] = useState<Provider | null>(null);
+  const [refreshingProviders, setRefreshingProviders] = useState<Set<Provider>>(() => new Set());
   const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
   const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -1089,8 +1103,8 @@ function App() {
     return filteredAccounts.slice(start, start + ACCOUNT_PAGE_SIZE);
   }, [filteredAccounts, currentAccountPage]);
   const isActiveProviderRefreshing = useMemo(
-    () => refreshingProvider === activeProvider || filteredAccounts.some((account) => refreshingAccountIds.has(account.id)),
-    [activeProvider, filteredAccounts, refreshingAccountIds, refreshingProvider],
+    () => refreshingProviders.has(activeProvider) || filteredAccounts.some((account) => refreshingAccountIds.has(account.id)),
+    [activeProvider, filteredAccounts, refreshingAccountIds, refreshingProviders],
   );
 
   const counts = useMemo(
@@ -1586,19 +1600,27 @@ function App() {
     }
   };
   const handleRefreshVisibleAccounts = async () => {
-    setIsBusy(true);
-    setRefreshingProvider(activeProvider);
+    const provider = activeProvider;
+    if (refreshingProviders.has(provider)) return;
+    setRefreshingProviders((current) => {
+      const next = new Set(current);
+      next.add(provider);
+      return next;
+    });
     try {
-      const refreshedAccounts = await invoke<ManagedAccount[]>("refresh_provider_accounts", { provider: activeProvider });
+      const refreshedAccounts = await invoke<ManagedAccount[]>("refresh_provider_accounts", { provider });
       setAccounts((current) =>
         sortAccountsForView(current.map((item) => refreshedAccounts.find((changed) => changed.id === item.id) ?? item)),
       );
-      showNotice("success", `已刷新 ${providerLabel(activeProvider)} 账号`);
+      showNotice("success", `已刷新 ${providerLabel(provider)} 账号`);
     } catch (error) {
-      showNotice("error", `刷新 ${providerLabel(activeProvider)} 失败：${String(error)}`);
+      showNotice("error", `刷新 ${providerLabel(provider)} 失败：${String(error)}`);
     } finally {
-      setRefreshingProvider(null);
-      setIsBusy(false);
+      setRefreshingProviders((current) => {
+        const next = new Set(current);
+        next.delete(provider);
+        return next;
+      });
     }
   };
   const exportFileBase = (label: string) => label.replace(/[^a-z0-9._-]+/gi, "_");
@@ -1662,22 +1684,27 @@ function App() {
       showNotice("error", `批量导出失败：${String(error)}`);
     }
   };
-  const handleBatchDelete = async () => {
+  const handleBatchDelete = () => {
     const selectedAccounts = filteredAccounts.filter((account) => selectedExportIds.has(account.id));
     if (selectedAccounts.length === 0) {
-      showNotice("error", "请选择要删除的账号");
+      showNotice("error", "请先勾选要删除的账号");
       return;
     }
-    if (!window.confirm(`确认删除选中的 ${selectedAccounts.length} 个账号？`)) return;
+    setPendingBatchDelete(selectedAccounts);
+  };
+  const confirmBatchDelete = async () => {
+    if (!pendingBatchDelete || isBusy) return;
+    const targets = pendingBatchDelete;
     setIsBusy(true);
     try {
       let nextAccounts = accounts;
-      for (const account of selectedAccounts) {
+      for (const account of targets) {
         nextAccounts = await invoke<ManagedAccount[]>("delete_account", { accountId: account.id });
       }
       setAccounts(nextAccounts);
       setSelectedExportIds(new Set());
-      showNotice("success", `已删除 ${selectedAccounts.length} 个账号`);
+      setPendingBatchDelete(null);
+      showNotice("success", `已删除 ${targets.length} 个账号`);
     } catch (error) {
       showNotice("error", `批量删除失败：${String(error)}`);
     } finally {
@@ -1930,7 +1957,7 @@ function App() {
       className={clsx(
         "shell",
         settings.maskSensitive && "privacy-mask",
-        (isImportModalOpen || isSettingsOpen || isLogsOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || forceUpdate) && "modal-active",
+        (isImportModalOpen || isSettingsOpen || isLogsOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
       )}
       onMouseDownCapture={handleShellTopDrag}
     >
@@ -2002,17 +2029,27 @@ function App() {
                   <Plus size={18} />
                   添加
                 </button>
-                <button className="secondary refresh-all" onClick={handleRefreshVisibleAccounts} disabled={isBusy || isActiveProviderRefreshing}>
+                <button className="secondary refresh-all" onClick={handleRefreshVisibleAccounts} disabled={isActiveProviderRefreshing}>
                   <RotateCw size={18} className={clsx(isActiveProviderRefreshing && "spin")} />
                   刷新
                 </button>
-                <button className="secondary" onClick={() => void handleBatchExport()} disabled={isBusy || filteredAccounts.length === 0}>
+                <button
+                  className="secondary"
+                  onClick={() => void handleBatchExport()}
+                  disabled={isBusy || selectedExportIds.size === 0}
+                  title={selectedExportIds.size === 0 ? "请先勾选账号" : `导出选中的 ${selectedExportIds.size} 个账号`}
+                >
                   <Download size={18} />
-                  导出
+                  导出{selectedExportIds.size > 0 ? ` (${selectedExportIds.size})` : ""}
                 </button>
-                <button className="secondary danger-action" onClick={() => void handleBatchDelete()} disabled={isBusy || filteredAccounts.length === 0}>
+                <button
+                  className="secondary danger-action"
+                  onClick={() => handleBatchDelete()}
+                  disabled={isBusy || selectedExportIds.size === 0}
+                  title={selectedExportIds.size === 0 ? "请先勾选账号" : `删除选中的 ${selectedExportIds.size} 个账号`}
+                >
                   <Trash2 size={18} />
-                  删除
+                  删除{selectedExportIds.size > 0 ? ` (${selectedExportIds.size})` : ""}
                 </button>
               </div>
             </div>
@@ -2105,10 +2142,10 @@ function App() {
                         <div className="account-actions" onClick={(event) => event.stopPropagation()}>
                         <button
                           className="icon-button"
-                          aria-label={isCurrentAccount(account) ? "停用当前账号" : "设为当前账号"}
-                          title={isCurrentAccount(account) ? "停用" : "设为当前"}
+                          aria-label={isCurrentAccount(account) ? "当前账号" : "设为当前账号"}
+                          title={isCurrentAccount(account) ? "当前账号" : "设为当前"}
                           onClick={() => handleToggleAccount(account)}
-                          disabled={(account.status ?? fallbackStatus(account)).state === "unavailable"}
+                          disabled={isCurrentAccount(account) || (account.status ?? fallbackStatus(account)).state === "unavailable"}
                         >
                           <BadgeCheck size={15} strokeWidth={1.75} />
                         </button>
@@ -2475,7 +2512,6 @@ function App() {
             <div className="confirm-copy">
               <h2>删除账号</h2>
               <p>{accountDisplayLabel(pendingDeleteAccount)}</p>
-              <span>只会从 Super AI 的账号库移除，不会删除本机 Codex/Gemini 当前配置。</span>
             </div>
             <div className="confirm-actions">
               <button className="secondary" onClick={() => setPendingDeleteAccount(null)} disabled={isDeletingAccount}>
@@ -2483,6 +2519,33 @@ function App() {
               </button>
               <button className="danger-button" onClick={() => void confirmDeleteAccount()} disabled={isDeletingAccount}>
                 {isDeletingAccount ? "删除中..." : "删除"}
+              </button>
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {pendingBatchDelete && (
+        <div
+          className="modal-overlay"
+          onMouseDown={(event) => handleModalBackdropMouseDown(event, () => {
+            if (!isBusy) setPendingBatchDelete(null);
+          })}
+        >
+          <aside className="confirm-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="confirm-icon danger">
+              <Trash2 size={22} />
+            </div>
+            <div className="confirm-copy">
+              <h2>批量删除账号</h2>
+              <p>共 {pendingBatchDelete.length} 个账号将被移除</p>
+            </div>
+            <div className="confirm-actions">
+              <button className="secondary" onClick={() => setPendingBatchDelete(null)} disabled={isBusy}>
+                取消
+              </button>
+              <button className="danger-button" onClick={() => void confirmBatchDelete()} disabled={isBusy}>
+                {isBusy ? "删除中..." : `删除 ${pendingBatchDelete.length} 个`}
               </button>
             </div>
           </aside>

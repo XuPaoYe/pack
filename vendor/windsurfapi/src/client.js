@@ -10,7 +10,7 @@ import https from 'https';
 import { randomUUID, createHash } from 'crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
-import { config, log } from './config.js';
+import { log } from './config.js';
 import { extractImages } from './image.js';
 import { closeSessionForPort, grpcFrame, grpcUnary, grpcStream } from './grpc.js';
 import { getLsEntryByPort } from './langserver.js';
@@ -454,8 +454,7 @@ export class WindsurfClient {
     // prefix so collision space rises to 64 bits, well below the
     // birthday bound for any realistic account count.
     const wsId = createHash('sha256').update(this.apiKey || '').digest('hex').slice(0, 16);
-    const workspaceRoot = process.env.LS_WORKSPACE_DIR || `${config.dataDir}/workspaces`;
-    const workspacePath = `${workspaceRoot}/workspace-${wsId}`;
+    const workspacePath = `/home/user/projects/workspace-${wsId}`;
     const workspaceUri = `file://${workspacePath}`;
 
     const handleWarmupError = (stage, err) => {

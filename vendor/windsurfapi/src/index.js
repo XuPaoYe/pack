@@ -114,7 +114,9 @@ async function main() {
   await initAuth();
 
   if (!isAuthenticated()) {
-    log.info('No accounts configured yet; waiting for /auth/login or Super AI account sync.');
+    log.warn('No accounts configured. Add via:');
+    log.warn('  POST /auth/login {"token":"..."}');
+    log.warn('  POST /auth/login {"api_key":"..."}');
   }
 
   const server = startServer();
@@ -130,10 +132,14 @@ async function main() {
           port: config.lsPort,
           apiServerUrl: config.codeiumApiUrl,
         });
-        await waitForReady(15000);
+        await waitForReady(30000);
+        // v2.0.93: if default LS started but proxy-LS crashed, give the
+        // manage child a moment to restart before syncing models.
+        log.info('LS ready — fetching model catalog');
       } catch (err) {
         log.error(`Language server failed to start: ${err.message}`);
         log.error('Chat completions will not work without the language server.');
+        log.error('Run: bash install-ls.sh (now uses Windsurf desktop LS, not stale Exafunction)');
       }
     })();
   }
