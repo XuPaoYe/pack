@@ -438,7 +438,8 @@ fn set_account_current_state(
                 updated_at: Some(now),
             });
             account.updated_at = now;
-        } else if account
+        } else if account.provider == provider
+            && account
             .status
             .as_ref()
             .map(|status| status.label.as_str() == "当前")
@@ -597,19 +598,30 @@ fn import_result_for_frontend(mut result: ImportResult) -> ImportResult {
 
 fn enforce_single_current_account(conn: &Connection) -> Result<(), String> {
     let mut accounts = read_accounts_from_conn(conn)?;
-    let mut current_ids = accounts
-        .iter()
-        .filter(|account| is_current_status(&account.status))
-        .map(|account| (account.id.clone(), account.updated_at))
-        .collect::<Vec<_>>();
-    if current_ids.len() <= 1 {
+    let mut keep_by_provider: HashMap<String, String> = HashMap::new();
+    for provider in ["codex", "gemini", "windsurf"] {
+        let mut current_ids = accounts
+            .iter()
+            .filter(|account| account.provider == provider && is_current_status(&account.status))
+            .map(|account| (account.id.clone(), account.updated_at))
+            .collect::<Vec<_>>();
+        if current_ids.len() <= 1 {
+            continue;
+        }
+        current_ids.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        keep_by_provider.insert(provider.to_string(), current_ids[0].0.clone());
+    }
+
+    if keep_by_provider.is_empty() {
         return Ok(());
     }
 
-    current_ids.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let keep_id = current_ids[0].0.clone();
     for account in &mut accounts {
-        if account.id != keep_id && is_current_status(&account.status) {
+        if keep_by_provider
+            .get(&account.provider)
+            .is_some_and(|keep_id| keep_id != &account.id)
+            && is_current_status(&account.status)
+        {
             mark_account_available(account);
             let account_json = serialize_account_for_storage(account)?;
             conn.execute(
@@ -652,7 +664,10 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
     if is_current_status(&account_to_write.status) {
         let mut accounts = read_accounts_from_conn(conn)?;
         for existing in &mut accounts {
-            if existing.id != account_to_write.id && is_current_status(&existing.status) {
+            if existing.provider == account_to_write.provider
+                && existing.id != account_to_write.id
+                && is_current_status(&existing.status)
+            {
                 mark_account_available(existing);
                 let existing_json = serialize_account_for_storage(existing)?;
                 conn.execute(

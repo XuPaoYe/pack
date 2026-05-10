@@ -495,6 +495,17 @@ h2 {
   background: color-mix(in srgb, var(--accent) 7%, var(--control));
 }
 
+.danger-action {
+  color: #dc2626;
+  border-color: color-mix(in srgb, #ef4444 18%, var(--line));
+}
+
+.danger-action:hover:not(:disabled) {
+  color: #b91c1c;
+  border-color: color-mix(in srgb, #ef4444 34%, var(--line));
+  background: color-mix(in srgb, #ef4444 7%, var(--control));
+}
+
 .panel-actions button,
 .wide {
   display: inline-flex;
@@ -941,6 +952,38 @@ h2 {
   box-shadow:
     0 8px 22px -18px rgba(16, 185, 129, 0.55),
     0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.card-mode .account-row.selectable {
+  cursor: pointer;
+}
+
+.card-mode .account-row.selected {
+  border-color: color-mix(in srgb, var(--accent) 56%, var(--line));
+  box-shadow:
+    0 8px 22px -18px rgba(16, 185, 129, 0.55),
+    0 0 0 2px color-mix(in srgb, var(--accent) 28%, transparent);
+}
+
+.card-selected-mark {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 5;
+  width: 54px;
+  height: 54px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  border-radius: 50%;
+  color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 34%, transparent);
+  background: color-mix(in srgb, var(--panel) 84%, transparent);
+  box-shadow:
+    0 10px 26px -18px rgba(15, 23, 42, 0.42),
+    0 0 0 6px color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 .account-provider {

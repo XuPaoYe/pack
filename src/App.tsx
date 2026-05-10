@@ -105,7 +105,12 @@ type SwitchAccountResult = ManagedAccount[];
 type NoticeTone = "success" | "error" | "info";
 type Notice = { tone: NoticeTone; text: string };
 type AppLogEntry = { id: string; tone: NoticeTone; text: string; createdAt: number };
-type ExportPreview = { account: ManagedAccount; payload: string; kind: "json" | "key" };
+type ExportPreview = {
+  payload: string;
+  kind: "json" | "key";
+  label: string;
+  fileBase: string;
+};
 type ForceUpdateState = {
   update: Update;
   phase: "ready" | "downloading" | "installing" | "error";
@@ -950,8 +955,10 @@ function App() {
   const [isLogsOpen, setIsLogsOpen] = useState(false);
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
+  const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
   const [isBusy, setIsBusy] = useState(false);
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
   const [isFileImporting, setIsFileImporting] = useState(false);
   const [refreshingAccountIds, setRefreshingAccountIds] = useState<Set<string>>(() => new Set());
   const [refreshingProvider, setRefreshingProvider] = useState<Provider | null>(null);
@@ -1524,10 +1531,12 @@ function App() {
   };
   const handleProviderChange = (provider: Provider) => {
     setActiveProvider(provider);
+    setSelectedExportIds(new Set());
     setAccountPage(1);
   };
   const handleSearchChange = (value: string) => {
     setQuery(value);
+    setSelectedExportIds(new Set());
     setAccountPage(1);
   };
   const handleSettings = () => {
@@ -1592,6 +1601,7 @@ function App() {
       setIsBusy(false);
     }
   };
+  const exportFileBase = (label: string) => label.replace(/[^a-z0-9._-]+/gi, "_");
   const handleExportAccount = async (account: ManagedAccount) => {
     let payload: string;
     const isPublicKeyExport = shouldHideAccountDetails(account);
@@ -1603,7 +1613,76 @@ function App() {
       showNotice("error", `导出账号失败：${String(error)}`);
       return;
     }
-    setExportPreview({ account, payload, kind: isPublicKeyExport ? "key" : "json" });
+    setExportPreview({
+      payload,
+      kind: isPublicKeyExport ? "key" : "json",
+      label: isPublicKeyExport ? "SuperAl 密钥" : accountDisplayLabel(account),
+      fileBase: `${account.provider}-${exportFileBase(accountDisplayLabel(account))}`,
+    });
+  };
+  const toggleExportSelection = (accountId: string) => {
+    setSelectedExportIds((current) => {
+      const next = new Set(current);
+      if (next.has(accountId)) {
+        next.delete(accountId);
+      } else {
+        next.add(accountId);
+      }
+      return next;
+    });
+  };
+  const handleBatchExport = async () => {
+    const selectedAccounts = filteredAccounts.filter((account) => selectedExportIds.has(account.id));
+    if (selectedAccounts.length === 0) {
+      showNotice("error", "请选择要导出的账号");
+      return;
+    }
+    try {
+      const exported = await Promise.all(
+        selectedAccounts.map(async (account) => {
+          const isPublicKeyExport = shouldHideAccountDetails(account);
+          const payload = isPublicKeyExport
+            ? await invoke<string>("export_public_windsurf_account", { accountId: account.id })
+            : await invoke<string>("export_account", { accountId: account.id });
+          return { payload, kind: isPublicKeyExport ? ("key" as const) : ("json" as const) };
+        }),
+      );
+      const isKeyExport = exported.every((item) => item.kind === "key");
+      const payload = isKeyExport
+        ? exported.map((item) => item.payload.trim()).filter(Boolean).join("\n")
+        : JSON.stringify(exported.map((item) => JSON.parse(item.payload)), null, 2);
+      setExportPreview({
+        payload,
+        kind: isKeyExport ? "key" : "json",
+        label: isKeyExport ? `SuperAl 密钥 · ${exported.length} 个账号` : `${providerLabel(activeProvider)} · ${exported.length} 个账号`,
+        fileBase: `${activeProvider}-${exported.length}-accounts`,
+      });
+      setSelectedExportIds(new Set());
+    } catch (error) {
+      showNotice("error", `批量导出失败：${String(error)}`);
+    }
+  };
+  const handleBatchDelete = async () => {
+    const selectedAccounts = filteredAccounts.filter((account) => selectedExportIds.has(account.id));
+    if (selectedAccounts.length === 0) {
+      showNotice("error", "请选择要删除的账号");
+      return;
+    }
+    if (!window.confirm(`确认删除选中的 ${selectedAccounts.length} 个账号？`)) return;
+    setIsBusy(true);
+    try {
+      let nextAccounts = accounts;
+      for (const account of selectedAccounts) {
+        nextAccounts = await invoke<ManagedAccount[]>("delete_account", { accountId: account.id });
+      }
+      setAccounts(nextAccounts);
+      setSelectedExportIds(new Set());
+      showNotice("success", `已删除 ${selectedAccounts.length} 个账号`);
+    } catch (error) {
+      showNotice("error", `批量删除失败：${String(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
   const downloadExportPreview = (preview: ExportPreview) => {
     const isKey = preview.kind === "key";
@@ -1611,10 +1690,10 @@ function App() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${preview.account.provider}-${accountDisplayLabel(preview.account).replace(/[^a-z0-9._-]+/gi, "_")}.${isKey ? "txt" : "json"}`;
+    a.download = `${preview.fileBase}.${isKey ? "txt" : "json"}`;
     a.click();
     URL.revokeObjectURL(url);
-    showNotice("success", `已下载 ${accountDisplayLabel(preview.account)}`);
+    showNotice("success", `已下载 ${preview.label}`);
   };
   const copyExportPreview = async (preview: ExportPreview) => {
     try {
@@ -1629,9 +1708,9 @@ function App() {
   };
 
   const confirmDeleteAccount = async () => {
-    if (!pendingDeleteAccount) return;
+    if (!pendingDeleteAccount || isDeletingAccount) return;
     const account = pendingDeleteAccount;
-    setIsBusy(true);
+    setIsDeletingAccount(true);
     try {
       const nextAccounts = await invoke<ManagedAccount[]>("delete_account", { accountId: account.id });
       setAccounts(nextAccounts);
@@ -1640,7 +1719,7 @@ function App() {
     } catch (error) {
       showNotice("error", `删除账号失败：${String(error)}`);
     } finally {
-      setIsBusy(false);
+      setIsDeletingAccount(false);
     }
   };
   const handleOpenStore = (event: React.MouseEvent<HTMLAnchorElement>) => {
@@ -1921,11 +2000,19 @@ function App() {
                 </label>
                 <button className="primary" onClick={handleAddAccount}>
                   <Plus size={18} />
-                  添加账号
+                  添加
                 </button>
                 <button className="secondary refresh-all" onClick={handleRefreshVisibleAccounts} disabled={isBusy || isActiveProviderRefreshing}>
                   <RotateCw size={18} className={clsx(isActiveProviderRefreshing && "spin")} />
-                  刷新账号
+                  刷新
+                </button>
+                <button className="secondary" onClick={() => void handleBatchExport()} disabled={isBusy || filteredAccounts.length === 0}>
+                  <Download size={18} />
+                  导出
+                </button>
+                <button className="secondary danger-action" onClick={() => void handleBatchDelete()} disabled={isBusy || filteredAccounts.length === 0}>
+                  <Trash2 size={18} />
+                  删除
                 </button>
               </div>
             </div>
@@ -1949,7 +2036,24 @@ function App() {
                     </div>
                   )}
                   {pagedAccounts.map((account) => (
-                    <article className={clsx("account-row", account.status?.state === "unavailable" && "disabled", isCurrentAccount(account) && "current")} key={account.id}>
+                    <article
+                      className={clsx(
+                        "account-row",
+                        account.status?.state === "unavailable" && "disabled",
+                        isCurrentAccount(account) && "current",
+                        "selectable",
+                        selectedExportIds.has(account.id) && "selected",
+                      )}
+                      key={account.id}
+                      onClick={() => {
+                        toggleExportSelection(account.id);
+                      }}
+                    >
+                      {selectedExportIds.has(account.id) && (
+                        <span className="card-selected-mark" aria-hidden="true">
+                          <Check size={24} strokeWidth={2.25} />
+                        </span>
+                      )}
                       <AccountStateCorner account={account} />
                       <div className="account-main">
                         <div className="account-title">
@@ -1998,7 +2102,7 @@ function App() {
                       <ValidityMeter account={account} />
                       <div className="account-footer">
                         <time className="account-stamp">{account.status?.state === "unavailable" ? "--" : formatRelative(account.updatedAt)}</time>
-                        <div className="account-actions">
+                        <div className="account-actions" onClick={(event) => event.stopPropagation()}>
                         <button
                           className="icon-button"
                           aria-label={isCurrentAccount(account) ? "停用当前账号" : "设为当前账号"}
@@ -2336,7 +2440,7 @@ function App() {
       {exportPreview && (
         <AppModal
           title="导出账号"
-          description={exportPreview.kind === "key" ? "SuperAl 加密密钥" : accountDisplayLabel(exportPreview.account)}
+          description={exportPreview.label}
           closeLabel="关闭导出账号"
           className="export-panel"
           onClose={() => setExportPreview(null)}
@@ -2358,7 +2462,12 @@ function App() {
       )}
 
       {pendingDeleteAccount && (
-        <div className="modal-overlay" onMouseDown={(event) => handleModalBackdropMouseDown(event, () => setPendingDeleteAccount(null))}>
+        <div
+          className="modal-overlay"
+          onMouseDown={(event) => handleModalBackdropMouseDown(event, () => {
+            if (!isDeletingAccount) setPendingDeleteAccount(null);
+          })}
+        >
           <aside className="confirm-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
             <div className="confirm-icon danger">
               <Trash2 size={22} />
@@ -2369,11 +2478,11 @@ function App() {
               <span>只会从 Super AI 的账号库移除，不会删除本机 Codex/Gemini 当前配置。</span>
             </div>
             <div className="confirm-actions">
-              <button className="secondary" onClick={() => setPendingDeleteAccount(null)} disabled={isBusy}>
+              <button className="secondary" onClick={() => setPendingDeleteAccount(null)} disabled={isDeletingAccount}>
                 取消
               </button>
-              <button className="danger-button" onClick={() => void confirmDeleteAccount()} disabled={isBusy}>
-                {isBusy ? "删除中..." : "删除"}
+              <button className="danger-button" onClick={() => void confirmDeleteAccount()} disabled={isDeletingAccount}>
+                {isDeletingAccount ? "删除中..." : "删除"}
               </button>
             </div>
           </aside>
