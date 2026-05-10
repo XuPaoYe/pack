@@ -50,13 +50,16 @@ function resolveGeminiPlanBadge(account: ManagedAccount): PlanBadge {
 }
 
 function resolveWindsurfPlanBadge(account: ManagedAccount): PlanBadge {
-  const raw = normalizePlanKey(account.plan || account.planType);
+  const official = (account.plan || account.planType || "").trim();
+  const raw = normalizePlanKey(official);
   if (!raw) return { label: "SuperAI", tone: "unknown" };
   if (raw.includes("enterprise")) return { label: "Enterprise", tone: "enterprise" };
   if (raw.includes("team")) return { label: "Team", tone: "team" };
+  if (raw.includes("trial")) return { label: "Trial", tone: "free" };
+  if (raw.includes("ultra") || raw.includes("max")) return { label: "Max", tone: "pro" };
   if (raw.includes("pro")) return { label: "Pro", tone: "pro" };
   if (raw.includes("free")) return { label: "Free", tone: "free" };
-  return { label: account.plan || "SuperAI", tone: "unknown" };
+  return { label: official, tone: "unknown" };
 }
 
 export function resolvePlanBadge(account: ManagedAccount): PlanBadge {

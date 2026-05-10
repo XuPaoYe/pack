@@ -236,13 +236,15 @@ function accountTitle(account: ManagedAccount) {
 }
 
 function publicAccountCode(account: ManagedAccount, prefix: string) {
-  const input = `${account.provider}:${account.id}:${account.email}:${account.accountId ?? ""}`;
+  const seed = (account.email || account.accountId || account.id || "").toLowerCase();
+  const input = `${prefix}|${account.provider}|${seed}`;
   let hash = 2166136261;
   for (let index = 0; index < input.length; index += 1) {
     hash ^= input.charCodeAt(index);
     hash = Math.imul(hash, 16777619);
   }
-  return `${prefix}-${(hash >>> 0).toString(36).toUpperCase().padStart(7, "0").slice(0, 7)}`;
+  const code = (hash >>> 0).toString(36).toUpperCase().padStart(7, "0").slice(0, 7);
+  return `${prefix}-${code}`;
 }
 
 function shouldHideAccountDetails(account: ManagedAccount) {
@@ -275,7 +277,7 @@ function AccountStateCorner({ account }: { account: ManagedAccount }) {
 
 function AccountPlanBadge({ account }: { account: ManagedAccount }) {
   if (shouldHideAccountDetails(account)) {
-    return <span className="pill plan unknown">{publicAccountCode(account, "TIER")}</span>;
+    return <span className="pill plan pro">Max</span>;
   }
 
   const badge = resolvePlanBadge(account);

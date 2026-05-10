@@ -468,7 +468,10 @@ fn spawn_sidecar(
                     let _ = child.kill();
                     let _ = child.wait();
                     cleanup_language_server_processes(ls_bin);
-                    return Err("等待 sidecar 启动超时（30s）".to_string());
+                    return Err(format!(
+                        "等待 sidecar 启动超时（{}s）",
+                        SIDECAR_BOOT_TIMEOUT.as_secs()
+                    ));
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1146,8 +1149,19 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
             return;
         }
     };
+    // 把最近使用账号的探测放后台线程，避免给客户端 respond 之前再多打
+    // 一次 sidecar GET — 之前是同步调用，会拖慢 SSE 首字节，并在高并发
+    // 下让 /auth/accounts 被反复打。fire-and-forget 即可，结果只用于
+    // UI 高亮，丢失一次没关系。
     if matches!(path, "/v1/chat/completions" | "/v1/messages" | "/v1/responses") {
-        update_last_used_account_from_sidecar(&client, target);
+        let target_for_probe = target.clone();
+        let _ = thread::Builder::new()
+            .name("windsurf-api-last-used".into())
+            .spawn(move || {
+                if let Ok(client) = build_inner_client() {
+                    update_last_used_account_from_sidecar(&client, &target_for_probe);
+                }
+            });
     }
 
     // 收集响应头（除 hop-by-hop 与 Content-Length；body 长度让 tiny_http 自行决定）。
@@ -1314,7 +1328,7 @@ fn fallback_models_payload() -> Value {
                 "id": id,
                 "object": "model",
                 "created": now,
-                "owned_by": "windsurf",
+                "owned_by": "superai",
             })
         })
         .collect();
