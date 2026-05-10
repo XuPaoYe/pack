@@ -88,8 +88,7 @@ async function main() {
     }
   }
 
-  const canStartLanguageServer = existsSync(binaryPath);
-  if (canStartLanguageServer) {
+  if (existsSync(binaryPath)) {
     resetWorkspace();
 
     // v2.0.85 (#127 123cek): kill any leftover language_server_linux_x64
@@ -105,6 +104,30 @@ async function main() {
       } catch (e) { log.warn(`LS cleanup error (non-fatal): ${e.message}`); }
     }
 
+    // Super AI note: previously we ran this block fire-and-forget so the
+    // HTTP "Server on ..." line printed before LS was ready. The Tauri
+    // wrapper would then forward chat requests immediately; those failed
+    // because LS wasn't up yet and the account pool got marked
+    // "temporarily unavailable" with multi-minute retryAfter values,
+    // poisoning the pool ("账号队列超时: 所有可用账号暂时不可用"). Match
+    // upstream and await readiness here. Tauri side raises its boot
+    // timeout to 60s to accommodate.
+    await startLanguageServer({
+      binaryPath,
+      port: config.lsPort,
+      apiServerUrl: config.codeiumApiUrl,
+    });
+
+    try {
+      await waitForReady(30000);
+      // v2.0.93: if default LS started but proxy-LS crashed, give the
+      // manage child (port 42101) a moment to restart before syncing models.
+      log.info('LS ready — fetching model catalog');
+    } catch (err) {
+      log.error(`Language server failed to start: ${err.message}`);
+      log.error('Chat completions will not work without the language server.');
+      log.error('Run: bash install-ls.sh (now uses Windsurf desktop LS, not stale Exafunction)');
+    }
   } else {
     log.warn(`Language server binary not found at ${binaryPath}`);
     log.warn('Install it with: download Windsurf Linux tarball and extract language_server_linux_x64');
@@ -120,29 +143,6 @@ async function main() {
   }
 
   const server = startServer();
-
-  // Super AI: don't block the parent process waiting for LS readiness before
-  // printing "Server on ...". The Tauri wrapper needs the HTTP port quickly;
-  // chat endpoints can report LS errors later if the binary is still starting.
-  if (canStartLanguageServer) {
-    (async () => {
-      try {
-        await startLanguageServer({
-          binaryPath,
-          port: config.lsPort,
-          apiServerUrl: config.codeiumApiUrl,
-        });
-        await waitForReady(30000);
-        // v2.0.93: if default LS started but proxy-LS crashed, give the
-        // manage child a moment to restart before syncing models.
-        log.info('LS ready — fetching model catalog');
-      } catch (err) {
-        log.error(`Language server failed to start: ${err.message}`);
-        log.error('Chat completions will not work without the language server.');
-        log.error('Run: bash install-ls.sh (now uses Windsurf desktop LS, not stale Exafunction)');
-      }
-    })();
-  }
 
   // v2.0.67 (#112) — quiet-window auto-update watcher. No-op until the
   // operator flips experimental.autoUpdateQuietWindow on (default off).

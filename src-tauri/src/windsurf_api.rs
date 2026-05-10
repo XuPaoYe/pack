@@ -31,7 +31,9 @@ pub const DEFAULT_PORT: u16 = 0;
 pub const API_KEY_PREFIX: &str = "agt_wsf_";
 
 /// sidecar 启动后等待 stdout 报告端口的最长时长。
-const SIDECAR_BOOT_TIMEOUT: Duration = Duration::from_secs(30);
+/// sidecar 在打印 "Server on http://..." 之前会先 await
+/// startLanguageServer + waitForReady(30s)，因此这里给到 60s 留余量。
+const SIDECAR_BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
