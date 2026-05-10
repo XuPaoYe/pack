@@ -60,7 +60,7 @@ import {
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
-type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey";
+type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey" | "password";
 type OAuthProvider = "codex" | "gemini";
 type ThemeMode = "system" | "light" | "dark";
 
@@ -171,10 +171,18 @@ const modeConfig: Record<
     title: "批量密钥",
     desc: "一行一个密钥，支持多个 SuperAI 账号一起导入。",
   },
+  password: {
+    icon: LockKeyhole,
+    title: "账号密码",
+    desc: "输入 SuperAI 邮箱与密码导入单个账号。",
+  },
 };
 
 const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
-const superaiImportModeOrder: ImportMode[] = ["batchKey"];
+// 完全版额外允许“账号密码”导入单个 SuperAI 账号；公开版仅批量密钥。
+const superaiImportModeOrder: ImportMode[] = IS_PUBLIC_BUILD
+  ? ["batchKey"]
+  : ["batchKey", "password"];
 const defaultImportMode: ImportMode = "oauth";
 const defaultSuperaiImportMode: ImportMode = "batchKey";
 
@@ -204,9 +212,14 @@ const __WSFAPI: string = [119, 105, 110, 100, 115, 117, 114, 102, 97, 112, 105]
 const PROVIDER_WSF = __WSFAPI.slice(0, 8) as "windsurf"; // DB 里存的 provider 值
 
 function sanitizeUserFacingText(text: string) {
+  // 先替换更长的 lowercase 项目代号 windsurfapi，再替换 Windsurf；
+  // 顺序反了会让 "WindsurfAPI" 先变成 "SuperAIAPI"，第二轮 lowercase
+  // 匹配就没机会修正大小写混用的形态。再补一条 case-insensitive 兜底
+  // "WindsurfAPI" 形态，运行时 sidecar 偶发返回的字符串也能干净。
   let next = text
-    .replaceAll(__WSF, "SuperAI")
-    .replaceAll(__WSFAPI, "superai-sidecar");
+    .replaceAll(__WSFAPI, "superai-sidecar")
+    .replace(new RegExp(__WSF + "API", "gi"), "SuperAI")
+    .replaceAll(__WSF, "SuperAI");
   if (IS_PUBLIC_BUILD) {
     next = next
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account]")
@@ -1005,6 +1018,8 @@ function App() {
   const [mode, setMode] = useState<ImportMode>(defaultImportMode);
   const [pasteValue, setPasteValue] = useState("");
   const [superaiBatchKeys, setSuperaiBatchKeys] = useState("");
+  const [superaiPasswordEmail, setSuperaiPasswordEmail] = useState("");
+  const [superaiPasswordPwd, setSuperaiPasswordPwd] = useState("");
   const [query, setQuery] = useState("");
   const [accountPage, setAccountPage] = useState(1);
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
@@ -1367,6 +1382,8 @@ function App() {
     setMode(defaultImportModeForProvider(activeProvider));
     setPasteValue("");
     setSuperaiBatchKeys("");
+    setSuperaiPasswordEmail("");
+    setSuperaiPasswordPwd("");
   };
 
   const applyImportResult = (
@@ -1560,6 +1577,31 @@ function App() {
   const handleAddAccount = () => {
     setMode(defaultImportModeForProvider(activeProvider));
     setIsImportModalOpen(true);
+  };
+
+  const handleSuperaiPasswordImport = async () => {
+    const email = superaiPasswordEmail.trim();
+    const password = superaiPasswordPwd;
+    if (!email || !password) {
+      showNotice("error", "请输入 SuperAI 邮箱和密码");
+      return;
+    }
+    setIsBusy(true);
+    try {
+      const account = await invoke<ManagedAccount>("add_superai_account_by_password", {
+        email,
+        password,
+      });
+      setAccounts((current) => mergeAccounts(current, [account]));
+      setSuperaiPasswordEmail("");
+      setSuperaiPasswordPwd("");
+      closeImportModal();
+      showNotice("success", `已添加 SuperAI 账号${account.email ? "：" + account.email : ""}`);
+    } catch (error) {
+      showNotice("error", `导入失败：${String(error)}`);
+    } finally {
+      setIsBusy(false);
+    }
   };
 
   const handleSuperaiBatchKeyImport = async () => {
@@ -2371,6 +2413,44 @@ function App() {
                     {isBusy ? "导入中..." : "批量导入"}
                   </button>
                 </>
+              )}
+
+              {mode === "password" && activeProvider === PROVIDER_WSF && !IS_PUBLIC_BUILD && (
+                <div className="superai-password-form">
+                  <label className="field">
+                    <span>邮箱</span>
+                    <input
+                      type="email"
+                      value={superaiPasswordEmail}
+                      onChange={(event) => setSuperaiPasswordEmail(event.target.value)}
+                      placeholder="name@example.com"
+                      autoComplete="off"
+                      spellCheck={false}
+                      disabled={isBusy}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>密码</span>
+                    <input
+                      type="password"
+                      value={superaiPasswordPwd}
+                      onChange={(event) => setSuperaiPasswordPwd(event.target.value)}
+                      placeholder="SuperAI 登录密码"
+                      autoComplete="new-password"
+                      spellCheck={false}
+                      disabled={isBusy}
+                    />
+                  </label>
+                  <p className="superai-password-tip">凭证仅在本机加密保存，导入完成后建议立即修改密码或启用二步验证。</p>
+                  <button
+                    className="wide primary"
+                    onClick={() => void handleSuperaiPasswordImport()}
+                    disabled={!superaiPasswordEmail.trim() || !superaiPasswordPwd || isBusy}
+                  >
+                    <LockKeyhole size={20} />
+                    {isBusy ? "导入中..." : "登录并导入"}
+                  </button>
+                </div>
               )}
 
             </div>

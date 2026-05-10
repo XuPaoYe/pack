@@ -233,6 +233,8 @@ fn current_target_triple() -> &'static str {
         "aarch64-unknown-linux-gnu"
     } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
         "x86_64-pc-windows-msvc"
+    } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        "aarch64-pc-windows-msvc"
     } else {
         ""
     }
@@ -256,11 +258,27 @@ fn resolve_bundled_binary(name: &str) -> Option<PathBuf> {
             if candidate.is_file() {
                 return Some(candidate);
             }
+            #[cfg(target_os = "macos")]
+            {
+                let universal = parent.join(format!("{name}-universal-apple-darwin"));
+                if universal.is_file() {
+                    return Some(universal);
+                }
+            }
             // 源码仓库 fallback：从 target/debug 往上找到有 src-tauri/binaries 的目录
             for ancestor in parent.ancestors() {
                 let dev = ancestor.join("src-tauri/binaries").join(&filename);
                 if dev.is_file() {
                     return Some(dev);
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    let universal = ancestor
+                        .join("src-tauri/binaries")
+                        .join(format!("{name}-universal-apple-darwin"));
+                    if universal.is_file() {
+                        return Some(universal);
+                    }
                 }
             }
         }
@@ -1372,6 +1390,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
+    /// 串行化所有会动 RUNTIME 全局态的测试，避免 `cargo test`
+    /// 默认并发线程时互相 stop() 掉对方的监听器。
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn lock_serial() -> std::sync::MutexGuard<'static, ()> {
+        // 中毒锁也强行拿到，单条用例 panic 不应阻塞后续。
+        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn http_get(addr: &str, path: &str, auth: Option<&str>) -> (u16, String) {
         let mut stream = TcpStream::connect(addr).expect("connect");
         let auth_line = auth
@@ -1428,6 +1455,7 @@ mod tests {
 
     #[test]
     fn lifecycle_and_routes() {
+        let _guard = lock_serial();
         let key = "agt_wsf_test_key_12345";
         let status = start_no_sidecar("127.0.0.1", 0, key).expect("start");
         assert!(status.running);
@@ -1463,6 +1491,7 @@ mod tests {
 
     #[test]
     fn restart_picks_new_port() {
+        let _guard = lock_serial();
         let key = "agt_wsf_restart_test";
         let s1 = start_no_sidecar("127.0.0.1", 0, key).unwrap();
         let p1 = s1.actual_port.unwrap();
@@ -1477,6 +1506,7 @@ mod tests {
 
     #[test]
     fn empty_key_rejected() {
+        let _guard = lock_serial();
         let err = start_no_sidecar("127.0.0.1", 0, "").unwrap_err();
         assert!(err.contains("API Key"));
     }
@@ -1487,6 +1517,7 @@ mod tests {
     #[test]
     #[ignore = "needs prebuilt sidecar binaries; run with --ignored"]
     fn e2e_proxy_models() {
+        let _guard = lock_serial();
         let key = "agt_wsf_e2e_test_key";
         let tmp = std::env::temp_dir().join("super-ai-windsurf-e2e");
         let _ = std::fs::remove_dir_all(&tmp);

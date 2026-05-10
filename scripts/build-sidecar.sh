@@ -10,6 +10,9 @@
 #   scripts/build-sidecar.sh                  # 自动识别当前平台
 #   WINDSURF_LS_PATH=/path scripts/build-sidecar.sh
 #   TARGET=darwin-arm64 scripts/build-sidecar.sh
+#   TARGET=universal-apple-darwin scripts/build-sidecar.sh
+#   TARGET=windows-x64 scripts/build-sidecar.sh
+#   TARGET=windows-arm64 scripts/build-sidecar.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,8 +41,29 @@ fi
 echo "▶ scripts/scrub-vendor.mjs"
 node "$REPO_ROOT/scripts/scrub-vendor.mjs"
 
+target_pair_from_alias() {
+  case "${1:-}" in
+    darwin-arm64|mac-arm64|aarch64-apple-darwin)
+      echo "bun-darwin-arm64|aarch64-apple-darwin" ;;
+    darwin-x64|mac-x64|x86_64-apple-darwin)
+      echo "bun-darwin-x64|x86_64-apple-darwin" ;;
+    universal-apple-darwin|darwin-universal|mac-universal)
+      echo "universal-apple-darwin|universal-apple-darwin" ;;
+    windows-x64|win-x64|x86_64-pc-windows-msvc)
+      echo "bun-windows-x64|x86_64-pc-windows-msvc" ;;
+    windows-arm64|win-arm64|aarch64-pc-windows-msvc)
+      echo "bun-windows-arm64|aarch64-pc-windows-msvc" ;;
+    linux-x64|x86_64-unknown-linux-gnu)
+      echo "bun-linux-x64|x86_64-unknown-linux-gnu" ;;
+    linux-arm64|aarch64-unknown-linux-gnu)
+      echo "bun-linux-arm64|aarch64-unknown-linux-gnu" ;;
+    "") echo "" ;;
+    *) echo "" ;;
+  esac
+}
+
 # 推断当前平台的 bun target + Rust target triple
-detect_target() {
+detect_current_target() {
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
@@ -59,15 +83,24 @@ detect_target() {
       esac
       ;;
     MINGW*|MSYS*|CYGWIN*)
-      echo "bun-windows-x64|x86_64-pc-windows-msvc"
+      case "$arch" in
+        arm64|aarch64) echo "bun-windows-arm64|aarch64-pc-windows-msvc" ;;
+        *)             echo "bun-windows-x64|x86_64-pc-windows-msvc" ;;
+      esac
       ;;
     *) echo "" ;;
   esac
 }
 
-read -r BUN_TARGET RUST_TRIPLE <<<"$(detect_target | tr '|' ' ')"
+TARGET_ALIAS="${TARGET:-${1:-}}"
+TARGET_PAIR="$(target_pair_from_alias "$TARGET_ALIAS")"
+if [[ -z "$TARGET_PAIR" ]]; then
+  TARGET_PAIR="$(detect_current_target)"
+fi
+
+read -r BUN_TARGET RUST_TRIPLE <<<"$(echo "$TARGET_PAIR" | tr '|' ' ')"
 if [[ -z "${BUN_TARGET:-}" || -z "${RUST_TRIPLE:-}" ]]; then
-  echo "❌ 无法识别当前平台" >&2
+  echo "❌ 无法识别目标平台：${TARGET_ALIAS:-当前平台}" >&2
   exit 1
 fi
 
@@ -84,74 +117,137 @@ repair_macos_binary() {
   fi
 }
 
-# 1) 编译本地 API sidecar
-echo "▶ bun build --compile --target=$BUN_TARGET"
-SIDECAR_OUT="$OUTPUT_DIR/superai-api-$RUST_TRIPLE"
-WINDOWS_SUFFIX=""
-if [[ "$RUST_TRIPLE" == *windows* ]]; then
-  WINDOWS_SUFFIX=".exe"
-  SIDECAR_OUT="$SIDECAR_OUT.exe"
-fi
-bun build --compile --target="$BUN_TARGET" \
-  "$VENDOR_DIR/src/index.js" \
-  --outfile "$SIDECAR_OUT"
-repair_macos_binary "$SIDECAR_OUT"
-echo "✓ $SIDECAR_OUT"
+windows_suffix_for_triple() {
+  case "$1" in
+    *windows*) echo ".exe" ;;
+    *) echo "" ;;
+  esac
+}
 
-# 2) 抽运行时 Language Server 二进制
-LS_OUT="$OUTPUT_DIR/language_server-$RUST_TRIPLE$WINDOWS_SUFFIX"
+compile_sidecar() {
+  local bun_target="$1"
+  local rust_triple="$2"
+  local out="$3"
+  echo "▶ bun build --compile --target=$bun_target"
+  bun build --compile --target="$bun_target" \
+    "$VENDOR_DIR/src/index.js" \
+    --outfile "$out"
+  repair_macos_binary "$out"
+  echo "✓ $out"
+}
 
-# 用户显式指定优先
-if [[ -n "${WINDSURF_LS_PATH:-}" && -f "$WINDSURF_LS_PATH" ]]; then
-  cp "$WINDSURF_LS_PATH" "$LS_OUT"
-  repair_macos_binary "$LS_OUT"
-  echo "✓ $LS_OUT (来自 \$WINDSURF_LS_PATH)"
-  exit 0
-fi
+find_ls() {
+  local rust_triple="$1"
+  local env_name=""
+  local candidates=()
 
-# 否则按平台自动探测
-candidates=()
-case "$RUST_TRIPLE" in
-  aarch64-apple-darwin)
-    candidates+=(
-      "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm"
-      "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm64"
-      "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64"
-    )
-    ;;
-  x86_64-apple-darwin)
-    candidates+=(
-      "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64"
-    )
-    ;;
-  x86_64-unknown-linux-gnu)
-    candidates+=("/opt/windsurf/language_server_linux_x64")
-    ;;
-  aarch64-unknown-linux-gnu)
-    candidates+=("/opt/windsurf/language_server_linux_arm")
-    ;;
-  x86_64-pc-windows-msvc)
-    candidates+=("C:/Program Files/Windsurf/resources/app/extensions/windsurf/bin/language_server_windows_x64.exe")
-    ;;
-esac
+  case "$rust_triple" in
+    aarch64-apple-darwin)
+      env_name="WINDSURF_LS_ARM64_PATH"
+      candidates+=(
+        "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm"
+        "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm64"
+      )
+      ;;
+    x86_64-apple-darwin)
+      env_name="WINDSURF_LS_X64_PATH"
+      candidates+=(
+        "/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64"
+      )
+      ;;
+    x86_64-unknown-linux-gnu)
+      candidates+=("/opt/windsurf/language_server_linux_x64")
+      ;;
+    aarch64-unknown-linux-gnu)
+      candidates+=("/opt/windsurf/language_server_linux_arm")
+      ;;
+    x86_64-pc-windows-msvc)
+      env_name="WINDSURF_LS_X64_PATH"
+      candidates+=("C:/Program Files/Windsurf/resources/app/extensions/windsurf/bin/language_server_windows_x64.exe")
+      ;;
+    aarch64-pc-windows-msvc)
+      env_name="WINDSURF_LS_ARM64_PATH"
+      candidates+=(
+        "C:/Program Files/Windsurf/resources/app/extensions/windsurf/bin/language_server_windows_arm64.exe"
+        "C:/Program Files/Windsurf/resources/app/extensions/windsurf/bin/language_server_windows_arm.exe"
+      )
+      ;;
+  esac
 
-found=""
-for c in "${candidates[@]}"; do
-  if [[ -f "$c" ]]; then found="$c"; break; fi
-done
+  if [[ -n "$env_name" ]]; then
+    local env_path="${!env_name:-}"
+    if [[ -n "$env_path" && -f "$env_path" ]]; then
+      echo "$env_path"
+      return 0
+    fi
+  fi
 
-if [[ -z "$found" ]]; then
+  if [[ -n "${WINDSURF_LS_PATH:-}" && -f "$WINDSURF_LS_PATH" ]]; then
+    echo "$WINDSURF_LS_PATH"
+    return 0
+  fi
+
+  local c
+  for c in "${candidates[@]}"; do
+    if [[ -f "$c" ]]; then
+      echo "$c"
+      return 0
+    fi
+  done
+
   cat >&2 <<EOF
-❌ 没找到 SuperAI runtime 二进制
-   请安装运行时应用后重试，或手动设置 WINDSURF_LS_PATH 指向已有的 LS 文件。
+❌ 没找到 $rust_triple 的 SuperAI runtime 二进制
+   请安装对应架构的运行时应用后重试，或手动设置：
+   - WINDSURF_LS_PATH：当前单架构目标
+   - WINDSURF_LS_ARM64_PATH / WINDSURF_LS_X64_PATH：mac universal 或指定架构目标
    候选位置：
 $(printf '   - %s\n' "${candidates[@]}")
 EOF
-  exit 1
-fi
+  return 1
+}
 
-cp "$found" "$LS_OUT"
-repair_macos_binary "$LS_OUT"
-echo "✓ $LS_OUT (来自 $found)"
+copy_ls() {
+  local rust_triple="$1"
+  local out="$2"
+  local found
+  found="$(find_ls "$rust_triple")"
+  cp "$found" "$out"
+  repair_macos_binary "$out"
+  echo "✓ $out (来自 $found)"
+}
+
+if [[ "$RUST_TRIPLE" == "universal-apple-darwin" ]]; then
+  if ! command -v lipo >/dev/null 2>&1; then
+    echo "❌ 构建 mac universal sidecar 需要 lipo" >&2
+    exit 1
+  fi
+  ARM_API="$OUTPUT_DIR/superai-api-aarch64-apple-darwin"
+  X64_API="$OUTPUT_DIR/superai-api-x86_64-apple-darwin"
+  UNI_API="$OUTPUT_DIR/superai-api-universal-apple-darwin"
+  ARM_LS="$OUTPUT_DIR/language_server-aarch64-apple-darwin"
+  X64_LS="$OUTPUT_DIR/language_server-x86_64-apple-darwin"
+  UNI_LS="$OUTPUT_DIR/language_server-universal-apple-darwin"
+
+  compile_sidecar "bun-darwin-arm64" "aarch64-apple-darwin" "$ARM_API"
+  compile_sidecar "bun-darwin-x64" "x86_64-apple-darwin" "$X64_API"
+  echo "▶ lipo -create superai-api"
+  lipo -create "$ARM_API" "$X64_API" -output "$UNI_API"
+  repair_macos_binary "$UNI_API"
+  echo "✓ $UNI_API"
+
+  copy_ls "aarch64-apple-darwin" "$ARM_LS"
+  copy_ls "x86_64-apple-darwin" "$X64_LS"
+  echo "▶ lipo -create language_server"
+  lipo -create "$ARM_LS" "$X64_LS" -output "$UNI_LS"
+  repair_macos_binary "$UNI_LS"
+  echo "✓ $UNI_LS"
+else
+  WINDOWS_SUFFIX="$(windows_suffix_for_triple "$RUST_TRIPLE")"
+  SIDECAR_OUT="$OUTPUT_DIR/superai-api-$RUST_TRIPLE$WINDOWS_SUFFIX"
+  LS_OUT="$OUTPUT_DIR/language_server-$RUST_TRIPLE$WINDOWS_SUFFIX"
+
+  compile_sidecar "$BUN_TARGET" "$RUST_TRIPLE" "$SIDECAR_OUT"
+  copy_ls "$RUST_TRIPLE" "$LS_OUT"
+fi
 echo
-echo "🟢 sidecar 构建完成。可以 npm run tauri dev 了。"
+echo "🟢 sidecar 构建完成。可以 npm run dev 了。"

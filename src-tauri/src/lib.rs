@@ -580,6 +580,26 @@ fn mark_account_available(account: &mut ManagedAccount) {
 
 fn account_for_frontend(account: &ManagedAccount) -> ManagedAccount {
     let mut redacted = account.clone();
+    // 公开版下的 windsurf 账号：有效期展示**每次从 batch_key 现解**（密钥本体被
+    // AES 封死，用户即使解开外层 account_json 改 license_expires_at 也无效）。
+    // 现解失败再退回缓存的 license_expires_at 兜底；都没有就不改。
+    // 完全版直接用 DB 里的 subscription_active_until（= 上游 plan_end）。
+    if is_public_build() && account.provider == "windsurf" {
+        let payload = account.auth_payload.as_ref().and_then(Value::as_object);
+        let derived = payload
+            .and_then(|payload| payload.get("batch_key"))
+            .and_then(Value::as_str)
+            .and_then(|key| parse_windsurf_batch_key_line(key).ok())
+            .map(|credential| credential.expires_at)
+            .filter(|expires_at| *expires_at != i64::MAX)
+            .map(|expires_at| Value::Number(expires_at.into()));
+        let cached = payload
+            .and_then(|payload| payload.get("license_expires_at"))
+            .cloned();
+        if let Some(value) = derived.or(cached) {
+            redacted.subscription_active_until = Some(value);
+        }
+    }
     redacted.auth_payload = None;
     redacted
 }
@@ -842,6 +862,27 @@ fn normalize_unix_seconds_value(value: &Value) -> Option<i64> {
     }
 }
 
+/// 把 Connect-RPC JSON 里各种形态的时间戳吃成 Unix 秒：
+/// - 数字（秒或毫秒）/ 数字串
+/// - RFC3339 字符串，如 "2025-11-15T13:34:50Z"（protobuf well-known Timestamp 默认编码）
+/// - 对象 `{seconds: <num|str>, nanos: <num>}`（少数 grpc-gateway 实现）
+fn coerce_unix_seconds(value: &Value) -> Option<i64> {
+    if let Some(seconds) = normalize_unix_seconds_value(value) {
+        return Some(seconds);
+    }
+    if let Some(text) = value.as_str() {
+        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(text.trim()) {
+            return Some(parsed.timestamp());
+        }
+    }
+    if let Some(obj) = value.as_object() {
+        if let Some(seconds) = obj.get("seconds").and_then(normalize_unix_seconds_value) {
+            return Some(seconds);
+        }
+    }
+    None
+}
+
 fn windsurf_license_expired_at(expires_at: i64) -> bool {
     expires_at != i64::MAX && now_ts() / 60 >= expires_at / 60
 }
@@ -854,7 +895,7 @@ fn windsurf_license_expires_at(account: &ManagedAccount) -> Option<i64> {
 }
 
 fn apply_windsurf_license_expiry(account: &mut ManagedAccount) {
-    if account.provider != "windsurf" {
+    if !is_public_build() || account.provider != "windsurf" {
         return;
     }
     if let Some(expires_at) = windsurf_license_expires_at(account) {
@@ -2656,10 +2697,16 @@ fn apply_windsurf_user_status_json(account: &mut ManagedAccount, user_status: &V
             Value::Number(value.into()),
         );
     }
-    if let Some(value) = number_field(plan_status.get("dailyQuotaResetAtUnix")) {
+    if let Some(value) = plan_status
+        .get("dailyQuotaResetAtUnix")
+        .and_then(coerce_unix_seconds)
+    {
         normalized.insert("daily_quota_reset_at_unix".to_string(), Value::Number(value.into()));
     }
-    if let Some(value) = number_field(plan_status.get("weeklyQuotaResetAtUnix")) {
+    if let Some(value) = plan_status
+        .get("weeklyQuotaResetAtUnix")
+        .and_then(coerce_unix_seconds)
+    {
         normalized.insert(
             "weekly_quota_reset_at_unix".to_string(),
             Value::Number(value.into()),
@@ -2680,7 +2727,9 @@ fn apply_windsurf_user_status_json(account: &mut ManagedAccount, user_status: &V
     if let Some(value) = number_field(plan_status.get("availableFlexCredits")) {
         normalized.insert("available_flex_credits".to_string(), Value::Number(value.into()));
     }
-    if let Some(value) = number_field(plan_status.get("planEnd")) {
+    // planEnd 在 Connect-RPC JSON 里可能是数字、数字串、RFC3339 字符串或
+    // {seconds, nanos} 对象，全部归一到 Unix 秒。
+    if let Some(value) = plan_status.get("planEnd").and_then(coerce_unix_seconds) {
         normalized.insert("plan_end".to_string(), Value::Number(value.into()));
     }
     apply_windsurf_plan_status(account, &Value::Object(normalized));
@@ -2857,6 +2906,14 @@ async fn windsurf_get_plan_status(account: &ManagedAccount) -> Result<Value, Str
 }
 
 async fn enrich_windsurf_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
+    // 有 api_key 时优先走 JSON 路径：上游 GetUserStatus 用 application/json，
+    // 字段名是 dailyQuotaRemainingPercent / weeklyQuotaRemainingPercent / planEnd，
+    // 不依赖 protobuf 私有 tag mapping，跟 vendor sidecar 对齐。
+    if windsurf_payload_string(account, "api_key").is_some() {
+        if let Ok(()) = refresh_windsurf_account_by_api_key(account).await {
+            return Ok(());
+        }
+    }
     let mut last_error = None;
     match windsurf_get_current_user(account).await {
         Ok(user_info_result) => {
@@ -3220,7 +3277,9 @@ fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str, expires_at
         Value::Number(expires_at.into()),
     );
     account.auth_payload = Some(Value::Object(payload));
-    account.subscription_active_until = Some(Value::Number(expires_at.into()));
+    if is_public_build() {
+        account.subscription_active_until = Some(Value::Number(expires_at.into()));
+    }
     // 入库时立刻初始化本地累计：把当前上游 weekly% 当 baseline，consumed 从 0 起算。
     // bump_public_usage 自带初始化分支。
     let _ = bump_public_usage(account);

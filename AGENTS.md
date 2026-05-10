@@ -190,8 +190,8 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 
 | 脚本 | 模式 | 注入的 env |
 |---|---|---|
-| `npm run dev` / `npm run tauri:build` / `tauri:build:dmg` | **public**（默认） | `VITE_SUPERAI_PUBLIC_BUILD=1` |
-| `npm run dev:full` / `tauri:build:full` / `tauri:build:dmg:full` | **full** | 不注入 |
+| `npm run dev` / `npm run build` / `npm run build:mac` / `npm run build:win:x64` / `npm run build:win:arm64` | **public**（默认） | `VITE_SUPERAI_PUBLIC_BUILD=1` |
+| `npm run dev:full` / `npm run build:full` / `npm run build:mac:full` / `npm run build:win:x64:full` / `npm run build:win:arm64:full` | **full** | 不注入 |
 
 读取入口：
 - 前端：`@/src/App.tsx` 顶部 `IS_PUBLIC_BUILD = import.meta.env.VITE_SUPERAI_PUBLIC_BUILD === "1"`
@@ -212,6 +212,7 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 | 6 | Rust 兜底拒绝原始凭证导出 | `lib.rs` `export_account` 中 `is_public_build()` | ✅ `Err("公开版不允许导出 SuperAI 原始凭证")` | ❌ 走 `build_windsurf_payload` |
 | 7 | 账号本地累计用量 | `lib.rs` `bump_public_usage` 等（详见下节） | ✅ 触发条件：账号 `auth_payload` 含 `batch_key`，只有公开版的批量密钥导入路径会写这个字段 | ❌ 不写 batch_key，helper 全部 no-op |
 | 8 | windsurf 卡片配额面板可见 metric | `App.tsx` 配额渲染处 | ✅ 仅 `superai-daily` / `superai-public` / 标签为"日限"的 metric；缺失时强制兜底 0% 进度条（公开版下 `superai-public` 的标签也固定为"日限"，UI 不暴露"额度"二字） | ❌ 全部 metric |
+| 9 | windsurf 添加账号弹窗 tab | `App.tsx` `superaiImportModeOrder` + `mode === "password"` JSX | ✅ 仅"批量密钥" | ❌ "批量密钥" + "账号密码"（邮箱密码登录单个账号，调 `add_superai_account_by_password`） |
 
 ### 与构建模式无关（不要错误地包条件）
 
@@ -222,7 +223,7 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 - **sidecar accounts.json 不落盘**：scrub-vendor 的 no-op patch 让 `saveAccounts` 一直空转，应用关闭 = 内存账号池蒸发。所有构建都生效。
 - **3 秒 IPC `sync_api_service_active_account` 缓存短路**（`@/src-tauri/src/windsurf_api.rs` `LAST_SYNCED_ACTIVE_EMAIL`）：所有构建都启用。
 - **DB / 3DES / refresh / sidecar 反代行为**：所有构建一致。
-- **导入面板的可选模式**：由 provider 决定，**不**由 build 决定。windsurf provider 永远只显示"批量密钥"（`superaiImportModeOrder = ["batchKey"]`），codex/gemini 永远显示 oauth/paste/local/file。两种构建在这块表现一致，请勿误加 `IS_PUBLIC_BUILD` 判。
+- **codex / gemini 导入面板的可选模式**：永远是 oauth/paste/local/file 四件套，**不**由 build 决定，请勿误加 `IS_PUBLIC_BUILD` 判。（windsurf 的 tab 列表是 build-aware 的，详见上面差异表第 9 行）
 
 ## 公开版账号"本地累计用量"机制
 
@@ -324,4 +325,3 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib e2e_proxy_models -- --igno
 ```bash
 npm run dev -- --host 127.0.0.1
 ```
-

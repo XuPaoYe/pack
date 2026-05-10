@@ -201,7 +201,7 @@ button:disabled {
 .superai-password-form .field textarea {
   border: 1px solid var(--line);
   border-radius: 8px;
-  padding: 9px 12px;
+  padding: 12px 12px;
   font-size: 13px;
   font-family: inherit;
   background: var(--surface, #fff);
