@@ -3208,33 +3208,7 @@ fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str, expires_at
     account.subscription_active_until = Some(Value::Number(expires_at.into()));
 }
 
-fn public_export_encrypt(value: &str, account: &ManagedAccount, field: &str) -> String {
-    let key_material = format!("{}:{}:{}", account.id, account.provider, field);
-    let mut output = Vec::with_capacity(value.len());
-    let mut counter = 0u64;
-    while output.len() < value.len() {
-        let mut hasher = Sha256::new();
-        hasher.update(key_material.as_bytes());
-        hasher.update(counter.to_le_bytes());
-        let block = hasher.finalize();
-        for byte in block {
-            if output.len() >= value.len() {
-                break;
-            }
-            output.push(byte);
-        }
-        counter += 1;
-    }
-    let encrypted: Vec<u8> = value
-        .as_bytes()
-        .iter()
-        .zip(output.iter())
-        .map(|(left, right)| left ^ right)
-        .collect();
-    URL_SAFE_NO_PAD.encode(encrypted)
-}
-
-fn public_windsurf_export_payload(account: &ManagedAccount) -> Result<Value, String> {
+fn public_windsurf_export_key(account: &ManagedAccount) -> Result<String, String> {
     if account.provider != "windsurf" {
         return Err("只支持导出 SuperAl 用户版数据".to_string());
     }
@@ -3243,11 +3217,7 @@ fn public_windsurf_export_payload(account: &ManagedAccount) -> Result<Value, Str
         .and_then(|payload| payload.get("batch_key"))
         .and_then(Value::as_str)
         .and_then(|key| parse_windsurf_batch_key_line(key).ok())
-        .unwrap_or_else(|| WindsurfBatchCredential {
-            account: account.email.clone(),
-            password: String::new(),
-            expires_at: windsurf_license_expires_at(account).unwrap_or_default(),
-        });
+        .ok_or_else(|| "该账号缺少可导出的批量密钥，请重新通过批量密钥导入".to_string())?;
     let expires_at = account
         .subscription_active_until
         .as_ref()
@@ -3258,13 +3228,13 @@ fn public_windsurf_export_payload(account: &ManagedAccount) -> Result<Value, Str
                 .and_then(normalize_unix_seconds_str)
         })
         .map(|value| value.to_string())
-        .unwrap_or_default();
-    Ok(serde_json::json!({
-        "provider": "superai",
-        "account": public_export_encrypt(&credential.account, account, "account"),
-        "password": public_export_encrypt(&credential.password, account, "password"),
-        "expires_at": public_export_encrypt(&expires_at, account, "expires_at"),
-    }))
+        .unwrap_or_else(|| credential.expires_at.to_string());
+    let payload = serde_json::json!({
+        "account": credential.account,
+        "password": credential.password,
+        "expires_at": expires_at,
+    });
+    superai_encrypt_text(&payload.to_string())
 }
 
 #[tauri::command]
@@ -5074,8 +5044,7 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
 fn export_public_windsurf_account(app: tauri::AppHandle, accountId: String) -> Result<String, String> {
     let conn = open_app_db(&app)?;
     let account = load_account_from_db(&conn, &accountId)?;
-    let value = public_windsurf_export_payload(&account)?;
-    serde_json::to_string_pretty(&value).map_err(|error| format!("序列化导出内容失败: {error}"))
+    public_windsurf_export_key(&account)
 }
 
 fn system_auto_launch_enabled(app: &tauri::AppHandle) -> Result<Option<bool>, String> {

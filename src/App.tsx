@@ -105,7 +105,7 @@ type SwitchAccountResult = ManagedAccount[];
 type NoticeTone = "success" | "error" | "info";
 type Notice = { tone: NoticeTone; text: string };
 type AppLogEntry = { id: string; tone: NoticeTone; text: string; createdAt: number };
-type ExportPreview = { account: ManagedAccount; payload: string };
+type ExportPreview = { account: ManagedAccount; payload: string; kind: "json" | "key" };
 type ForceUpdateState = {
   update: Update;
   phase: "ready" | "downloading" | "installing" | "error";
@@ -1594,22 +1594,24 @@ function App() {
   };
   const handleExportAccount = async (account: ManagedAccount) => {
     let payload: string;
+    const isPublicKeyExport = shouldHideAccountDetails(account);
     try {
-      payload = shouldHideAccountDetails(account)
+      payload = isPublicKeyExport
         ? await invoke<string>("export_public_windsurf_account", { accountId: account.id })
         : await invoke<string>("export_account", { accountId: account.id });
     } catch (error) {
       showNotice("error", `导出账号失败：${String(error)}`);
       return;
     }
-    setExportPreview({ account, payload });
+    setExportPreview({ account, payload, kind: isPublicKeyExport ? "key" : "json" });
   };
   const downloadExportPreview = (preview: ExportPreview) => {
-    const blob = new Blob([preview.payload], { type: "application/json;charset=utf-8" });
+    const isKey = preview.kind === "key";
+    const blob = new Blob([preview.payload], { type: isKey ? "text/plain;charset=utf-8" : "application/json;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${preview.account.provider}-${accountDisplayLabel(preview.account).replace(/[^a-z0-9._-]+/gi, "_")}.json`;
+    a.download = `${preview.account.provider}-${accountDisplayLabel(preview.account).replace(/[^a-z0-9._-]+/gi, "_")}.${isKey ? "txt" : "json"}`;
     a.click();
     URL.revokeObjectURL(url);
     showNotice("success", `已下载 ${accountDisplayLabel(preview.account)}`);
@@ -1617,7 +1619,7 @@ function App() {
   const copyExportPreview = async (preview: ExportPreview) => {
     try {
       await navigator.clipboard.writeText(preview.payload);
-      showNotice("success", "账号 JSON 已复制");
+      showNotice("success", preview.kind === "key" ? "账号密钥已复制" : "账号 JSON 已复制");
     } catch (error) {
       showNotice("error", `复制失败：${String(error)}`);
     }
@@ -2334,7 +2336,7 @@ function App() {
       {exportPreview && (
         <AppModal
           title="导出账号"
-          description={accountDisplayLabel(exportPreview.account)}
+          description={exportPreview.kind === "key" ? "SuperAl 加密密钥" : accountDisplayLabel(exportPreview.account)}
           closeLabel="关闭导出账号"
           className="export-panel"
           onClose={() => setExportPreview(null)}
