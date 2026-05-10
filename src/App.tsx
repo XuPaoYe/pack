@@ -475,6 +475,23 @@ const MODEL_FAMILIES: ModelFamily[] = [
   },
 ];
 
+const PUBLIC_MODEL_FAMILY_KEYS = new Set([
+  "gpt-5.3-codex",
+  "gpt-5.4",
+  "gpt-5.5",
+  "claude-opus-4.6",
+  "claude-opus-4.7",
+  "gemini-2.5-pro",
+  "gemini-3.1-pro",
+  "gemini-3.0-flash",
+]);
+
+function modelFamiliesForBuild() {
+  return IS_PUBLIC_BUILD
+    ? MODEL_FAMILIES.filter((family) => PUBLIC_MODEL_FAMILY_KEYS.has(family.key))
+    : MODEL_FAMILIES;
+}
+
 const FALLBACK_FAMILY_KEY = "gpt-5.3-codex";
 
 type ApiModelPref = {
@@ -494,7 +511,7 @@ function loadApiPref(): ApiModelPref {
     const raw = window.localStorage.getItem(API_PREF_STORAGE_KEY);
     if (!raw) return defaultPref();
     const parsed = JSON.parse(raw) as Partial<ApiModelPref>;
-    const fam = MODEL_FAMILIES.find((f) => f.key === parsed.family);
+    const fam = modelFamiliesForBuild().find((f) => f.key === parsed.family);
     if (!fam) {
       // 之前选过的模型已被下架（例如旧的 deepseek-v4）——
       // 直接在这里把 localStorage 重置成默认值，避免下次启动还读到脏数据。
@@ -529,7 +546,7 @@ function persistApiPref(pref: ApiModelPref) {
 
 /** 把 pref 翻译成 sidecar 的 model id，并判断是否在 sidecar 真实可用。 */
 function resolveModelId(pref: ApiModelPref): string | null {
-  const family = MODEL_FAMILIES.find((f) => f.key === pref.family);
+  const family = modelFamiliesForBuild().find((f) => f.key === pref.family);
   if (!family) return null;
   return family.resolveId(pref.effort);
 }
@@ -605,7 +622,8 @@ function ModelSelect({
     () => new Set(availableModels.map((m) => m.id)),
     [availableModels],
   );
-  const selectedFamily = MODEL_FAMILIES.find((f) => f.key === familyKey);
+  const families = modelFamiliesForBuild();
+  const selectedFamily = families.find((f) => f.key === familyKey);
   const triggerLabel = disabled
     ? selectedFamily?.label ?? emptyHint
     : loading
@@ -638,7 +656,7 @@ function ModelSelect({
       </button>
       {open && !disabled && (
         <div className="model-select-popover" role="listbox">
-          {MODEL_FAMILIES.map((family) => {
+          {families.map((family) => {
             const available = isFamilyAvailable(family, availableSet);
             const selected = family.key === familyKey;
             return (
@@ -716,7 +734,8 @@ function WindsurfApiCard({
   const running = Boolean(status?.running);
   const address = status?.address ?? "—";
   const apiKey = status?.apiKey ?? "";
-  const family = MODEL_FAMILIES.find((f) => f.key === pref.family) ?? MODEL_FAMILIES[0];
+  const families = modelFamiliesForBuild();
+  const family = families.find((f) => f.key === pref.family) ?? families[0];
   const modelSummary = [
     family.label,
     pref.effort ? EFFORT_LABELS[pref.effort] : null,
@@ -818,7 +837,8 @@ function WindsurfApiConfigPanel({
   onChangeFamily: (family: string) => void;
   onChangeEffort: (effort: EffortKey) => void;
 }) {
-  const family = MODEL_FAMILIES.find((f) => f.key === pref.family) ?? MODEL_FAMILIES[0];
+  const families = modelFamiliesForBuild();
+  const family = families.find((f) => f.key === pref.family) ?? families[0];
   const showEffort = family.efforts.length > 0;
 
   return (
@@ -1897,7 +1917,7 @@ function App() {
   const handleChangeFamily = useCallback(
     (familyKey: string) => {
       applyApiPref((prev) => {
-        const fam = MODEL_FAMILIES.find((f) => f.key === familyKey);
+        const fam = modelFamiliesForBuild().find((f) => f.key === familyKey);
         if (!fam) return prev;
         return {
           family: fam.key,
