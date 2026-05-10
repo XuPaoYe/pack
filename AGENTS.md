@@ -16,15 +16,15 @@ The app should feel like a polished native desktop utility, not a web dashboard.
 - React + TypeScript + Vite frontend
 - `lucide-react` icons
 - Plain CSS with system fonts and native-feeling layout
-- Tauri 2 + Rust desktop shell is initialized
-- Rust business commands are not implemented yet
+- Tauri 2 + Rust desktop shell（业务命令在 `src-tauri/src/lib.rs`，sidecar 反代在 `src-tauri/src/windsurf_api.rs`）
+- Bun-compiled sidecar from vendored `WindsurfPoolAPI`，详见后面 "Windsurf 本地 API 服务" 一节
 
 Current frontend entry points:
 
 - `src/App.tsx`
 - `src/App.css`
 - `src/index.css`
-- `src/lib/authParser.ts`
+- `src/lib/authParser.ts`（仅 UI 预览解析；权威 parser 在 Rust 后端）
 
 ## Important Context
 
@@ -37,29 +37,24 @@ This repo was started after reviewing two reference projects in the parent direc
   - Zig CLI for Codex auth switching
   - Strong reference for Codex `auth.json` parsing, account identity, registry logic
 
-Do not copy huge unrelated parts from either project. Extract ideas and narrow implementation to Codex + Gemini.
+Do not copy huge unrelated parts from either project. Extract ideas and narrow implementation to Codex + Gemini + Windsurf。
 
 ## Product Scope
 
-Required import methods:
+支持的 provider：
 
-- Read local account
-  - Codex: `~/.codex/auth.json`
-  - Gemini: `~/.gemini/oauth_creds.json`, `google_accounts.json`, `settings.json`
-- Import JSON from local file
-- Paste `auth.json` / token JSON
-- OAuth authorization
+- **codex**：本地 `~/.codex/auth.json`、JSON 粘贴、OAuth
+- **gemini**：本地 `~/.gemini/oauth_creds.json` / `google_accounts.json` / `settings.json`、JSON 粘贴、OAuth
+- **windsurf**（公开版核心）：批量密钥导入；完全版还支持邮箱密码 / token / OAuth 等导入路径
 
-Core account operations planned:
+核心账号操作（已实现）：
 
-- List accounts
-- Search/filter accounts
-- Import/update accounts
-- Export accounts
-- Switch/inject selected account into local Codex or Gemini config
-- Refresh token/quota later, if kept small and explicit
+- 列表 / 搜索 / 过滤
+- 导入 / 更新 / 导出（公开版只导出 batch_key，完全版导出原始凭证）
+- 切换：写回 codex/gemini 本地配置；windsurf 通过 sidecar 池调度
+- 刷新 token / 配额，含 windsurf 公开版本地累计用量（详见后节）
 
-Avoid expanding into many providers. This app is intentionally not a full clone of Cockpit Tools.
+Avoid expanding into more providers. This app is intentionally not a full clone of Cockpit Tools.
 
 ## UI Direction
 
@@ -87,60 +82,17 @@ When adding screens, prefer:
 
 ## Auth Parsing Rules
 
-`src/lib/authParser.ts` owns browser-side prototype parsing only.
+权威 parser 在 Rust 后端（`@/src-tauri/src/lib.rs` 的 `parse_*_payload` / `apply_*_user_status_*` 系列）。`@/src/lib/authParser.ts` 只做 UI 预览：粘贴框实时显示"识别到 N 个账号"，不做最终入库决策。
 
-Current parser recognizes:
+前端不应成为 security boundary：本地文件读取、token 校验、refresh、加密落盘全部在 Rust。前端拿到的 `ManagedAccount` 已经过 `account_for_frontend` 把 `auth_payload` 抹掉。
 
-- Codex standard `auth.json`
-  - `tokens.id_token`
-  - `tokens.access_token`
-  - `tokens.refresh_token`
-  - `tokens.account_id`
-  - optional `auth_mode`
-  - optional `OPENAI_API_KEY`
-- Codex exported account-like objects
-- Gemini token objects
-  - `access_token`
-  - `refresh_token`
-  - `id_token`
-  - `expiry_date`
-- Arrays and `{ accounts: [...] }`
+## Security Expectations
 
-Sensitive parsing and local file reads should move to Rust backend. Frontend may keep lightweight preview parsing, but should not become the security boundary.
-
-## Planned Tauri Backend
-
-Tauri 2 is initialized. Add commands around these modules:
-
-- `src-tauri/src/commands/codex.rs`
-- `src-tauri/src/commands/gemini.rs`
-- `src-tauri/src/services/storage.rs`
-- `src-tauri/src/services/oauth.rs`
-- `src-tauri/src/services/codex_auth.rs`
-- `src-tauri/src/services/gemini_auth.rs`
-
-Planned commands:
-
-- `list_accounts`
-- `import_codex_from_local`
-- `import_gemini_from_local`
-- `import_accounts_from_json`
-- `start_codex_oauth`
-- `complete_codex_oauth`
-- `start_gemini_oauth`
-- `complete_gemini_oauth`
-- `switch_codex_account`
-- `switch_gemini_account`
-
-Security expectations:
-
-- Do not send local auth files to any third-party service.
-- Do not log raw tokens.
-- Mask tokens in UI by default.
-- Use atomic writes for credential files.
-- Use restrictive file permissions where supported.
-- On macOS, account for Keychain if Gemini/Codex requires it.
-- On Windows, account for Credential Manager where needed.
+- 不要把本地 auth 文件 / token 发送到任何第三方服务（vendor sidecar 算"我们自己的本机进程"，不算第三方）
+- 不要把原始 token 写日志；sidecar 转发日志走 `sanitize_sidecar_log_line` 兜底
+- UI 默认 mask sensitive 字段；公开版进一步走 `sanitizeUserFacingText`
+- 凭证持久化走 SQLite + AES（详见后面"与构建模式无关"清单的 "DB 加密"项）；不依赖 macOS Keychain / Windows Credential Manager
+- 写凭证文件用原子写法（temp + rename）+ 限制权限
 
 ## Engineering Rules
 
@@ -217,25 +169,7 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 - 内部 model provider tag `provider: 'windsurf'` —— 走 `models.js` 的 `owned_by` 收口替换，不要改值本身
 - DB 里 `provider = 'windsurf'` 行 —— 用户开 sqlite cli 才看得到，改它要 schema 迁移，风险/收益不划算
 
-**回归检查命令**（每次有可能影响外观的改动后跑）：
-
-```bash
-npm run check                       # vite build
-grep -c Windsurf dist/assets/*.js   # 必须为 0
-grep -c windsurf dist/assets/*.js   # 必须为 0
-grep -ic windsurf dist/assets/*.css # 必须为 0
-strings src-tauri/binaries/superai-api-* | grep -c Windsurf  # 必须为 0
-```
-
-任何一项 `> 0`，新增的字面量必须按上面规则消化掉再合并。
-
-开发前必跑（否则 Tauri 找不到 sidecar 会报错）：
-
-```bash
-npm run build:sidecar
-```
-
-需要 `bun >= 1.3` + 已安装 Windsurf 应用（或设置 `WINDSURF_LS_PATH`）。
+**回归命令统一在最末 "Verification" 节**。任何一项 `> 0`，新增的字面量必须按上面规则消化掉再合并。
 
 不要把 sidecar / LS 二进制提交到 Git，`.gitignore` 已经覆盖。
 
@@ -359,33 +293,35 @@ npm run build:sidecar
 
 ## Verification
 
-Run before handing off meaningful changes:
+首次或 vendor 升级后必跑（否则 Tauri 找不到 sidecar 会报错；需要 `bun >= 1.3` + 已安装 Windsurf 应用或 `WINDSURF_LS_PATH`）：
 
 ```bash
-npm run build:sidecar  # 第一次或 vendor 升级后
+npm run build:sidecar
+```
+
+每次有意义改动合并前跑：
+
+```bash
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
 cargo test --manifest-path src-tauri/Cargo.toml --lib windsurf_api -- --test-threads=1
 npm run check  # = node scripts/app-build.mjs && npm run lint
 
-# 品牌脱敏回归（详见上一节"品牌脱敏规则"）
-grep -c Windsurf dist/assets/*.js                        # 必须为 0
-grep -c windsurf dist/assets/*.js                        # 必须为 0
-grep -ic windsurf dist/assets/*.css                      # 必须为 0
+# 品牌脱敏回归（规则在 "品牌脱敏规则" 节）
+grep -c Windsurf dist/assets/*.js                            # 必须为 0
+grep -c windsurf dist/assets/*.js                            # 必须为 0
+grep -ic windsurf dist/assets/*.css                          # 必须为 0
 strings src-tauri/binaries/superai-api-* | grep -c Windsurf  # 必须为 0
 ```
 
-E2E 反向代理验证（需要 sidecar 已构建）：
+E2E 反向代理验证（慢，需要 sidecar 已构建；公开版分发前必跑）：
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml --lib e2e_proxy_models -- --ignored --test-threads=1 --nocapture
 ```
 
-For local preview:
+本地浏览器预览：
 
 ```bash
 npm run dev -- --host 127.0.0.1
 ```
 
-## Known Environment Note
-
-At project creation time, Node/npm were available, but `rustc` and `cargo` were not installed. Rust was later installed through Homebrew and Tauri 2 was initialized. Continue backend work inside `src-tauri/`.
