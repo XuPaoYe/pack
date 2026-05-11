@@ -689,7 +689,7 @@ fn start_internal(
         .unwrap_or_default();
 
     let accept_join = thread::Builder::new()
-        .name("windsurf-api".into())
+        .name("superai-api".into())
         .spawn(move || {
             run_server(server, stop_flag_for_thread, api_key_owned, target_for_thread);
         })

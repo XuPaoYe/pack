@@ -1139,7 +1139,7 @@ function App() {
           ? {
               ...current,
               phase: "error",
-              error: `升级失败：${String(error)}`,
+              error: sanitizeUserFacingText(`升级失败：${String(error)}`),
             }
           : current,
       );
