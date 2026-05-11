@@ -25,21 +25,25 @@ jobs:
             tauri_target: aarch64-apple-darwin
             sidecar_target: darwin-arm64
             rust_targets: aarch64-apple-darwin
+            bundles: app,dmg
           - name: macOS x64 (Intel)
             os: macos-latest
             tauri_target: x86_64-apple-darwin
             sidecar_target: darwin-x64
             rust_targets: x86_64-apple-darwin
+            bundles: app,dmg
           - name: Windows x64 (Intel)
             os: windows-latest
             tauri_target: x86_64-pc-windows-msvc
             sidecar_target: windows-x64
             rust_targets: x86_64-pc-windows-msvc
+            bundles: nsis,msi
           - name: Windows arm64
             os: windows-latest
             tauri_target: aarch64-pc-windows-msvc
             sidecar_target: windows-arm64
             rust_targets: aarch64-pc-windows-msvc
+            bundles: nsis,msi
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -79,11 +83,19 @@ jobs:
       #   2. 自动从 windsurf.com / GitHub Release 拉对应平台的 LS 二进制
       #      → 写到 src-tauri/binaries/language_server-<triple>(.exe)
       # tauri build 之后会被 externalBin 自动 bundle 进 dmg/exe/msi。
+      # bun --compile 在 Windows runner 上下载交叉编译 runtime 偶发"download
+      # incomplete"，重试 3 次足够覆盖网络抖动。
       - name: Build sidecar binaries
         shell: bash
         env:
           TARGET: ${{ matrix.sidecar_target }}
-        run: bash scripts/build-sidecar.sh
+        run: |
+          for i in 1 2 3; do
+            if bash scripts/build-sidecar.sh; then exit 0; fi
+            echo "▶ build-sidecar.sh failed (attempt $i/3), retrying in 5s..."
+            sleep 5
+          done
+          exit 1
 
       - name: Tauri build & release
         uses: tauri-apps/tauri-action@v0
@@ -92,9 +104,11 @@ jobs:
           # public 构建：邮箱 / token 脱敏，UI 显示 SUPERAI-XXXXXXX。
           # 想发完全版改成不注入这一行，或者再加一个 release-full.yml。
           VITE_SUPERAI_PUBLIC_BUILD: "1"
-          # 有 updater 私钥时打开（仓库 secret 里塞这两个就行）：
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # updater 私钥：只有 secret 真的设了才注入；空字符串会被 tauri 当成
+          # 损坏密钥导致 "Missing comment in secret key" 报错。
+          # 想签 updater 时去仓库 secrets 里塞这两个值即可，无需改 yml。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Super AI ${{ github.ref_name }}"
@@ -108,4 +122,7 @@ jobs:
             - Windows arm64 NSIS installer + MSI
           releaseDraft: true
           prerelease: false
-          args: --target ${{ matrix.tauri_target }}
+          # --bundles 主动列出本平台需要的 bundle 类型，故意排除 updater
+          # bundle —— 没配 TAURI_SIGNING_PRIVATE_KEY 时 tauri 会因 createUpdaterArtifacts:true
+          # 强制要签名而失败。等到给仓库 secrets 配上私钥再把 updater 加回来。
+          args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
