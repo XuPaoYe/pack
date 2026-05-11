@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "tauri": "tauri",
     "dev": "node scripts/dev.mjs",
     "dev:full": "node scripts/dev.mjs full",
     "build": "node scripts/tauri-build.mjs app",

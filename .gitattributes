@@ -1,0 +1,18 @@
+# 强制所有文本文件用 LF 行尾，避免 Windows runner 默认 core.autocrlf=true
+# 把 vendor / 脚本里包含 \n 的多行锚点（如 scripts/scrub-vendor.mjs 里的
+# logger.js / auth.js anchor）在 checkout 时被改成 CRLF 导致字符串失配。
+* text=auto eol=lf
+
+# 二进制文件保持原样，不让 git 做行尾转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.dmg binary
+*.exe binary
+*.msi binary
+*.zip binary
+*.tar.gz binary
+*.tgz binary
