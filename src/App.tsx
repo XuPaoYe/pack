@@ -537,7 +537,10 @@ type ApiModelPref = {
 };
 
 function defaultPref(): ApiModelPref {
-  return { family: FALLBACK_FAMILY_KEY, effort: null };
+  // 用模型家族自身的 defaultEffort，避免首次打开配置时推理强度无高亮。
+  const fam = MODEL_FAMILIES.find((f) => f.key === FALLBACK_FAMILY_KEY);
+  const effort = fam && fam.efforts.length > 0 ? fam.defaultEffort ?? fam.efforts[0] : null;
+  return { family: FALLBACK_FAMILY_KEY, effort: effort ?? null };
 }
 
 const API_PREF_STORAGE_KEY = "super-ai:api-service-pref";
