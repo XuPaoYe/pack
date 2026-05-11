@@ -16,16 +16,21 @@ jobs:
   build:
     strategy:
       fail-fast: false
-      # 三个目标平台并行：mac universal 一个 dmg 覆盖 M+Intel；
+      # 四个目标平台并行：Mac 拆成 M 系列 (arm64) 与 Intel (x64) 两个独立 dmg；
       # Windows 用原生 windows-latest runner 出 nsis exe + msi，零交叉编译。
       matrix:
         include:
-          - name: macOS (universal)
+          - name: macOS arm64 (M series)
             os: macos-latest
-            tauri_target: universal-apple-darwin
-            sidecar_target: universal-apple-darwin
-            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
-          - name: Windows x64
+            tauri_target: aarch64-apple-darwin
+            sidecar_target: darwin-arm64
+            rust_targets: aarch64-apple-darwin
+          - name: macOS x64 (Intel)
+            os: macos-latest
+            tauri_target: x86_64-apple-darwin
+            sidecar_target: darwin-x64
+            rust_targets: x86_64-apple-darwin
+          - name: Windows x64 (Intel)
             os: windows-latest
             tauri_target: x86_64-pc-windows-msvc
             sidecar_target: windows-x64
@@ -97,7 +102,8 @@ jobs:
             See AGENTS.md / README for what's in this build.
 
             Artifacts:
-            - macOS universal dmg (M-series + Intel)
+            - macOS arm64 dmg (M-series)
+            - macOS x64 dmg (Intel)
             - Windows x64 NSIS installer + MSI
             - Windows arm64 NSIS installer + MSI
           releaseDraft: true
