@@ -102,7 +102,12 @@ jobs:
           done
           exit 1
 
-      - name: Tauri build & release
+      # 第一次尝试；continue-on-error 让它失败也不直接 fail job，留给下面的 retry。
+      # 典型 flake：macOS dmg 打包调 AppleScript/Finder 在无 GUI CI runner 上偶发挂
+      # （参考 tauri#3055）。重试一般秒过，因为 cargo 产物已缓存，只需重走 bundle 阶段。
+      - name: Tauri build & release (attempt 1)
+        id: tauri_build
+        continue-on-error: true
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -130,6 +135,23 @@ jobs:
           # --bundles 显式列出：dmg/nsis 给用户首次安装；updater 给老版本
           # 自动升级用（.app.tar.gz / .nsis.zip + .sig）。需要仓库 secrets 里
           # 已经配好 TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD。
+          args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
+
+      # 仅当第一次失败时触发；tauri-action 见 release 已存在会直接追加 artifact，
+      # cargo/rustc 产物沿用上轮缓存，实际只重跑 bundler（dmg/nsis）。
+      - name: Tauri build & release (retry)
+        if: steps.tauri_build.outcome == 'failure'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VITE_SUPERAI_PUBLIC_BUILD: "1"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Super AI ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
           args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
 
   # 4 个平台 build job 全部成功后，把 release 里的 latest.json 改写成 OSS-ready
