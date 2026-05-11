@@ -84,8 +84,8 @@ jobs:
         run: npm ci
 
       # build-sidecar.sh 会：
-      #   1. bun build --compile 把 vendor/windsurfapi 打成 superai-api-<triple>(.exe)
-      #   2. 自动从 windsurf.com / GitHub Release 拉对应平台的 LS 二进制
+      #   1. bun build --compile 把 vendor 子模块打成 superai-api-<triple>(.exe)
+      #   2. 自动从上游分发渠道拉对应平台的 runtime 二进制
       #      → 写到 src-tauri/binaries/language_server-<triple>(.exe)
       # tauri build 之后会被 externalBin 自动 bundle 进 dmg/exe/msi。
       # bun --compile 在 Windows runner 上下载交叉编译 runtime 偶发"download
@@ -131,3 +131,33 @@ jobs:
           # 自动升级用（.app.tar.gz / .nsis.zip + .sig）。需要仓库 secrets 里
           # 已经配好 TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD。
           args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
+
+  # 4 个平台 build job 全部成功后，把 release 里的 latest.json 改写成 OSS-ready
+  # 版本（URL 指向 ai.talentisan.cn/SuperAI/v{ver}/...）。用户只要把 release 里
+  # 的 latest.json 直接拷到 OSS 的 SuperAI/latest.json 就能用。
+  rewrite-latest-json:
+    name: Rewrite latest.json for OSS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Rewrite & re-upload latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 改这里就能切换发布域名（比如 OSS bucket 直链 / 其他 CDN）。
+          PUBLIC_BASE_URL: https://ai.talentisan.cn/SuperAI
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"        # 例如 v1.0.1
+          VERSION="${TAG#v}"              # 1.0.1
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern latest.json -O latest.json --clobber
+          node scripts/rewrite-updater-json.mjs latest.json "$VERSION" "$PUBLIC_BASE_URL"
+          echo "--- 改写后的 latest.json ---"
+          cat latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
