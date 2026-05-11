@@ -20,24 +20,27 @@ jobs:
       # Windows 用原生 windows-latest runner 出 nsis exe + msi，零交叉编译。
       matrix:
         include:
+          # Mac 只出 dmg；'app' bundle 会额外产 .app.tar.gz（updater 用的中间格式），
+          # 普通用户不需要，省去 release assets 噪音。
           - name: macOS arm64 (M series)
             os: macos-latest
             tauri_target: aarch64-apple-darwin
             sidecar_target: darwin-arm64
             rust_targets: aarch64-apple-darwin
-            bundles: app,dmg
+            bundles: dmg
           - name: macOS x64 (Intel)
             os: macos-latest
             tauri_target: x86_64-apple-darwin
             sidecar_target: darwin-x64
             rust_targets: x86_64-apple-darwin
-            bundles: app,dmg
+            bundles: dmg
+          # Win 只出 NSIS（setup.exe）；MSI 主要是企业 GPO 场景，先省略。
           - name: Windows x64 (Intel)
             os: windows-latest
             tauri_target: x86_64-pc-windows-msvc
             sidecar_target: windows-x64
             rust_targets: x86_64-pc-windows-msvc
-            bundles: nsis,msi
+            bundles: nsis
           # bun 1.2.x 不支持 windows-arm64 交叉编译，1.3.x cross-compile runtime 又损坏。
           # 用 windows-11-arm 原生 ARM64 runner，bun 直接当原生编译，零交叉问题。
           - name: Windows arm64
@@ -45,7 +48,7 @@ jobs:
             tauri_target: aarch64-pc-windows-msvc
             sidecar_target: windows-arm64
             rust_targets: aarch64-pc-windows-msvc
-            bundles: nsis,msi
+            bundles: nsis
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -120,8 +123,8 @@ jobs:
             Artifacts:
             - macOS arm64 dmg (M-series)
             - macOS x64 dmg (Intel)
-            - Windows x64 NSIS installer + MSI
-            - Windows arm64 NSIS installer + MSI
+            - Windows x64 NSIS installer (.exe)
+            - Windows arm64 NSIS installer (.exe)
           releaseDraft: true
           prerelease: false
           # --bundles 主动列出本平台需要的 bundle 类型，故意排除 updater
