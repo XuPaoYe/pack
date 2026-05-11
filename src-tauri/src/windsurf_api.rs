@@ -250,6 +250,7 @@ fn binary_filename(name: &str) -> String {
 ///   - 打包后 tauri 会把 externalBin **去掉 triple 后缀**放在主程序旁
 ///     （Mac 是 `Contents/MacOS/<name>`，Win 是 exe 同目录的 `<name>.exe`）。
 ///   - dev 模式（`tauri dev`）也会复制到 target/debug 旁，名字一样去后缀。
+///
 /// 找不到再退回仓库的 `src-tauri/binaries/<name>-<triple>`，方便 `cargo run`
 /// 这种不走 tauri-cli 的开发场景。
 fn resolve_bundled_binary(name: &str) -> Option<PathBuf> {
@@ -867,7 +868,16 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
         }
     }
 
-    let refresh = refresh_sidecar_account_capabilities(&client, &target);
+    // probe-all 只在账号池真正有增删时跑。前端每 15s 的 refresh_account 会
+    // 通过 schedule_windsurf_sync 调上来，若每次都触发 probe-all，sidecar 就会
+    // 对所有账号反复跑 GetUserStatus + Dynamic cloud probe，把 gemini canary
+    // 配额烧光也把日志刷爆。账号能力的"漂移"由 sidecar 自带的 6 小时定时
+    // re-probe 兜底，纯同步刷新不必参与。
+    let refresh = if add_count > 0 || removed > 0 {
+        refresh_sidecar_account_capabilities(&client, &target)
+    } else {
+        json!({"skipped": "no account changes"})
+    };
 
     Ok(json!({
         "added": add_count,
@@ -1108,7 +1118,11 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
         return;
     }
 
-    // 若是聊天接口且配置了默认模型，统一用默认值覆盖请求体 model。
+    // 设计选择：**SuperAI 是模型选择的唯一真相**。
+    // codex / cline / cursor 等客户端发到我们这里的 `model` 一律忽略，
+    // 强制改写成 SuperAI UI 当前选中的模型 + reasoning effort 后缀。
+    // 这样用户只需在 SuperAI 一处切模型，所有上层 UI 自动跟随，
+    // 不会出现"codex TUI 显示 A、实际打 B"或"两处不同步"的混乱。
     let mut forced_model: Option<String> = None;
     if !target.default_model.is_empty()
         && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/responses")

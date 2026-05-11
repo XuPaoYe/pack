@@ -2519,9 +2519,20 @@ textarea:focus {
 }
 
 .superai-api-actions {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
+  display: flex;
+  justify-content: center;
   gap: 8px;
+}
+
+.superai-api-actions .superai-api-toggle {
+  min-width: 160px;
+}
+
+.api-config-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
 }
 
 .superai-api-secondary {

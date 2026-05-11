@@ -31,6 +31,7 @@ import {
   Info,
   Power,
   RefreshCw,
+  RotateCcw,
   RotateCw,
   Rocket,
   ScrollText,
@@ -762,6 +763,14 @@ type CodexAppSetupResult = {
   modelId: string;
   backupPath: string | null;
   disabledUserKeys: number;
+  authBackupPath: string | null;
+  authNeutralized: boolean;
+};
+
+type CodexAppRestoreResult = {
+  steps: string[];
+  configRestoredFromBackup: boolean;
+  authRestoredFromBackup: boolean;
 };
 
 function ApiServiceCard({
@@ -771,8 +780,6 @@ function ApiServiceCard({
   onToggleService,
   onCopy,
   onOpenConfig,
-  onConfigureCodex,
-  configuringCodex,
 }: {
   status: ApiServiceStatus | null;
   busy: boolean;
@@ -780,8 +787,6 @@ function ApiServiceCard({
   onToggleService: () => void;
   onCopy: (text: string, label: string) => void;
   onOpenConfig: () => void;
-  onConfigureCodex: () => void;
-  configuringCodex: boolean;
 }) {
   const running = Boolean(status?.running);
   const address = status?.address ?? "—";
@@ -866,16 +871,6 @@ function ApiServiceCard({
             <Power size={14} />
             {running ? "停止服务" : "启动服务"}
           </button>
-          <button
-            type="button"
-            className="superai-api-secondary"
-            onClick={onConfigureCodex}
-            disabled={!running || configuringCodex}
-            title={running ? "把当前地址、密钥和模型写入 ~/.codex/" : "请先启动 API 服务"}
-          >
-            <CodexIcon size={14} />
-            {configuringCodex ? "配置中…" : "配置Codex"}
-          </button>
         </div>
 
         <p className="superai-api-hint">
@@ -894,12 +889,20 @@ function ApiServiceConfigPanel({
   pref,
   onChangeFamily,
   onChangeEffort,
+  onConfigureCodex,
+  onRestoreCodex,
+  configuringCodex,
+  restoringCodex,
 }: {
   running: boolean;
   models: ApiServiceModel[];
   pref: ApiModelPref;
   onChangeFamily: (family: string) => void;
   onChangeEffort: (effort: EffortKey) => void;
+  onConfigureCodex: () => void;
+  onRestoreCodex: () => void;
+  configuringCodex: boolean;
+  restoringCodex: boolean;
 }) {
   const families = modelFamiliesForBuild();
   const family = families.find((f) => f.key === pref.family) ?? families[0];
@@ -939,6 +942,35 @@ function ApiServiceConfigPanel({
             <span className="effort-segment placeholder">不支持</span>
           </div>
         )}
+      </section>
+
+      <section className="api-config-row">
+        <div className="api-config-copy">
+          <strong>Codex 配置</strong>
+          <p>把当前地址、密钥写入 ~/.codex/，或回滚到接管前的备份</p>
+        </div>
+        <div className="api-config-actions">
+          <button
+            type="button"
+            className="superai-api-secondary"
+            onClick={onConfigureCodex}
+            disabled={!running || configuringCodex || restoringCodex}
+            title={running ? "写入 / 同步 ~/.codex/config.toml + auth.json" : "请先启动 API 服务"}
+          >
+            <CodexIcon size={14} />
+            {configuringCodex ? "配置中…" : "配置 Codex"}
+          </button>
+          <button
+            type="button"
+            className="superai-api-secondary"
+            onClick={onRestoreCodex}
+            disabled={configuringCodex || restoringCodex}
+            title="从 .superai-bak 恢复，没有备份则尽量移除 SuperAI 痕迹"
+          >
+            <RotateCcw size={14} />
+            {restoringCodex ? "恢复中…" : "恢复 Codex"}
+          </button>
+        </div>
       </section>
 
     </div>
@@ -1080,6 +1112,7 @@ function App() {
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
   const [isConfiguringCodex, setIsConfiguringCodex] = useState(false);
+  const [isRestoringCodex, setIsRestoringCodex] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const accountListRef = useRef<HTMLDivElement | null>(null);
   const oauthPollTimers = useRef<Partial<Record<OAuthProvider, number>>>({});
@@ -2069,19 +2102,49 @@ function App() {
     setIsConfiguringCodex(true);
     try {
       const result = await invoke<CodexAppSetupResult>("configure_codex_app");
-      const suffix = result.disabledUserKeys > 0
-        ? `（已自动注释原有 ${result.disabledUserKeys} 行顶层配置，可在 ${result.configPath} 手动恢复）`
-        : "";
-      showNotice(
-        "success",
-        `Codex 已配置为通过 SuperAI 调用。请重启正在运行的 codex 进程后即可使用。${suffix}`,
-      );
+      const parts: string[] = [
+        "Codex 已切换到 SuperAI 通道，历史会话保留。请重启一次 codex 进程 / 桌面版生效。",
+        "之后在 SuperAI 切模型时，~/.codex/config.toml 自动同步，无需再点此按钮（codex 进程下次启动就会读到新模型）。",
+        "额度请在 SuperAI 中查看，官方 Codex 不再显示 ChatGPT 额度。",
+      ];
+      if (result.authNeutralized && result.authBackupPath) {
+        parts.push(`原 ChatGPT 登录已备份到 ${result.authBackupPath}，需要时可手动恢复。`);
+      }
+      if (result.disabledUserKeys > 0) {
+        parts.push(
+          `已自动注释原有 ${result.disabledUserKeys} 行顶层配置，可在 ${result.configPath} 手动恢复。`,
+        );
+      }
+      showNotice("success", parts.join(" "));
     } catch (error) {
       showNotice("error", `配置 Codex 失败：${String(error)}`);
     } finally {
       setIsConfiguringCodex(false);
     }
   }, [apiService?.running, showNotice]);
+
+  const restoreCodexApp = useCallback(async () => {
+    if (!isTauri()) {
+      showNotice("error", "仅在 SuperAI 桌面应用中可用");
+      return;
+    }
+    setIsRestoringCodex(true);
+    try {
+      const result = await invoke<CodexAppRestoreResult>("restore_codex_app");
+      const restored: string[] = [];
+      if (result.configRestoredFromBackup) restored.push("config.toml");
+      if (result.authRestoredFromBackup) restored.push("auth.json");
+      const headline = restored.length > 0
+        ? `已从备份恢复：${restored.join(" / ")}。请重启 codex 进程 / 桌面版生效。`
+        : "未发现备份文件，已尽量移除 SuperAI 痕迹。请重启 codex 生效。";
+      const detail = (result.steps ?? []).filter(Boolean).join(" ");
+      showNotice("success", detail ? `${headline} ${detail}` : headline);
+    } catch (error) {
+      showNotice("error", `恢复 Codex 配置失败：${String(error)}`);
+    } finally {
+      setIsRestoringCodex(false);
+    }
+  }, [showNotice]);
 
   const copyApiServiceText = useCallback(
     async (text: string, label: string) => {
@@ -2225,8 +2288,6 @@ function App() {
                       onToggleService={() => void toggleApiService()}
                       onCopy={(text, label) => void copyApiServiceText(text, label)}
                       onOpenConfig={() => setIsApiConfigOpen(true)}
-                      onConfigureCodex={() => void configureCodexApp()}
-                      configuringCodex={isConfiguringCodex}
                     />
                   )}
                   {filteredAccounts.length === 0 && activeProvider !== PROVIDER_WSF && (
@@ -2528,6 +2589,10 @@ function App() {
             pref={apiPref}
             onChangeFamily={handleChangeFamily}
             onChangeEffort={handleChangeEffort}
+            onConfigureCodex={() => void configureCodexApp()}
+            onRestoreCodex={() => void restoreCodexApp()}
+            configuringCodex={isConfiguringCodex}
+            restoringCodex={isRestoringCodex}
           />
         </AppModal>
       )}

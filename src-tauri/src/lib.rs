@@ -5825,6 +5825,12 @@ fn set_api_service_default_model(
     write_settings_record(&app, &settings)?;
     // 在跑就立刻热更，不在跑只持久化等下次启动。
     let _ = windsurf_api::update_default_model(&settings.api_service_default_model);
+    // 顺手把 ~/.codex/config.toml managed block 的 model 行原地改写，
+    // 这样 codex 重启后 TUI 顶部 `model:` 跟 SuperAI UI 一致。
+    // 用户没点过"配置Codex"时该函数返回 false，不会擅自创建文件。
+    if let Err(error) = rewrite_managed_model_line(&settings.api_service_default_model) {
+        eprintln!("[SuperAI] 改写 codex config.toml model 行失败: {error}");
+    }
     Ok(())
 }
 
@@ -5928,6 +5934,11 @@ struct CodexAppSetupResult {
     backup_path: Option<String>,
     /// 用户原有的顶层 key 被注释了几行（便于在 UI 提示是否动到了用户配置）。
     disabled_user_keys: usize,
+    /// 若动到了 `~/.codex/auth.json`，这里是原文件的备份路径。
+    auth_backup_path: Option<String>,
+    /// 为 true 表示我们把 auth.json 的 ChatGPT tokens 清空了（只保留 API key 模式），
+    /// 这样官方 Codex 客户端不会再显示 ChatGPT 额度，引导用户到 SuperAI 查看。
+    auth_neutralized: bool,
 }
 
 /// 删除已有的 SuperAI managed block（如果存在）。保留前后用户内容原样。
@@ -6023,27 +6034,168 @@ fn escape_toml_basic_string(s: &str) -> String {
     out
 }
 
+/// 写入 codex `~/.codex/config.toml` 的 SuperAI managed block。
+///
+/// 设计：
+/// - `model` 字段直接用 SuperAI UI 当前选中的真实模型名（如 `claude-opus-4.7-medium`）。
+///   这样 codex TUI 顶部那行 `model:` 跟 SuperAI UI 一致，不再误导。
+/// - SuperAI 切模型时，前端调 `set_api_service_default_model`，后端会顺手
+///   `rewrite_managed_model_line()` 把这行原地改掉，下次 codex 重启就显示新模型；
+///   codex 进程没重启时，proxy 内存里 default_model 也已热更，请求立即生效。
+/// - 用真实模型名 + proxy 不改写（请求/响应一致）→ codex CLI 不会触发
+///   cyber-safety 误报；只剩一条 `Model metadata not found` cosmetic 提示，
+///   ylsagi 等所有 custom provider 都有，无解。
 fn build_superai_managed_block(base_url: &str, model_id: &str, api_key: &str) -> String {
     let url = escape_toml_basic_string(base_url);
     let model = escape_toml_basic_string(model_id);
-    let bearer = format!("Bearer {api_key}");
-    let bearer_escaped = escape_toml_basic_string(&bearer);
+    let bearer = escape_toml_basic_string(&format!("Bearer {api_key}"));
+    // 鉴权直接走 `experimental_bearer_token`：
+    //   - codex-rs 在 `bearer_auth_for_provider` 里会优先用它，
+    //     避免去查 env_key / auth.json，启动不再依赖 OPENAI_API_KEY 环境变量。
+    //   - 不设 `env_key` / `requires_openai_auth`，因为这两项只对内置
+    //     `openai` provider 有效；自定义 provider 设了 `env_key` 会强制
+    //     从环境变量读 API key，读不到就报 `Missing environment variable`。
+    //   - 同时在 `http_headers.Authorization` 里再写一份 Bearer 作为兜底，
+    //     旧版本 codex 不认 `experimental_bearer_token` 时也能跑。
     format!(
         "{begin}\n\
 model_provider = \"superai\"\n\
 model = \"{model}\"\n\
+model_context_window = 200000\n\
+model_max_output_tokens = 32768\n\
+disable_response_storage = true\n\
 \n\
 [model_providers.superai]\n\
 name = \"SuperAI\"\n\
 base_url = \"{url}\"\n\
-wire_api = \"chat\"\n\
-requires_openai_auth = false\n\
-http_headers = {{ Authorization = \"{bearer}\" }}\n\
+wire_api = \"responses\"\n\
+experimental_bearer_token = \"{api_key_escaped}\"\n\
+\n\
+[model_providers.superai.http_headers]\n\
+Authorization = \"{bearer}\"\n\
 {end}\n",
         begin = SUPERAI_TOML_BEGIN,
         end = SUPERAI_TOML_END,
-        bearer = bearer_escaped,
+        api_key_escaped = escape_toml_basic_string(api_key),
     )
+}
+
+/// 当 SuperAI UI 切换模型时调用：原地把 managed block 里的
+/// `model = "..."` 那一行改成新模型名。
+///
+/// - 文件不存在 / 没 SuperAI managed 标记 / 没找到 model 行 → 一律不动文件，返回 false。
+///   说明用户还没点"配置 Codex"，不该擅自创建文件。
+/// - 改动成功返回 true。
+///
+/// 比直接重新生成整个 managed block 更安全：保留用户在 block 之外的自定义内容、
+/// 也不会重复处理 disabled keys 的注释。
+fn rewrite_managed_model_line(model_id: &str) -> Result<bool, String> {
+    let codex_home = match codex_home_dir() {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+    let config_path = codex_home.join("config.toml");
+    if !config_path.exists() {
+        return Ok(false);
+    }
+    let existing = read_to_string(&config_path)?;
+    let Some(begin) = existing.find(SUPERAI_TOML_BEGIN) else {
+        return Ok(false);
+    };
+    let Some(end_rel) = existing[begin..].find(SUPERAI_TOML_END) else {
+        return Ok(false);
+    };
+    let block_end = begin + end_rel + SUPERAI_TOML_END.len();
+
+    let head = &existing[..begin];
+    let block = &existing[begin..block_end];
+    let tail = &existing[block_end..];
+
+    let escaped = escape_toml_basic_string(model_id);
+    let mut new_lines: Vec<String> = Vec::with_capacity(block.lines().count());
+    let mut replaced = false;
+    for line in block.lines() {
+        let trimmed = line.trim_start();
+        if !replaced && trimmed.starts_with("model = \"") {
+            new_lines.push(format!("model = \"{escaped}\""));
+            replaced = true;
+        } else {
+            new_lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        return Ok(false);
+    }
+    let new_block = new_lines.join("\n");
+
+    let mut next = String::with_capacity(existing.len() + 32);
+    next.push_str(head);
+    next.push_str(&new_block);
+    next.push_str(tail);
+
+    if next == existing {
+        return Ok(false);
+    }
+
+    write_string_atomic(&config_path, &next)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(true)
+}
+
+/// 把 `~/.codex/auth.json` 里的 ChatGPT tokens 清掉，只保留我们的 API key，
+/// 这样官方 Codex CLI / 桌面版不会再拿 ChatGPT access_token 发请求，
+/// 也不会再从 ChatGPT 账号拉"已用额度 / 订阅套餐"面板。
+///
+/// 原文件做一次性备份到 `auth.json.superai-bak`（若已存在则跳过，保留最早那份）。
+/// 返回 (backup_path, neutralized)。neutralized=true 表示真的写了新内容。
+fn neutralize_codex_auth_json(
+    codex_home: &Path,
+    api_key: &str,
+) -> Result<(Option<String>, bool), String> {
+    let auth_path = codex_home.join("auth.json");
+    let backup_path_buf = codex_home.join("auth.json.superai-bak");
+
+    // 1) 一次性备份原文件。
+    let backup_path = if auth_path.exists() && !backup_path_buf.exists() {
+        fs::copy(&auth_path, &backup_path_buf)
+            .map_err(|error| format!("备份 {} 失败: {error}", auth_path.display()))?;
+        Some(backup_path_buf.display().to_string())
+    } else if backup_path_buf.exists() {
+        Some(backup_path_buf.display().to_string())
+    } else {
+        None
+    };
+
+    // 2) 判断是否需要改写：若已经是 "仅 API key + tokens=null" 的 SuperAI 形态，就不重复写。
+    let desired = serde_json::json!({
+        "OPENAI_API_KEY": api_key,
+        "tokens": serde_json::Value::Null,
+        "last_refresh": serde_json::Value::Null,
+    });
+    if auth_path.exists() {
+        if let Ok(existing) = fs::read_to_string(&auth_path) {
+            if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing) {
+                if existing_json == desired {
+                    return Ok((backup_path, false));
+                }
+            }
+        }
+    }
+
+    // 3) 原子写入 + 600 权限。
+    let payload = serde_json::to_string_pretty(&desired)
+        .map_err(|error| format!("序列化 auth.json 失败: {error}"))?;
+    write_string_atomic(&auth_path, &payload)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600));
+    }
+    Ok((backup_path, true))
 }
 
 #[tauri::command]
@@ -6104,9 +6256,19 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
         None
     };
 
-    // 把用户已有的顶层 model_provider / model 注释掉，避免与 managed block 重复定义。
-    let (user_body, disabled_user_keys) =
-        comment_out_top_level_keys(&stripped, &["model_provider", "model"]);
+    // 把用户已有的顶层 model_provider / model / preferred_auth_method 注释掉，
+    // 避免与 managed block 重复定义（TOML 重复 key 会解析失败）。
+    let (user_body, disabled_user_keys) = comment_out_top_level_keys(
+        &stripped,
+        &[
+            "model_provider",
+            "model",
+            "preferred_auth_method",
+            "model_context_window",
+            "model_max_output_tokens",
+            "disable_response_storage",
+        ],
+    );
 
     // managed block 放最前面：顶层 key 在 TOML 里必须先于任何 [section] 出现。
     let managed = build_superai_managed_block(&base_url, &model_id, &api_key);
@@ -6128,12 +6290,126 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
         let _ = fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600));
     }
 
+    // 中和 auth.json：清掉 ChatGPT tokens，只保留 API key 模式，
+    // 让官方 Codex 不再展示 ChatGPT 额度，也不再拿 ChatGPT access_token 发请求。
+    let (auth_backup_path, auth_neutralized) = neutralize_codex_auth_json(&codex_home, &api_key)?;
+
     Ok(CodexAppSetupResult {
         config_path: config_path.display().to_string(),
         base_url,
         model_id,
         backup_path,
         disabled_user_keys,
+        auth_backup_path,
+        auth_neutralized,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexAppRestoreResult {
+    /// 实际生效的恢复动作，给前端展示用。
+    pub steps: Vec<String>,
+    /// 哪些备份文件被使用 / 找到。
+    pub config_restored_from_backup: bool,
+    pub auth_restored_from_backup: bool,
+}
+
+/// 把 `# disabled by SuperAI: <line>` 这样被我们注释掉的顶层 keys 取消注释。
+fn uncomment_superai_disabled_lines(content: &str) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix(SUPERAI_DISABLED_PREFIX) {
+            out.push(rest.to_string());
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    let mut new_content = out.join("\n");
+    if content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    new_content
+}
+
+/// 把 `~/.codex` 还原成 SuperAI 接管之前的样子。
+///
+/// 优先级：
+/// 1. 若有 `.superai-bak` 备份 → 直接 cp 回原文件（最忠实）
+/// 2. 没备份但 SuperAI managed block 在 → 移除 block + 还原"被注释的顶层 keys"
+///    （`# disabled by SuperAI: model = "..."` → `model = "..."`），让用户原配置生效
+/// 3. 没 managed block 也没 .superai-bak → no-op（用户可能从未点过配置 Codex）
+///
+/// auth.json 同理，但只支持"有备份就恢复，没备份就跳过"，因为我们写的
+/// `{ OPENAI_API_KEY, tokens=null }` 没法机械还原成 ChatGPT 登录态。
+#[tauri::command]
+fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, String> {
+    let codex_home = codex_home_dir()?;
+    let config_path = codex_home.join("config.toml");
+    let auth_path = codex_home.join("auth.json");
+    let config_bak = codex_home.join("config.toml.superai-bak");
+    let auth_bak = codex_home.join("auth.json.superai-bak");
+
+    let mut steps: Vec<String> = Vec::new();
+    let mut config_restored_from_backup = false;
+    let mut auth_restored_from_backup = false;
+
+    // ---- config.toml ----
+    if config_bak.exists() {
+        fs::copy(&config_bak, &config_path)
+            .map_err(|error| format!("恢复 config.toml 失败: {error}"))?;
+        steps.push(format!(
+            "已用 {} 覆盖回 {}",
+            config_bak.display(),
+            config_path.display(),
+        ));
+        config_restored_from_backup = true;
+    } else if config_path.exists() {
+        let existing = read_to_string(&config_path)?;
+        let stripped = strip_superai_managed_block(&existing);
+        let restored = uncomment_superai_disabled_lines(&stripped);
+        if restored != existing {
+            write_string_atomic(&config_path, &restored)?;
+            steps.push(format!(
+                "未找到 config.toml.superai-bak，已就地移除 managed block 并恢复被注释的 keys（{}）",
+                config_path.display(),
+            ));
+        } else {
+            steps.push(format!(
+                "config.toml 中无 SuperAI 痕迹，跳过（{}）",
+                config_path.display(),
+            ));
+        }
+    } else {
+        steps.push("没有 ~/.codex/config.toml，无需恢复".to_string());
+    }
+
+    // ---- auth.json ----
+    if auth_bak.exists() {
+        fs::copy(&auth_bak, &auth_path)
+            .map_err(|error| format!("恢复 auth.json 失败: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&auth_path, fs::Permissions::from_mode(0o600));
+        }
+        steps.push(format!(
+            "已用 {} 覆盖回 {}",
+            auth_bak.display(),
+            auth_path.display(),
+        ));
+        auth_restored_from_backup = true;
+    } else {
+        steps.push(
+            "未找到 auth.json.superai-bak（首次配置前可能无 ChatGPT 登录态），跳过 auth.json"
+                .to_string(),
+        );
+    }
+
+    Ok(CodexAppRestoreResult {
+        steps,
+        config_restored_from_backup,
+        auth_restored_from_backup,
     })
 }
 
@@ -6196,6 +6472,7 @@ pub fn run() {
             list_api_service_models,
             set_api_service_default_model,
             configure_codex_app,
+            restore_codex_app,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
