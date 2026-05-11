@@ -6029,7 +6029,17 @@ fn build_superai_managed_block(base_url: &str, model_id: &str, api_key: &str) ->
     let bearer = format!("Bearer {api_key}");
     let bearer_escaped = escape_toml_basic_string(&bearer);
     format!(
-        "{begin}\nmodel_provider = \"superai\"\nmodel = \"{model}\"\n\n[model_providers.superai]\nname = \"SuperAI\"\nbase_url = \"{url}\"\nwire_api = \"responses\"\nhttp_headers = {{ Authorization = \"{bearer}\" }}\n{end}\n",
+        "{begin}\n\
+model_provider = \"superai\"\n\
+model = \"{model}\"\n\
+\n\
+[model_providers.superai]\n\
+name = \"SuperAI\"\n\
+base_url = \"{url}\"\n\
+wire_api = \"chat\"\n\
+requires_openai_auth = false\n\
+http_headers = {{ Authorization = \"{bearer}\" }}\n\
+{end}\n",
         begin = SUPERAI_TOML_BEGIN,
         end = SUPERAI_TOML_END,
         bearer = bearer_escaped,
