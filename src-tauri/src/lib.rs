@@ -5391,18 +5391,38 @@ fn apply_system_auto_launch(app: &tauri::AppHandle, enabled: bool) -> Result<(),
     #[cfg(desktop)]
     {
         let manager = app.autolaunch();
+
+        // 先检查当前状态：如果已经是目标状态，直接跳过 enable/disable，避免触发
+        // Windows 平台 disable() 在注册表项不存在时抛 ERROR_FILE_NOT_FOUND (os
+        // error 2) 这种"看似失败实际目标已达成"的情况。
+        if let Ok(current) = manager.is_enabled() {
+            if current == enabled {
+                return Ok(());
+            }
+        }
+
         let result = if enabled {
             manager.enable()
         } else {
             manager.disable()
         };
-        result.map_err(|error| {
-            if enabled {
-                format!("启用系统开机自启失败: {error}")
-            } else {
-                format!("关闭系统开机自启失败: {error}")
+
+        // enable/disable 返回错误时，仍然查一下实际状态：可能底层只是"项不存在"
+        // 之类的良性错误，状态已经正确就当成功。
+        match result {
+            Ok(_) => {}
+            Err(error) => {
+                let actual = manager.is_enabled().unwrap_or(!enabled);
+                if actual != enabled {
+                    return Err(if enabled {
+                        format!("启用系统开机自启失败: {error}")
+                    } else {
+                        format!("关闭系统开机自启失败: {error}")
+                    });
+                }
             }
-        })?;
+        }
+
         let actual = manager
             .is_enabled()
             .map_err(|error| format!("校验系统开机自启状态失败: {error}"))?;
