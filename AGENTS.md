@@ -130,6 +130,22 @@ Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authoriz
 - 双层鉴权：外层 `agt_wsf_*` 由我们校验，内层 sidecar 用我们生成的随机 inner key（不持久化）。
 - 账号同步：`sync_superai_accounts_to_api` 命令把 DB 里的 Windsurf 账号映射成 `{refresh_token | api_key | token, label}` POST 到 sidecar `/auth/login`。`upsert_accounts_into_db` 写库后会在 API 服务运行时自动触发同步。
 
+## 公开仓库 / CI 可见性（永久执行）
+
+> 仓库一旦公开（或 GitHub Actions 日志公开），下面这些位置任何人都能看到。**不允许出现 `Windsurf` / `windsurf.com` / `windsurfapi` / `WindsurfAPI` 等字面量**：
+>
+> 1. `.github/workflows/*.yml` 文件本体 + 其中所有注释 / step name / echo / if-表达式。
+> 2. CI 步骤 stdout / stderr：包括 `npm run build:sidecar` 链路里的 `scripts/scrub-vendor.mjs`、`scripts/build-sidecar.sh` 成功路径的所有 `echo` / `console.log`。
+> 3. commit message、PR title / body、release notes、issue / discussion 文本。
+> 4. release artifacts 文件名（`Super_AI_*.dmg` / `*.exe` / `*.msi` / `latest.json`）以及 `tauri-action` 自动生成的 release body。
+>
+> **允许保留**（不在公开 CI 日志里高频出现，且属于操作必需）：
+>
+> - `scripts/build-sidecar.sh` 里 `/Applications/Windsurf.app/...` 候选路径、`WINDSURF_LS_*_PATH` 环境变量名、上游 GitHub Release URL（`dwgx/WindsurfAPI` 等）。这些只在**找不到 LS 二进制的失败分支**才 echo，CI 正常构建路径不会输出。新增的 echo 走 success path 时务必避开这些字符串。
+> - `vendor/windsurfapi/` 目录名（仓库源码里）。改名要同步动 `scrub-vendor.mjs` / `build-sidecar.sh` / `.gitignore` 多处。优先级低，可后续统一迁。
+>
+> **新增 workflow / 脚本前自检**：把改动 grep 一遍 `Windsurf` / `windsurf` / `WINDSURFAPI`，落到上述 1-4 条任一项就要换措辞（中性的"vendor 子模块" / "上游分发渠道" / "runtime 二进制" 都行）。
+
 ## 品牌脱敏规则（永久执行）
 
 > **必须遵守**：所有用户可见 / 可观察的位置，凡是出现 `Windsurf` 都改成 `SuperAI`。任何新增代码、UI 文本、CSS 类名、IPC 命令名、emit 事件名、日志字符串都直接用 SuperAI / superai。Vendor 升级后跑 `npm run build:sidecar` 会自动经 `scripts/scrub-vendor.mjs` 完成同样替换。

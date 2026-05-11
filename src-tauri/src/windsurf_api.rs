@@ -246,15 +246,26 @@ fn binary_filename(name: &str) -> String {
     format!("{name}-{triple}{suffix}")
 }
 
-/// 解析 sidecar / LS 二进制路径。优先 exe 同目录（Tauri externalBin 在 dev 与
-/// 打包中都会把它们放这里），找不到再尝试仓库的 `src-tauri/binaries/`，方便
-/// `cargo run` 这种不走 tauri-cli 的开发场景。
+/// 解析 sidecar / LS 二进制路径。优先 exe 同目录：
+///   - 打包后 tauri 会把 externalBin **去掉 triple 后缀**放在主程序旁
+///     （Mac 是 `Contents/MacOS/<name>`，Win 是 exe 同目录的 `<name>.exe`）。
+///   - dev 模式（`tauri dev`）也会复制到 target/debug 旁，名字一样去后缀。
+/// 找不到再退回仓库的 `src-tauri/binaries/<name>-<triple>`，方便 `cargo run`
+/// 这种不走 tauri-cli 的开发场景。
 fn resolve_bundled_binary(name: &str) -> Option<PathBuf> {
-    let filename = binary_filename(name);
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let bundled_name = format!("{name}{suffix}");
+    let triple_name = binary_filename(name);
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            let candidate = parent.join(&filename);
+            // 打包 / tauri dev：去掉 triple 后的二进制
+            let candidate = parent.join(&bundled_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            // 兜底：旧版 / 某些平台 tauri 行为变化时仍可能保留 triple
+            let candidate = parent.join(&triple_name);
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -265,9 +276,10 @@ fn resolve_bundled_binary(name: &str) -> Option<PathBuf> {
                     return Some(universal);
                 }
             }
-            // 源码仓库 fallback：从 target/debug 往上找到有 src-tauri/binaries 的目录
+            // 源码仓库 fallback：cargo run 这种不走 tauri-cli 的场景，binaries/
+            // 目录里仍然是 triple-suffixed 名字。
             for ancestor in parent.ancestors() {
-                let dev = ancestor.join("src-tauri/binaries").join(&filename);
+                let dev = ancestor.join("src-tauri/binaries").join(&triple_name);
                 if dev.is_file() {
                     return Some(dev);
                 }

@@ -38,7 +38,7 @@ const SRC_DIR = join(repoRoot, "vendor", "windsurfapi");
 const OUT_DIR = join(repoRoot, ".vendor-build", "windsurfapi");
 
 if (!statSync(SRC_DIR, { throwIfNoEntry: false })?.isDirectory()) {
-  console.error(`[scrub-vendor] missing source: ${SRC_DIR}`);
+  console.error(`[scrub-vendor] missing vendor source directory`);
   process.exit(1);
 }
 
@@ -200,4 +200,4 @@ const authPath = join(OUT_DIR, "src", "auth.js");
   writeFileSync(authPath, next);
 }
 
-console.log(`[scrub-vendor] ${OUT_DIR} ready (rewrote ${changed} files)`);
+console.log(`[scrub-vendor] vendor ready (rewrote ${changed} files)`);
