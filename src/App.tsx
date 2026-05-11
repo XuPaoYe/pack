@@ -756,6 +756,14 @@ function EffortSegments({
   );
 }
 
+type CodexAppSetupResult = {
+  configPath: string;
+  baseUrl: string;
+  modelId: string;
+  backupPath: string | null;
+  disabledUserKeys: number;
+};
+
 function ApiServiceCard({
   status,
   busy,
@@ -763,6 +771,8 @@ function ApiServiceCard({
   onToggleService,
   onCopy,
   onOpenConfig,
+  onConfigureCodex,
+  configuringCodex,
 }: {
   status: ApiServiceStatus | null;
   busy: boolean;
@@ -770,6 +780,8 @@ function ApiServiceCard({
   onToggleService: () => void;
   onCopy: (text: string, label: string) => void;
   onOpenConfig: () => void;
+  onConfigureCodex: () => void;
+  configuringCodex: boolean;
 }) {
   const running = Boolean(status?.running);
   const address = status?.address ?? "—";
@@ -844,15 +856,27 @@ function ApiServiceCard({
       )}
 
       <div className="superai-api-footer">
-        <button
-          type="button"
-          className={clsx("superai-api-toggle", running ? "off" : "on")}
-          onClick={onToggleService}
-          disabled={busy}
-        >
-          <Power size={14} />
-          {running ? "停止服务" : "启动服务"}
-        </button>
+        <div className="superai-api-actions">
+          <button
+            type="button"
+            className={clsx("superai-api-toggle", running ? "off" : "on")}
+            onClick={onToggleService}
+            disabled={busy}
+          >
+            <Power size={14} />
+            {running ? "停止服务" : "启动服务"}
+          </button>
+          <button
+            type="button"
+            className="superai-api-secondary"
+            onClick={onConfigureCodex}
+            disabled={!running || configuringCodex}
+            title={running ? "把当前地址、密钥和模型写入 ~/.codex/" : "请先启动 API 服务"}
+          >
+            <CodexIcon size={14} />
+            {configuringCodex ? "配置中…" : "配置Codex"}
+          </button>
+        </div>
 
         <p className="superai-api-hint">
           {running
@@ -1055,6 +1079,7 @@ function App() {
   });
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
+  const [isConfiguringCodex, setIsConfiguringCodex] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const accountListRef = useRef<HTMLDivElement | null>(null);
   const oauthPollTimers = useRef<Partial<Record<OAuthProvider, number>>>({});
@@ -2032,6 +2057,32 @@ function App() {
     invoke("set_api_service_default_model", { model: modelId }).catch(() => undefined);
   }, [apiService?.running, apiPref]);
 
+  const configureCodexApp = useCallback(async () => {
+    if (!isTauri()) {
+      showNotice("error", "仅在 SuperAI 桌面应用中可用");
+      return;
+    }
+    if (!apiService?.running) {
+      showNotice("error", "请先启动 API 服务");
+      return;
+    }
+    setIsConfiguringCodex(true);
+    try {
+      const result = await invoke<CodexAppSetupResult>("configure_codex_app");
+      const suffix = result.disabledUserKeys > 0
+        ? `（已自动注释原有 ${result.disabledUserKeys} 行顶层配置，可在 ${result.configPath} 手动恢复）`
+        : "";
+      showNotice(
+        "success",
+        `Codex 已配置为通过 SuperAI 调用。请重启正在运行的 codex 进程后即可使用。${suffix}`,
+      );
+    } catch (error) {
+      showNotice("error", `配置 Codex 失败：${String(error)}`);
+    } finally {
+      setIsConfiguringCodex(false);
+    }
+  }, [apiService?.running, showNotice]);
+
   const copyApiServiceText = useCallback(
     async (text: string, label: string) => {
       if (!text) return;
@@ -2174,6 +2225,8 @@ function App() {
                       onToggleService={() => void toggleApiService()}
                       onCopy={(text, label) => void copyApiServiceText(text, label)}
                       onOpenConfig={() => setIsApiConfigOpen(true)}
+                      onConfigureCodex={() => void configureCodexApp()}
+                      configuringCodex={isConfiguringCodex}
                     />
                   )}
                   {filteredAccounts.length === 0 && activeProvider !== PROVIDER_WSF && (

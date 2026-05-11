@@ -5900,6 +5900,233 @@ async fn stop_api_service(
         .map_err(|error| format!("停止 API 服务任务失败: {error}"))?
 }
 
+// ---------- 一键配置 Codex App ----------
+//
+// 直接改写 `~/.codex/config.toml`：在文件最前面写一个 SuperAI managed block，
+// 内含：
+//   - 顶层 `model_provider = "superai"` / `model = "<选中的模型>"`
+//   - `[model_providers.superai]` 段，把 base_url、wire_api 写好，并通过
+//     `http_headers.Authorization = "Bearer <key>"` 把鉴权一并写进配置文件，
+//     避免依赖环境变量。
+//
+// 用户原有的顶层 `model_provider` / `model` 行会被**注释**为
+// `# disabled by SuperAI: ...`，保留可回滚（用户手动去掉注释就恢复原状）。
+// 其它一切（其它 provider 段、profile 段、unrelated 配置）一律不动。
+//
+// 首次写入前会备份原 `config.toml` 到 `config.toml.superai-bak`，永久保留。
+
+const SUPERAI_TOML_BEGIN: &str = "# >>> SuperAI managed block (auto-generated, do not edit) >>>";
+const SUPERAI_TOML_END: &str = "# <<< SuperAI managed block <<<";
+const SUPERAI_DISABLED_PREFIX: &str = "# disabled by SuperAI: ";
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexAppSetupResult {
+    config_path: String,
+    base_url: String,
+    model_id: String,
+    backup_path: Option<String>,
+    /// 用户原有的顶层 key 被注释了几行（便于在 UI 提示是否动到了用户配置）。
+    disabled_user_keys: usize,
+}
+
+/// 删除已有的 SuperAI managed block（如果存在）。保留前后用户内容原样。
+fn strip_superai_managed_block(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let begin = match content.find(SUPERAI_TOML_BEGIN) {
+        Some(i) => i,
+        None => return content.to_string(),
+    };
+    let end = match content[begin..].find(SUPERAI_TOML_END) {
+        Some(rel) => begin + rel,
+        None => return content.to_string(),
+    };
+    let after_end = match content[end..].find('\n') {
+        Some(rel) => end + rel + 1,
+        None => content.len(),
+    };
+    let mut start = begin;
+    if start > 0 && bytes[start - 1] == b'\n' {
+        start -= 1;
+    }
+    let mut out = String::with_capacity(content.len());
+    out.push_str(&content[..start]);
+    out.push_str(&content[after_end..]);
+    out
+}
+
+fn has_external_superai_provider_section(stripped: &str) -> bool {
+    stripped.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed == "[model_providers.superai]" || trimmed == "[ model_providers.superai ]"
+    })
+}
+
+/// 判断一行是不是顶层 `<key> =` 或 `<key>=` 形式的赋值。
+fn is_top_level_assignment_for(line: &str, key: &str) -> bool {
+    let trimmed = line.trim_start();
+    let rest = match trimmed.strip_prefix(key) {
+        Some(r) => r,
+        None => return false,
+    };
+    let next = rest.chars().next();
+    matches!(next, Some(c) if c == '=' || c.is_whitespace())
+}
+
+/// 把内容里出现在**顶层**（即不在任何 `[section]` 内）的某些 key 注释掉。
+/// 已注释或已是我们的"disabled by SuperAI"行不会重复处理。
+/// 返回 (新内容, 被注释行数)。
+fn comment_out_top_level_keys(content: &str, keys: &[&str]) -> (String, usize) {
+    let mut out_lines: Vec<String> = Vec::with_capacity(content.lines().count());
+    let mut in_top_level = true;
+    let mut disabled_count = 0usize;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // 进入/离开 section 头。
+        if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
+            in_top_level = false;
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if in_top_level
+            && !trimmed.starts_with('#')
+            && keys.iter().any(|k| is_top_level_assignment_for(line, k))
+        {
+            out_lines.push(format!("{SUPERAI_DISABLED_PREFIX}{line}"));
+            disabled_count += 1;
+        } else {
+            out_lines.push(line.to_string());
+        }
+    }
+    let mut new_content = out_lines.join("\n");
+    if content.ends_with('\n') {
+        new_content.push('\n');
+    }
+    (new_content, disabled_count)
+}
+
+/// 转义 TOML basic string 里的字符。我们的 API key 是 `agt_wsf_<hex>`，
+/// 实际只会落在 ASCII 安全集合里，但兜底处理一下双引号 / 反斜杠 / 控制符。
+fn escape_toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn build_superai_managed_block(base_url: &str, model_id: &str, api_key: &str) -> String {
+    let url = escape_toml_basic_string(base_url);
+    let model = escape_toml_basic_string(model_id);
+    let bearer = format!("Bearer {api_key}");
+    let bearer_escaped = escape_toml_basic_string(&bearer);
+    format!(
+        "{begin}\nmodel_provider = \"superai\"\nmodel = \"{model}\"\n\n[model_providers.superai]\nname = \"SuperAI\"\nbase_url = \"{url}\"\nwire_api = \"responses\"\nhttp_headers = {{ Authorization = \"{bearer}\" }}\n{end}\n",
+        begin = SUPERAI_TOML_BEGIN,
+        end = SUPERAI_TOML_END,
+        bearer = bearer_escaped,
+    )
+}
+
+#[tauri::command]
+fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, String> {
+    let mut settings = read_settings_record(&app)?;
+    ensure_api_service_key(&app, &mut settings)?;
+    let status = windsurf_api::current_status(
+        &settings.api_service_host,
+        settings.api_service_port,
+        &settings.api_service_key,
+        &effective_api_service_model(&settings.api_service_default_model),
+    );
+    if !status.running {
+        return Err("API 服务未运行，请先启动服务再一键配置 Codex".to_string());
+    }
+    let base_url = status
+        .address
+        .clone()
+        .ok_or_else(|| "API 服务未提供监听地址".to_string())?;
+    let api_key = status.api_key.clone();
+    if api_key.trim().is_empty() {
+        return Err("API 服务密钥为空，无法配置 Codex".to_string());
+    }
+    let model_id = status.default_model.trim().to_string();
+    if model_id.is_empty() {
+        return Err("尚未选择默认模型，请先在 API 服务配置里挑一个".to_string());
+    }
+
+    let codex_home = codex_home_dir()?;
+    fs::create_dir_all(&codex_home)
+        .map_err(|error| format!("创建目录失败 {}: {error}", codex_home.display()))?;
+
+    let config_path = codex_home.join("config.toml");
+    let existing = if config_path.exists() {
+        read_to_string(&config_path)?
+    } else {
+        String::new()
+    };
+
+    let stripped = strip_superai_managed_block(&existing);
+
+    if has_external_superai_provider_section(&stripped) {
+        return Err(format!(
+            "{} 中已存在 [model_providers.superai] 段，但不在 SuperAI 自动管理范围内。请先手动删除该段再点一键配置，以免覆盖你的自定义内容。",
+            config_path.display(),
+        ));
+    }
+
+    // 首次写入前做一次性原始备份，永久保留，方便用户随时回滚。
+    let backup_path_buf = codex_home.join("config.toml.superai-bak");
+    let backup_path = if config_path.exists() && !backup_path_buf.exists() {
+        fs::copy(&config_path, &backup_path_buf)
+            .map_err(|error| format!("备份 {} 失败: {error}", config_path.display()))?;
+        Some(backup_path_buf.display().to_string())
+    } else if backup_path_buf.exists() {
+        Some(backup_path_buf.display().to_string())
+    } else {
+        None
+    };
+
+    // 把用户已有的顶层 model_provider / model 注释掉，避免与 managed block 重复定义。
+    let (user_body, disabled_user_keys) =
+        comment_out_top_level_keys(&stripped, &["model_provider", "model"]);
+
+    // managed block 放最前面：顶层 key 在 TOML 里必须先于任何 [section] 出现。
+    let managed = build_superai_managed_block(&base_url, &model_id, &api_key);
+    let mut next = String::with_capacity(managed.len() + user_body.len() + 2);
+    next.push_str(&managed);
+    let trimmed_user = user_body.trim_start_matches('\n').to_string();
+    if !trimmed_user.is_empty() {
+        next.push('\n');
+        next.push_str(&trimmed_user);
+    }
+    if !next.ends_with('\n') {
+        next.push('\n');
+    }
+    write_string_atomic(&config_path, &next)?;
+    // config.toml 含明文 bearer key，仅当前用户可读。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600));
+    }
+
+    Ok(CodexAppSetupResult {
+        config_path: config_path.display().to_string(),
+        base_url,
+        model_id,
+        backup_path,
+        disabled_user_keys,
+    })
+}
+
 fn stop_api_service_impl(
     app: tauri::AppHandle,
 ) -> Result<windsurf_api::WindsurfApiStatus, String> {
@@ -5958,6 +6185,7 @@ pub fn run() {
             sync_api_service_active_account,
             list_api_service_models,
             set_api_service_default_model,
+            configure_codex_app,
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {

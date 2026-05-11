@@ -897,6 +897,10 @@ fn post_sidecar_dashboard_api(
     let response = match client
         .post(format!("{}/dashboard/api{}", target.base_url, subpath))
         .header("Authorization", format!("Bearer {}", target.inner_key))
+        // sidecar dashboard 路由不看 Bearer，只看 X-Dashboard-Password；
+        // localhost bind 下 effectiveApiKey 等同 dashboard 密码。不加这个头
+        // 会被防爆破锁累计 5 次后封 30 分钟（issue: 启用账号 429）。
+        .header("X-Dashboard-Password", target.inner_key.as_str())
         .json(&json!({}))
         .send()
     {
@@ -965,6 +969,9 @@ pub fn activate_account_by_email(email: &str) -> Result<(), String> {
             target.base_url, account_id
         ))
         .header("Authorization", format!("Bearer {}", target.inner_key))
+        // 见 post_sidecar_dashboard_api 注释：dashboard 路由只看
+        // X-Dashboard-Password；不带会撞防爆破锁 → 30min IP ban。
+        .header("X-Dashboard-Password", target.inner_key.as_str())
         .json(&json!({ "status": "active", "resetErrors": true }))
         .send()
         .map_err(|error| format!("调用 sidecar 启用账号失败: {error}"))?;
