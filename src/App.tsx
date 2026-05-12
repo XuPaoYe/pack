@@ -191,7 +191,9 @@ const __WSF: string = [87, 105, 110, 100, 115, 117, 114, 102]
 const __WSFAPI: string = [119, 105, 110, 100, 115, 117, 114, 102, 97, 112, 105]
   .map((c) => String.fromCharCode(c))
   .join("");
-const PROVIDER_WSF = __WSFAPI.slice(0, 8) as "windsurf"; // DB 里存的 provider 值
+// 后端 account_for_frontend 出口处把内部协议名 "windsurf" 改写成 "superai"，
+// 所以前端只比较 "superai" 即可。upsert_accounts 入口会反向翻译回去。
+const PROVIDER_WSF = "superai" as const;
 
 function sanitizeUserFacingText(text: string) {
   // 先替换更长的 lowercase 项目代号 windsurfapi，再替换 Windsurf；
@@ -1792,6 +1794,30 @@ function App() {
       "account-exhausted",
       () => {
         showNotice("info", "有账号本地额度已用满，已自动停用");
+        void invoke<ManagedAccount[]>("list_accounts")
+          .then((next) => setAccounts(sortAccountsForView(next)))
+          .catch(() => undefined);
+      },
+    ).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [showNotice]);
+
+  // 后台定时任务删掉过期 SuperAI 账号时由 Rust 主动 emit；前端 re-fetch 列表，
+  // 避免已过期卡片残留在 UI 直到用户手动点刷新（且手动刷新会触发 "no rows" 报错）。
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    void listen<{ ids?: string[]; count?: number }>(
+      "accounts-expired-removed",
+      (event) => {
+        const count = event.payload?.count ?? event.payload?.ids?.length ?? 0;
+        if (count > 0) {
+          showNotice("info", `已自动移除 ${count} 个过期账号`);
+        }
         void invoke<ManagedAccount[]>("list_accounts")
           .then((next) => setAccounts(sortAccountsForView(next)))
           .catch(() => undefined);

@@ -429,6 +429,14 @@ fn init_app_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|error| format!("清理演示账号失败: {error}"))?;
+    // 历史数据里 provider 列存的是协议字面量；重命名成对用户透明的 "superai"，
+    // 避免用户用 sqlite cli 打开 DB 时看到内部协议代号。代码里所有内部比较仍用
+    // 协议字面量，parse_stored_account_json / 各 SELECT 都接受两种值做向后兼容。
+    conn.execute(
+        "UPDATE accounts SET provider = 'superai' WHERE provider = 'windsurf'",
+        [],
+    )
+    .map_err(|error| format!("迁移 provider 列失败: {error}"))?;
     Ok(())
 }
 
@@ -492,9 +500,12 @@ fn read_accounts_from_conn(conn: &Connection) -> Result<Vec<ManagedAccount>, Str
 ///
 /// 仅作用于 provider == "windsurf" 且携带 `license_expires_at` 的账号。
 /// Codex / Gemini、完全版 windsurf（无 license_expires_at）不会被误删。
-fn delete_expired_windsurf_accounts(conn: &Connection) -> Result<(Vec<String>, bool), String> {
+fn delete_expired_windsurf_accounts(
+    app: &tauri::AppHandle,
+    conn: &Connection,
+) -> Result<(Vec<String>, bool), String> {
     let accounts = read_accounts_from_conn(conn)?;
-    let mut expired_ids: Vec<String> = Vec::new();
+    let mut expired: Vec<ManagedAccount> = Vec::new();
     let mut current_was_expired = false;
     for account in accounts {
         if account.provider != "windsurf" {
@@ -509,8 +520,15 @@ fn delete_expired_windsurf_accounts(conn: &Connection) -> Result<(Vec<String>, b
         if is_current_status(&account.status) {
             current_was_expired = true;
         }
-        expired_ids.push(account.id);
+        expired.push(account);
     }
+    // 删之前为公开版 + batch_key 的账号 stash 一份使用记录，
+    // 24h 内重新导入同一 batch_key 时由 restore_public_usage_history 自动恢复，
+    // 避免到期被自动清理后用户重新导入时 consumed 被清零回 100%。
+    for account in &expired {
+        stash_public_usage_history(app, account);
+    }
+    let expired_ids: Vec<String> = expired.into_iter().map(|account| account.id).collect();
     for id in &expired_ids {
         conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])
             .map_err(|error| format!("删除过期 SuperAI 账号失败: {error}"))?;
@@ -525,10 +543,20 @@ fn delete_expired_windsurf_accounts(conn: &Connection) -> Result<(Vec<String>, b
 /// 再按 `license_expires_at` 升序——优先用快到期的，确保过期前能榨干。
 fn cleanup_expired_windsurf_and_handoff(app: &tauri::AppHandle) -> Result<usize, String> {
     let conn = open_app_db(app)?;
-    let (expired_ids, current_was_expired) = delete_expired_windsurf_accounts(&conn)?;
+    let (expired_ids, current_was_expired) = delete_expired_windsurf_accounts(app, &conn)?;
     if expired_ids.is_empty() {
         return Ok(0);
     }
+
+    // 通知前端：后台 cleanup 删掉了账号，UI 需要 re-fetch 列表，
+    // 否则已过期卡片会一直残留直到用户手动刷新。
+    let _ = app.emit(
+        "accounts-expired-removed",
+        serde_json::json!({
+            "ids": expired_ids,
+            "count": expired_ids.len(),
+        }),
+    );
 
     schedule_windsurf_sync(app.clone());
 
@@ -558,11 +586,13 @@ fn cleanup_expired_windsurf_and_handoff(app: &tauri::AppHandle) -> Result<usize,
     Ok(expired_ids.len())
 }
 
-/// 后台定时任务：每分钟清扫已过期的 SuperAI 账号。
+/// 后台定时任务：每 5 秒清扫已过期的 SuperAI 账号。
 ///
-/// 性能：单次 = 一次 DB 读 + 简单数值比较，账号数量级很小，每分钟跑一次
-/// 完全可接受；这样过期账号的停用延迟最多 1 分钟，符合用户预期。
+/// 性能：单次 = 一次 DB 读 + 每行 AES 解密 + 数值比较，纯本地无网络。
+/// 50 个账号约 50ms，CPU 占用 < 1%；典型用户基本无感。
+/// 没有过期账号时早返回，不写 DB、不通知 sidecar，开销近零。
 ///
+/// 5s 间隔是为了日卡场景下到期能尽快下架，避免用户已到期还能多用 1 分钟。
 /// 启动时 setup 也会立即同步跑一次，避免新启动时残留过期账号。
 fn spawn_expired_windsurf_cleanup(app: tauri::AppHandle) {
     std::thread::spawn(move || {
@@ -572,14 +602,18 @@ fn spawn_expired_windsurf_cleanup(app: tauri::AppHandle) {
             if let Err(error) = cleanup_expired_windsurf_and_handoff(&app) {
                 eprintln!("[cleanup] 清理过期 SuperAI 账号失败: {error}");
             }
-            std::thread::sleep(std::time::Duration::from_secs(60));
+            std::thread::sleep(std::time::Duration::from_secs(5));
         }
     });
 }
 
 fn encrypt_plain_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
+    // DB 迁移后 provider 列值是 "superai"，但老数据可能还残留 "windsurf"，
+    // 两种都扫一遍，确保新老 DB 都能正确加密。
     let mut stmt = conn
-        .prepare("SELECT id, account_json FROM accounts WHERE provider = 'windsurf'")
+        .prepare(
+            "SELECT id, account_json FROM accounts WHERE provider IN ('windsurf', 'superai')",
+        )
         .map_err(|error| format!("读取 SuperAI 账号记录失败: {error}"))?;
     let rows = stmt
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
@@ -598,6 +632,7 @@ fn encrypt_plain_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
         {
             continue;
         }
+        // 明文 account_json 里 provider 字段是内部协议值（"windsurf"）。
         if value.get("provider").and_then(Value::as_str) != Some("windsurf") {
             continue;
         }
@@ -617,12 +652,17 @@ fn encrypt_plain_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
 fn parse_stored_account_json(account_json: &str) -> Result<ManagedAccount, String> {
     let value: Value = serde_json::from_str(account_json)
         .map_err(|error| format!("解析账号记录失败: {error}"))?;
-    if value
+    // wrapper.provider 老数据是 "windsurf"，新数据是 "superai"。两种都接受，
+    // 升级用户的历史 DB 不会因为换 wrapper 标识而读不出来。
+    let is_encrypted_superai_wrapper = value
         .get("encrypted")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        && value.get("provider").and_then(Value::as_str) == Some("windsurf")
-    {
+        && matches!(
+            value.get("provider").and_then(Value::as_str),
+            Some("windsurf") | Some("superai")
+        );
+    if is_encrypted_superai_wrapper {
         let payload = value
             .get("payload")
             .and_then(Value::as_str)
@@ -663,6 +703,12 @@ fn mark_account_available(account: &mut ManagedAccount) {
 
 fn account_for_frontend(account: &ManagedAccount) -> ManagedAccount {
     let mut redacted = account.clone();
+    // IPC 出口处把内部协议名（"windsurf"）改写成对前端透明的 "superai"。
+    // 配合 upsert_accounts 入口的反向归一化，前端 DevTools 监听 IPC 也只
+    // 能看到 "superai"，看不到协议代号。
+    if redacted.provider == "windsurf" {
+        redacted.provider = "superai".to_string();
+    }
     // 公开版下的 windsurf 账号：有效期展示**每次从 batch_key 现解**（密钥本体被
     // AES 封死，用户即使解开外层 account_json 改 license_expires_at 也无效）。
     // 现解失败再退回缓存的 license_expires_at 兜底；都没有就不改。
@@ -819,6 +865,10 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
     } else {
         account_to_write.display_name.clone()
     };
+    // DB 列里只暴露对外可见的 provider 名（windsurf → superai）。内部代码、协议
+    // 字面量、加密的 account_json 内部仍保留原值；这里只动 sqlite cli 直接能看
+    // 到的 provider 列，避免用户开 DB 文件就看到协议代号。
+    let stored_provider = redact_provider_to_storage(&account_to_write.provider);
     conn.execute(
         r#"
       INSERT INTO accounts (
@@ -833,7 +883,7 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
       "#,
         params![
             account_to_write.id,
-            account_to_write.provider,
+            stored_provider,
             stored_email,
             stored_display_name,
             account_json,
@@ -845,6 +895,28 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
     Ok(())
 }
 
+/// 把代码内部使用的 provider 字面量改写成 DB 列里要存的对外可见值。
+/// 目前只有 "windsurf" → "superai"；其它（codex、gemini）原样返回。
+fn redact_provider_to_storage(provider: &str) -> String {
+    if provider == "windsurf" {
+        "superai".to_string()
+    } else {
+        provider.to_string()
+    }
+}
+
+/// 把前端 / IPC 入参中的 provider 字符串归一化回内部协议字面量。
+/// 前端通过 account_for_frontend 看到的是 "superai"；当它把这个值通过命令参数
+/// 或 ManagedAccount 字段回传时，必须翻译回 "windsurf"，否则内部 provider
+/// 分发（codex / gemini / windsurf 三路 match）会全部漏掉 SuperAI 账号。
+fn normalize_provider_from_frontend(provider: &str) -> String {
+    if provider == "superai" {
+        "windsurf".to_string()
+    } else {
+        provider.to_string()
+    }
+}
+
 fn serialize_account_for_storage(account: &ManagedAccount) -> Result<String, String> {
     let account_json = serde_json::to_string(account)
         .map_err(|error| format!("序列化账号失败: {error}"))?;
@@ -852,9 +924,11 @@ fn serialize_account_for_storage(account: &ManagedAccount) -> Result<String, Str
         return Ok(account_json);
     }
     let encrypted = superai_encrypt_text(&account_json)?;
+    // wrapper 里只是个路由标识，跟解密后的内部 provider 解耦。用 "superai"
+    // 让用户即使绕过外层 AES 看到 wrapper JSON，也不会看到协议代号。
     let wrapper = serde_json::json!({
         "encrypted": true,
-        "provider": "windsurf",
+        "provider": "superai",
         "payload": encrypted,
     });
     serde_json::to_string(&wrapper).map_err(|error| format!("序列化 SuperAI 加密账号失败: {error}"))
@@ -999,6 +1073,18 @@ fn windsurf_license_expired_at(expires_at: i64) -> bool {
 
 fn windsurf_license_expires_at(account: &ManagedAccount) -> Option<i64> {
     let payload = account.auth_payload.as_ref()?.as_object()?;
+    // 优先按 UI 同款逻辑现解 batch_key，避免 auth_payload 里缓存的
+    // license_expires_at 字段缺失 / 滞后导致 cleanup 漏删（UI 已经显示"已过期"
+    // 但后端读不到缓存值就以为没过期，账号永远不会被自动清掉）。
+    let derived = payload
+        .get("batch_key")
+        .and_then(Value::as_str)
+        .and_then(|key| parse_windsurf_batch_key_line(key).ok())
+        .map(|credential| credential.expires_at)
+        .filter(|expires_at| *expires_at != i64::MAX);
+    if derived.is_some() {
+        return derived;
+    }
     payload
         .get("license_expires_at")
         .and_then(normalize_unix_seconds_value)
@@ -3361,7 +3447,40 @@ async fn add_superai_accounts_by_batch_keys(
                     let conn = open_app_db(&app)?;
                     load_account_from_db(&conn, &account.id)?
                 };
+                // 日卡场景核心保险：必须在导入时点锁住 baseline，否则等下一次
+                // refresh 才锁可能跨过上游 16:00 重置，被刷成 100%。
+                // 拉不到 weekly 就重试一次 enrich；仍失败则回滚刚插入的账号，
+                // 让操作员重试，不允许"无 baseline"账号进入正式列表。
+                if current_weekly_remaining_from_account(&full_account).is_none() {
+                    let _ = enrich_windsurf_account_remote(&mut full_account).await;
+                }
+                if current_weekly_remaining_from_account(&full_account).is_none() {
+                    let conn = open_app_db(&app)?;
+                    let _ = conn.execute(
+                        "DELETE FROM accounts WHERE id = ?1",
+                        params![&full_account.id],
+                    );
+                    failed.push(ImportFailure {
+                        label,
+                        reason: "未能获取上游额度，导入已回滚，请稍后重试".to_string(),
+                    });
+                    continue;
+                }
                 attach_windsurf_batch_key(&app, &mut full_account, &key, credential.expires_at);
+                // 双重确认 baseline 真的写进去了。理论上前面已校验，这里再兜底
+                // 一次：万一 attach 内部 bump 因极端竞争没记录 baseline 也拦下。
+                if public_usage_baseline(&full_account).is_none() {
+                    let conn = open_app_db(&app)?;
+                    let _ = conn.execute(
+                        "DELETE FROM accounts WHERE id = ?1",
+                        params![&full_account.id],
+                    );
+                    failed.push(ImportFailure {
+                        label,
+                        reason: "未能锁定本地额度基线，导入已回滚，请稍后重试".to_string(),
+                    });
+                    continue;
+                }
                 upsert_accounts_into_db(&app, std::slice::from_ref(&full_account))?;
                 imported.push(account_for_frontend(&full_account));
             }
@@ -5437,7 +5556,17 @@ fn list_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
 
 #[tauri::command]
 fn upsert_accounts(app: tauri::AppHandle, accounts: Vec<ManagedAccount>) -> Result<(), String> {
-    upsert_accounts_into_db(&app, &accounts)
+    // 前端拿到的账号 provider 是 "superai"（由 account_for_frontend 改写），
+    // 这里翻译回内部协议字面量，否则 upsert_account 里 `provider == "windsurf"`
+    // 的分支全部走不到，邮箱 / display_name / 加密包裹全部错位。
+    let normalized: Vec<ManagedAccount> = accounts
+        .into_iter()
+        .map(|mut account| {
+            account.provider = normalize_provider_from_frontend(&account.provider);
+            account
+        })
+        .collect();
+    upsert_accounts_into_db(&app, &normalized)
 }
 
 #[tauri::command]
@@ -5446,9 +5575,23 @@ async fn refresh_account(
     app: tauri::AppHandle,
     accountId: String,
 ) -> Result<ManagedAccount, String> {
+    // 后台 cleanup 可能已经把这个账号删了；这种情况下不要抛 "Query returned no rows"
+    // 的红色 toast，而是 emit 同款事件让前端 re-fetch 列表，悄悄把残留卡片刷掉。
     let mut account = {
         let conn = open_app_db(&app)?;
-        load_account_from_db(&conn, &accountId)?
+        match load_account_from_db(&conn, &accountId) {
+            Ok(account) => account,
+            Err(_) => {
+                let _ = app.emit(
+                    "accounts-expired-removed",
+                    serde_json::json!({
+                        "ids": [accountId.clone()],
+                        "count": 1,
+                    }),
+                );
+                return Err("账号已被自动清理".to_string());
+            }
+        }
     };
     let was_current = is_current_status(&account.status);
 
@@ -5491,6 +5634,9 @@ async fn refresh_provider_accounts(
     app: tauri::AppHandle,
     provider: String,
 ) -> Result<Vec<ManagedAccount>, String> {
+    // 前端传进来的 "superai" 翻回内部协议名再 filter，否则 SuperAI 账号一个都
+    // 匹配不上。
+    let provider = normalize_provider_from_frontend(&provider);
     let mut accounts = {
         let conn = open_app_db(&app)?;
         read_accounts_from_conn(&conn)?

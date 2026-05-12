@@ -1,13 +1,16 @@
 import { normalizeUnixSeconds, nowUnixSeconds } from "./time";
 
-// 用 .map(...).join("") 构造，绕过 esbuild / vite 的常量折叠，让 dist 里
-// 不出现 "windsurf" 字面量。详见 src/App.tsx 同样做法。
-const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
+// 后端 IPC 出口已经把内部协议名 "windsurf" 改写成 "superai"，前端只需要
+// 跟 "superai" 比较即可。EXAFUNCTION_WSF_AUD 走 JWT aud 校验路径，需要的
+// 仍是上游协议字面量，所以单独从 charcode 构造，绕过 esbuild 常量折叠避免
+// dist 里出现 "windsurf" 字面量。
+const PROVIDER_WSF = "superai" as const;
+const __WSF_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
   .map((c) => String.fromCharCode(c))
-  .join("") as "windsurf";
-const EXAFUNCTION_WSF_AUD = "exafunction-" + PROVIDER_WSF;
+  .join("");
+const EXAFUNCTION_WSF_AUD = "exafunction-" + __WSF_AUD_PROTOCOL;
 
-export type Provider = "codex" | "gemini" | "windsurf";
+export type Provider = "codex" | "gemini" | "superai";
 
 export type ImportSource = "paste" | "file" | "local" | "oauth";
 
