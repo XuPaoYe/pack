@@ -458,10 +458,10 @@ fn set_account_current_state(
             account.updated_at = now;
         } else if account.provider == provider
             && account
-            .status
-            .as_ref()
-            .map(|status| status.label.as_str() == "当前")
-            .unwrap_or(false)
+                .status
+                .as_ref()
+                .map(|status| status.label.as_str() == "当前")
+                .unwrap_or(false)
         {
             mark_account_available(account);
             account.updated_at = now;
@@ -566,9 +566,7 @@ fn cleanup_expired_windsurf_and_handoff(app: &tauri::AppHandle) -> Result<usize,
         let remaining = read_accounts_from_conn(&conn)?;
         let mut candidates: Vec<ManagedAccount> = remaining
             .into_iter()
-            .filter(|account| {
-                account.provider == "windsurf" && !public_usage_is_exhausted(account)
-            })
+            .filter(|account| account.provider == "windsurf" && !public_usage_is_exhausted(account))
             .collect();
         candidates.sort_by_key(|account| windsurf_license_expires_at(account).unwrap_or(i64::MAX));
 
@@ -611,16 +609,17 @@ fn encrypt_plain_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
     // DB 迁移后 provider 列值是 "superai"，但老数据可能还残留 "windsurf"，
     // 两种都扫一遍，确保新老 DB 都能正确加密。
     let mut stmt = conn
-        .prepare(
-            "SELECT id, account_json FROM accounts WHERE provider IN ('windsurf', 'superai')",
-        )
+        .prepare("SELECT id, account_json FROM accounts WHERE provider IN ('windsurf', 'superai')")
         .map_err(|error| format!("读取 SuperAI 账号记录失败: {error}"))?;
     let rows = stmt
-        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|error| format!("读取 SuperAI 账号记录失败: {error}"))?;
     let mut migrated = 0usize;
     for row in rows {
-        let (id, account_json) = row.map_err(|error| format!("读取 SuperAI 账号记录失败: {error}"))?;
+        let (id, account_json) =
+            row.map_err(|error| format!("读取 SuperAI 账号记录失败: {error}"))?;
         let value: Value = match serde_json::from_str(&account_json) {
             Ok(value) => value,
             Err(_) => continue,
@@ -650,8 +649,8 @@ fn encrypt_plain_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
 }
 
 fn parse_stored_account_json(account_json: &str) -> Result<ManagedAccount, String> {
-    let value: Value = serde_json::from_str(account_json)
-        .map_err(|error| format!("解析账号记录失败: {error}"))?;
+    let value: Value =
+        serde_json::from_str(account_json).map_err(|error| format!("解析账号记录失败: {error}"))?;
     // wrapper.provider 老数据是 "windsurf"，新数据是 "superai"。两种都接受，
     // 升级用户的历史 DB 不会因为换 wrapper 标识而读不出来。
     let is_encrypted_superai_wrapper = value
@@ -753,7 +752,9 @@ fn account_for_frontend(account: &ManagedAccount) -> ManagedAccount {
             // -credits 等）。常规路径下 `rewrite_quota_for_public_usage` 已经把
             // metrics 替换成单一 `superai-public`，但若上一次 refresh 失败 / 旧
             // 数据迁移残留，这里再砍一次确保 IPC 输出干净。
-            quota.metrics.retain(|metric| !metric.key.starts_with("windsurf-"));
+            quota
+                .metrics
+                .retain(|metric| !metric.key.starts_with("windsurf-"));
         }
     }
     redacted.auth_payload = None;
@@ -918,8 +919,8 @@ fn normalize_provider_from_frontend(provider: &str) -> String {
 }
 
 fn serialize_account_for_storage(account: &ManagedAccount) -> Result<String, String> {
-    let account_json = serde_json::to_string(account)
-        .map_err(|error| format!("序列化账号失败: {error}"))?;
+    let account_json =
+        serde_json::to_string(account).map_err(|error| format!("序列化账号失败: {error}"))?;
     if account.provider != "windsurf" {
         return Ok(account_json);
     }
@@ -1100,10 +1101,16 @@ fn apply_windsurf_license_expiry(account: &mut ManagedAccount) {
 }
 
 fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
-    let key = hex::decode(SUPERAI_AES_KEY_HEX).map_err(|error| format!("解析 SuperAI AES key 失败: {error}"))?;
-    let iv = hex::decode(SUPERAI_AES_IV_HEX).map_err(|error| format!("解析 SuperAI AES iv 失败: {error}"))?;
-    let key: [u8; 32] = key.try_into().map_err(|_| "SuperAI AES key 长度必须为 32 字节".to_string())?;
-    let iv: [u8; 16] = iv.try_into().map_err(|_| "SuperAI AES iv 长度必须为 16 字节".to_string())?;
+    let key = hex::decode(SUPERAI_AES_KEY_HEX)
+        .map_err(|error| format!("解析 SuperAI AES key 失败: {error}"))?;
+    let iv = hex::decode(SUPERAI_AES_IV_HEX)
+        .map_err(|error| format!("解析 SuperAI AES iv 失败: {error}"))?;
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| "SuperAI AES key 长度必须为 32 字节".to_string())?;
+    let iv: [u8; 16] = iv
+        .try_into()
+        .map_err(|_| "SuperAI AES iv 长度必须为 16 字节".to_string())?;
     Ok((key, iv))
 }
 
@@ -2245,12 +2252,23 @@ fn summarize_windsurf_error_body(text: &str) -> String {
 
 fn windsurf_browser_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/plain, */*"));
-    headers.insert("Accept-Language", HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/json, text/plain, */*"),
+    );
+    headers.insert(
+        "Accept-Language",
+        HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+    );
     headers.insert("Accept-Encoding", HeaderValue::from_static("identity"));
     headers.insert("Origin", HeaderValue::from_static("https://windsurf.com"));
     headers.insert("Referer", HeaderValue::from_static("https://windsurf.com/"));
-    headers.insert("Sec-Ch-Ua", HeaderValue::from_static(r#""Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99""#));
+    headers.insert(
+        "Sec-Ch-Ua",
+        HeaderValue::from_static(
+            r#""Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99""#,
+        ),
+    );
     headers.insert("Sec-Ch-Ua-Mobile", HeaderValue::from_static("?0"));
     headers.insert("Sec-Ch-Ua-Platform", HeaderValue::from_static(r#""macOS""#));
     headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
@@ -2756,24 +2774,30 @@ fn extract_windsurf_plan_status(response_body: &[u8]) -> Result<Value, String> {
     {
         result.insert("plan_end".to_string(), Value::Number(value.into()));
     }
-    for (key, field) in [
+    for (key, field) in windsurf_plan_status_proto_field_map() {
+        if let Some(value) = proto_i64(plan_status.get(field)) {
+            result.insert(key.to_string(), Value::Number(value.into()));
+        }
+    }
+    Ok(Value::Object(result))
+}
+
+fn windsurf_plan_status_proto_field_map() -> [(&'static str, &'static str); 11] {
+    // GetPlanStatus 的 proto tag 名字不直观：int_14 是 weekly，int_15 是 daily。
+    // 公开版本地累计用量依赖 daily%，这里映射错会让"日限"显示成周限。
+    [
         ("available_flex_credits", "int_4"),
         ("used_flow_credits", "int_5"),
         ("used_prompt_credits", "int_6"),
         ("used_flex_credits", "int_7"),
         ("available_prompt_credits", "int_8"),
         ("available_flow_credits", "int_9"),
-        ("daily_quota_remaining_percent", "int_14"),
-        ("weekly_quota_remaining_percent", "int_15"),
+        ("weekly_quota_remaining_percent", "int_14"),
+        ("daily_quota_remaining_percent", "int_15"),
         ("overage_balance_micros", "int_16"),
-        ("daily_quota_reset_at_unix", "int_17"),
-        ("weekly_quota_reset_at_unix", "int_18"),
-    ] {
-        if let Some(value) = proto_i64(plan_status.get(field)) {
-            result.insert(key.to_string(), Value::Number(value.into()));
-        }
-    }
-    Ok(Value::Object(result))
+        ("weekly_quota_reset_at_unix", "int_17"),
+        ("daily_quota_reset_at_unix", "int_18"),
+    ]
 }
 
 fn quota_state_from_remaining(remaining: i64) -> String {
@@ -2897,7 +2921,10 @@ fn apply_windsurf_user_status_json(account: &mut ManagedAccount, user_status: &V
         .get("dailyQuotaResetAtUnix")
         .and_then(coerce_unix_seconds)
     {
-        normalized.insert("daily_quota_reset_at_unix".to_string(), Value::Number(value.into()));
+        normalized.insert(
+            "daily_quota_reset_at_unix".to_string(),
+            Value::Number(value.into()),
+        );
     }
     if let Some(value) = plan_status
         .get("weeklyQuotaResetAtUnix")
@@ -2909,7 +2936,10 @@ fn apply_windsurf_user_status_json(account: &mut ManagedAccount, user_status: &V
         );
     }
     if let Some(value) = number_field(plan_status.get("usedPromptCredits")) {
-        normalized.insert("used_prompt_credits".to_string(), Value::Number(value.into()));
+        normalized.insert(
+            "used_prompt_credits".to_string(),
+            Value::Number(value.into()),
+        );
     }
     if let Some(value) = number_field(plan_status.get("availablePromptCredits")) {
         normalized.insert(
@@ -2921,7 +2951,10 @@ fn apply_windsurf_user_status_json(account: &mut ManagedAccount, user_status: &V
         normalized.insert("used_flex_credits".to_string(), Value::Number(value.into()));
     }
     if let Some(value) = number_field(plan_status.get("availableFlexCredits")) {
-        normalized.insert("available_flex_credits".to_string(), Value::Number(value.into()));
+        normalized.insert(
+            "available_flex_credits".to_string(),
+            Value::Number(value.into()),
+        );
     }
     // planEnd 在 Connect-RPC JSON 里可能是数字、数字串、RFC3339 字符串或
     // {seconds, nanos} 对象，全部归一到 Unix 秒。
@@ -2932,8 +2965,8 @@ fn apply_windsurf_user_status_json(account: &mut ManagedAccount, user_status: &V
 }
 
 async fn refresh_windsurf_account_by_api_key(account: &mut ManagedAccount) -> Result<(), String> {
-    let api_key = windsurf_payload_string(account, "api_key")
-        .ok_or_else(|| "缺少 api_key".to_string())?;
+    let api_key =
+        windsurf_payload_string(account, "api_key").ok_or_else(|| "缺少 api_key".to_string())?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -3026,9 +3059,8 @@ async fn windsurf_seat_management_call(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("创建 SuperAI {endpoint} 客户端失败: {error}"))?;
-    let url = format!(
-        "{WINDSURF_BACKEND_URL}/exa.seat_management_pb.SeatManagementService/{endpoint}"
-    );
+    let url =
+        format!("{WINDSURF_BACKEND_URL}/exa.seat_management_pb.SeatManagementService/{endpoint}");
     let mut body = Vec::with_capacity(session_token.len() + 8 + extra_body.len());
     encode_proto_string_field(&mut body, 1, &session_token);
     body.extend_from_slice(extra_body);
@@ -3355,8 +3387,12 @@ fn parse_windsurf_batch_key_line(line: &str) -> Result<WindsurfBatchCredential, 
 fn decode_batch_key_text(value: &str) -> Option<String> {
     let normalized = value.trim();
     for decoded in [
-        base64::engine::general_purpose::STANDARD.decode(normalized).ok(),
-        base64::engine::general_purpose::URL_SAFE.decode(normalized).ok(),
+        base64::engine::general_purpose::STANDARD
+            .decode(normalized)
+            .ok(),
+        base64::engine::general_purpose::URL_SAFE
+            .decode(normalized)
+            .ok(),
         URL_SAFE_NO_PAD.decode(normalized).ok(),
     ]
     .into_iter()
@@ -3374,8 +3410,7 @@ fn account_password_from_value(value: &Value) -> Option<WindsurfBatchCredential>
     let account = string_field(obj.get("account"))
         .or_else(|| string_field(obj.get("username")))
         .or_else(|| string_field(obj.get("email")))?;
-    let password = string_field(obj.get("password"))
-        .or_else(|| string_field(obj.get("pwd")))?;
+    let password = string_field(obj.get("password")).or_else(|| string_field(obj.get("pwd")))?;
     let expires_at = number_field(obj.get("expires_at"))
         .or_else(|| number_field(obj.get("expiresAt")))
         .or_else(|| number_field(obj.get("expiry")))
@@ -3441,7 +3476,9 @@ async fn add_superai_accounts_by_batch_keys(
             continue;
         }
 
-        match add_superai_account_by_password(app.clone(), credential.account, credential.password).await {
+        match add_superai_account_by_password(app.clone(), credential.account, credential.password)
+            .await
+        {
             Ok(account) => {
                 let mut full_account = {
                     let conn = open_app_db(&app)?;
@@ -3449,12 +3486,12 @@ async fn add_superai_accounts_by_batch_keys(
                 };
                 // 日卡场景核心保险：必须在导入时点锁住 baseline，否则等下一次
                 // refresh 才锁可能跨过上游 16:00 重置，被刷成 100%。
-                // 拉不到 weekly 就重试一次 enrich；仍失败则回滚刚插入的账号，
+                // 拉不到 daily 就重试一次 enrich；仍失败则回滚刚插入的账号，
                 // 让操作员重试，不允许"无 baseline"账号进入正式列表。
-                if current_weekly_remaining_from_account(&full_account).is_none() {
+                if current_daily_remaining_from_account(&full_account).is_none() {
                     let _ = enrich_windsurf_account_remote(&mut full_account).await;
                 }
-                if current_weekly_remaining_from_account(&full_account).is_none() {
+                if current_daily_remaining_from_account(&full_account).is_none() {
                     let conn = open_app_db(&app)?;
                     let _ = conn.execute(
                         "DELETE FROM accounts WHERE id = ?1",
@@ -3484,7 +3521,10 @@ async fn add_superai_accounts_by_batch_keys(
                 upsert_accounts_into_db(&app, std::slice::from_ref(&full_account))?;
                 imported.push(account_for_frontend(&full_account));
             }
-            Err(error) => failed.push(ImportFailure { label, reason: error }),
+            Err(error) => failed.push(ImportFailure {
+                label,
+                reason: error,
+            }),
         }
     }
 
@@ -3525,8 +3565,8 @@ fn attach_windsurf_batch_key(
 // ---------------------------------------------------------------------------
 // 公开版（批量密钥）账号的"本地累计用量"独立追踪
 //
-// 上游 windsurf 的 weekly% 会按计费周期重置，但我们卖给用户的是固定额度：
-// 入库时记录 baseline，之后每次刷新做 max(0, last_remote - weekly) 单调累加，
+// 上游 windsurf 的 daily% 会按自然周期重置，但公开版 UI 展示的是"日限"：
+// 入库时记录 baseline，之后每次刷新做 max(0, last_remote - daily) 单调累加，
 // 累计 100% 即软停用账号（保留记录给 license 到期时由删号路径自然清理）。
 // 仅 windsurf provider + 含 batch_key 的账号生效，其他账号 helper 全部 no-op。
 // ---------------------------------------------------------------------------
@@ -3595,36 +3635,36 @@ fn public_usage_is_exhausted(account: &ManagedAccount) -> bool {
             || public_usage_remaining_percent(account) <= 0)
 }
 
-fn current_weekly_remaining_from_account(account: &ManagedAccount) -> Option<i64> {
+fn current_daily_remaining_from_account(account: &ManagedAccount) -> Option<i64> {
     account
         .quota
         .as_ref()?
         .metrics
         .iter()
-        .find(|m| m.key == "windsurf-weekly")
+        .find(|m| m.key == "windsurf-daily")
         .and_then(|m| m.remaining_percent)
 }
 
-/// 把上游 weekly% 的下降量累计到本地。返回 (是否本次首次耗尽, 当前 consumed%)。
+/// 把上游 daily% 的下降量累计到本地。返回 (是否本次首次耗尽, 当前 consumed%)。
 ///
 /// 语义：
-///   - 第一次记录：以当前 weekly% 当 baseline + last_remote，consumed 起步 0；
+///   - 第一次记录：以当前 daily% 当 baseline + last_remote，consumed 起步 0；
 ///     UI 显示的剩余 = baseline - consumed = 上游真实剩余（不再强行写成 100%）。
 ///     如果删除后 24h 内重新导入同一 batch_key，会从 usage_history 恢复
 ///     baseline / consumed / last_remote / exhausted_at，避免使用记录被清零。
-///   - 后续：diff = last_remote - this_weekly；diff > 0 才累加（单调递增）；
-///     上游重置（this_weekly > last_remote）丢弃负 diff，只更新 last_remote。
+///   - 后续：diff = last_remote - this_daily；diff > 0 才累加（单调递增）；
+///     上游重置（this_daily > last_remote）丢弃负 diff，只更新 last_remote。
 ///   - consumed clamp 在 [0,100]；只要 baseline - consumed <= 0 就视为耗尽并
 ///     软停用账号（不删除，等 license 过期由 cleanup 统一清除）。
 fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
     if !has_public_usage_tracking(account) {
         return (false, 0);
     }
-    let Some(weekly) = current_weekly_remaining_from_account(account) else {
+    let Some(daily) = current_daily_remaining_from_account(account) else {
         // 公开版账号刚导入但还没有 quota（极少见），保留当前状态等下次刷新。
         return (false, public_usage_consumed_percent(account));
     };
-    let weekly = weekly.clamp(0, 100);
+    let daily = daily.clamp(0, 100);
 
     let already_exhausted =
         windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_EXHAUSTED_AT).is_some();
@@ -3638,25 +3678,21 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
         windsurf_payload_set_value(
             account,
             PUBLIC_USAGE_KEY_BASELINE,
-            Value::Number(weekly.into()),
+            Value::Number(daily.into()),
         );
         windsurf_payload_set_value(
             account,
             PUBLIC_USAGE_KEY_LAST_REMOTE,
-            Value::Number(weekly.into()),
+            Value::Number(daily.into()),
         );
         if windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_CONSUMED).is_none() {
-            windsurf_payload_set_value(
-                account,
-                PUBLIC_USAGE_KEY_CONSUMED,
-                Value::Number(0.into()),
-            );
+            windsurf_payload_set_value(account, PUBLIC_USAGE_KEY_CONSUMED, Value::Number(0.into()));
         }
         return (false, public_usage_consumed_percent(account));
     }
 
     let last_remote = last_remote.unwrap();
-    let diff = last_remote - weekly;
+    let diff = last_remote - daily;
     if diff > 0 {
         consumed = (consumed + diff).clamp(0, 100);
         windsurf_payload_set_value(
@@ -3669,7 +3705,7 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
     windsurf_payload_set_value(
         account,
         PUBLIC_USAGE_KEY_LAST_REMOTE,
-        Value::Number(weekly.into()),
+        Value::Number(daily.into()),
     );
 
     // 剩余以 baseline 为上限：baseline - consumed <= 0 即耗尽。
@@ -3698,7 +3734,7 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
 }
 
 /// 公开版下用本地 consumed 覆盖 quota.metrics，UI 进度条因此显示"还剩 N%"
-/// 而不是上游 windsurf weekly%（避免上游重置后 UI 假性回血）。
+/// 而不是直接透出上游 windsurf daily%（避免上游重置后 UI 假性回血）。
 fn rewrite_quota_for_public_usage(account: &mut ManagedAccount) {
     if !has_public_usage_tracking(account) {
         return;
@@ -5800,13 +5836,13 @@ fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedA
         return Ok(Vec::new());
     }
     let conn = open_app_db(&app)?;
-    let Some(account) = read_accounts_from_conn(&conn)?
-        .into_iter()
-        .find(|account| account.provider == "windsurf" && account.email.eq_ignore_ascii_case(&email))
-    else {
+    let Some(account) = read_accounts_from_conn(&conn)?.into_iter().find(|account| {
+        account.provider == "windsurf" && account.email.eq_ignore_ascii_case(&email)
+    }) else {
         return Ok(Vec::new());
     };
-    let result = set_account_current_state(&conn, "windsurf", &account.id).map(accounts_for_frontend)?;
+    let result =
+        set_account_current_state(&conn, "windsurf", &account.id).map(accounts_for_frontend)?;
     windsurf_api::record_synced_active_email(email.to_ascii_lowercase());
     Ok(result)
 }
@@ -5830,7 +5866,10 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
 
 #[tauri::command]
 #[allow(non_snake_case)]
-fn export_public_superai_account(app: tauri::AppHandle, accountId: String) -> Result<String, String> {
+fn export_public_superai_account(
+    app: tauri::AppHandle,
+    accountId: String,
+) -> Result<String, String> {
     let conn = open_app_db(&app)?;
     let account = load_account_from_db(&conn, &accountId)?;
     public_windsurf_export_key(&account)
@@ -5839,8 +5878,7 @@ fn export_public_superai_account(app: tauri::AppHandle, accountId: String) -> Re
 fn system_auto_launch_enabled(app: &tauri::AppHandle) -> Result<Option<bool>, String> {
     #[cfg(desktop)]
     {
-        app
-            .autolaunch()
+        app.autolaunch()
             .is_enabled()
             .map(Some)
             .map_err(|error| format!("读取系统开机自启状态失败: {error}"))
@@ -5948,7 +5986,9 @@ fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), Str
         if merged.api_service_host.is_empty() {
             merged.api_service_host = existing.api_service_host;
         }
-        if merged.api_service_default_model.is_empty() && !existing.api_service_default_model.is_empty() {
+        if merged.api_service_default_model.is_empty()
+            && !existing.api_service_default_model.is_empty()
+        {
             merged.api_service_default_model = existing.api_service_default_model;
         }
     }
@@ -6082,7 +6122,10 @@ async fn complete_codex_oauth(
     login_id: String,
 ) -> Result<ImportResult, String> {
     let Some(pending) = oauth_pending_get(&login_id)? else {
-        return Ok(ImportResult { imported: vec![], failed: vec![] });
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
     };
     if pending.provider != "codex" {
         return Err("无效的 Codex OAuth 会话".to_string());
@@ -6092,7 +6135,10 @@ async fn complete_codex_oauth(
         return Err("Codex OAuth 登录已超时，请重新发起授权".to_string());
     }
     let Some(code) = pending.code else {
-        return Ok(ImportResult { imported: vec![], failed: vec![] });
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
     };
     let code_verifier = pending
         .code_verifier
@@ -6151,7 +6197,10 @@ async fn complete_gemini_oauth(
     login_id: String,
 ) -> Result<ImportResult, String> {
     let Some(pending) = oauth_pending_get(&login_id)? else {
-        return Ok(ImportResult { imported: vec![], failed: vec![] });
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
     };
     if pending.provider != "gemini" {
         return Err("无效的 Gemini OAuth 会话".to_string());
@@ -6161,7 +6210,10 @@ async fn complete_gemini_oauth(
         return Err("Gemini OAuth 登录已超时，请重新发起授权".to_string());
     }
     let Some(code) = pending.code else {
-        return Ok(ImportResult { imported: vec![], failed: vec![] });
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
     };
     let payload = exchange_gemini_oauth_code(&code, &pending.redirect_uri).await?;
     let result = parse_auth_json_content(&payload.to_string(), "oauth", "Gemini OAuth");
@@ -6203,7 +6255,10 @@ fn write_settings_record(app: &tauri::AppHandle, settings: &AppSettings) -> Resu
     Ok(())
 }
 
-fn ensure_api_service_key(app: &tauri::AppHandle, settings: &mut AppSettings) -> Result<(), String> {
+fn ensure_api_service_key(
+    app: &tauri::AppHandle,
+    settings: &mut AppSettings,
+) -> Result<(), String> {
     if settings.api_service_key.trim().is_empty() {
         settings.api_service_key = windsurf_api::generate_api_key();
         write_settings_record(app, settings)?;
@@ -6282,10 +6337,7 @@ fn list_api_service_models() -> Result<Vec<serde_json::Value>, String> {
 }
 
 #[tauri::command]
-fn set_api_service_default_model(
-    app: tauri::AppHandle,
-    model: String,
-) -> Result<(), String> {
+fn set_api_service_default_model(app: tauri::AppHandle, model: String) -> Result<(), String> {
     let mut settings = read_settings_record(&app)?;
     settings.api_service_default_model = effective_api_service_model(&model);
     write_settings_record(&app, &settings)?;
@@ -6685,9 +6737,8 @@ fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, St
     if config_path.exists() {
         let existing = read_to_string(&config_path)?;
         if config_is_superai_owned(&existing) {
-            fs::remove_file(&config_path).map_err(|error| {
-                format!("删除 SuperAI 写的 config.toml 失败: {error}")
-            })?;
+            fs::remove_file(&config_path)
+                .map_err(|error| format!("删除 SuperAI 写的 config.toml 失败: {error}"))?;
             steps.push(format!(
                 "已删除 SuperAI 写的 {}（codex 回到默认行为）",
                 config_path.display(),
@@ -6705,8 +6756,7 @@ fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, St
 
     // ---- auth.json：有备份就 cp 回去 ----
     if auth_bak.exists() {
-        fs::copy(&auth_bak, &auth_path)
-            .map_err(|error| format!("恢复 auth.json 失败: {error}"))?;
+        fs::copy(&auth_bak, &auth_path).map_err(|error| format!("恢复 auth.json 失败: {error}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -6732,9 +6782,7 @@ fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, St
     })
 }
 
-fn stop_api_service_impl(
-    app: tauri::AppHandle,
-) -> Result<windsurf_api::WindsurfApiStatus, String> {
+fn stop_api_service_impl(app: tauri::AppHandle) -> Result<windsurf_api::WindsurfApiStatus, String> {
     windsurf_api::stop()?;
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
@@ -6748,6 +6796,28 @@ fn stop_api_service_impl(
         &settings.api_service_key,
         &effective_api_service_model(&settings.api_service_default_model),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_status_proto_quota_tags_keep_daily_and_weekly_distinct() {
+        let field_map: HashMap<&str, &str> =
+            windsurf_plan_status_proto_field_map().into_iter().collect();
+
+        assert_eq!(
+            field_map.get("daily_quota_remaining_percent"),
+            Some(&"int_15")
+        );
+        assert_eq!(
+            field_map.get("weekly_quota_remaining_percent"),
+            Some(&"int_14")
+        );
+        assert_eq!(field_map.get("daily_quota_reset_at_unix"), Some(&"int_18"));
+        assert_eq!(field_map.get("weekly_quota_reset_at_unix"), Some(&"int_17"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

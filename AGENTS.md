@@ -251,8 +251,8 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 |---|---|
 | `batch_key` | 公开版批量密钥原文，导出时复用 |
 | `license_expires_at` | 批量密钥到期 unix 时间，到期由 `delete_expired_windsurf_accounts` 删账号 |
-| `usage_baseline_remaining` | 入库时上游 weekly% 快照（仅记录用，不参与 diff） |
-| `usage_last_remote_remaining` | 上次刷新拿到的上游 weekly%；下次比对差值 |
+| `usage_baseline_remaining` | 入库时上游 daily% 快照（公开版 UI 的"日限"基线） |
+| `usage_last_remote_remaining` | 上次刷新拿到的上游 daily%；下次比对差值 |
 | `usage_consumed_local` | 本地累计已用 0..100，**单调递增不可回退** |
 | `usage_exhausted_at` | 用满 unix 时间戳；存在即视为已耗尽 |
 
@@ -260,13 +260,13 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 
 ```
 首次（last_remote 缺失）:
-  baseline = last_remote = 当前 weekly%
+  baseline = last_remote = 当前 daily%
   consumed 保持 0
 后续:
-  diff = last_remote - this_weekly
+  diff = last_remote - this_daily
   diff > 0  → consumed = clamp(consumed + diff, 0, 100)
   diff <= 0 → 上游重置或抖动，不动 consumed
-  无论正负都更新 last_remote = this_weekly
+  无论正负都更新 last_remote = this_daily
 触达 100:
   写 usage_exhausted_at
   status = unavailable / "已耗尽" / reason="本地累计额度已用满"
@@ -294,10 +294,10 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 
 ### UI 显示约束
 
-`rewrite_quota_for_public_usage` 在公开版账号上把 `quota.metrics` 整段改写成单条 `superai-public` metric，`remainingPercent = 100 - consumed_local`。这意味着：
+`rewrite_quota_for_public_usage` 在公开版账号上把 `quota.metrics` 整段改写成单条 `superai-public` metric，`remainingPercent = baseline_daily - consumed_local`。这意味着：
 
-- UI 进度条对公开版账号显示**本地剩余**，不是上游 weekly%
-- 上游周重置不会让 UI 进度条假性回血
+- UI 进度条对公开版账号显示**本地日限剩余**，不是上游 weekly%
+- 上游日重置不会让 UI 进度条假性回血
 - full 版 / 非公开版 windsurf 号（无 batch_key）不被改写，照旧显示上游 daily/weekly
 
 ### 不要做的事

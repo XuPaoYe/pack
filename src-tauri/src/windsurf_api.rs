@@ -125,11 +125,13 @@ struct Runtime {
 }
 
 static RUNTIME: LazyLock<Mutex<Option<Runtime>>> = LazyLock::new(|| Mutex::new(None));
-static LAST_USED_ACCOUNT_EMAIL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static LAST_USED_ACCOUNT_EMAIL: LazyLock<Mutex<Option<String>>> =
+    LazyLock::new(|| Mutex::new(None));
 /// `sync_api_service_active_account` 上次成功打过"当前"标签的 email。
 /// 命中时直接返回空 vec，跳过 sqlite 解密 + 全表 upsert。前端 setInterval
 /// 调到 3s 也几乎零开销。start/stop 时清空，避免跨服务生命周期串号。
-static LAST_SYNCED_ACTIVE_EMAIL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+static LAST_SYNCED_ACTIVE_EMAIL: LazyLock<Mutex<Option<String>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Runtime>> {
     RUNTIME.lock().expect("SuperAI API 运行态锁失败")
@@ -325,10 +327,7 @@ fn cleanup_language_server_processes(ls_bin: &Path) {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("language_server");
-    let Ok(output) = Command::new("ps")
-        .args(["-e", "-o", "pid=,args="])
-        .output()
-    else {
+    let Ok(output) = Command::new("ps").args(["-e", "-o", "pid=,args="]).output() else {
         return;
     };
 
@@ -582,12 +581,17 @@ fn parse_listen_port(line: &str) -> Option<u16> {
     let idx = line.find(needle)?;
     let tail = &line[idx + needle.len()..];
     let after_colon = tail.split(':').nth(1)?;
-    let port_str: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let port_str: String = after_colon
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     port_str.parse::<u16>().ok()
 }
 
 fn sanitize_sidecar_log_line(line: &str) -> String {
-    let mut text = line.replace("Windsurf", "SuperAI").replace("windsurf", "superai");
+    let mut text = line
+        .replace("Windsurf", "SuperAI")
+        .replace("windsurf", "superai");
     let mut sanitized = String::with_capacity(text.len());
     let mut token = String::new();
 
@@ -680,9 +684,7 @@ pub fn start(
 /// 不需要重启 API 服务（之前是 clone 进线程的快照，必须重启才生效）。
 pub fn update_default_model(model: &str) -> Result<(), String> {
     let guard = lock();
-    let runtime = guard
-        .as_ref()
-        .ok_or_else(|| "API 服务未运行".to_string())?;
+    let runtime = guard.as_ref().ok_or_else(|| "API 服务未运行".to_string())?;
     let target = runtime
         .proxy_target
         .as_ref()
@@ -712,8 +714,22 @@ fn start_internal(
     target: Option<ProxyTarget>,
     sidecar: Option<Sidecar>,
 ) -> Result<WindsurfApiStatus, String> {
+    // 首选用户/上次记录的端口；被占用（典型如 Windows `WSAEADDRINUSE 10048`
+    // 或上次自动分配的端口在 TIME_WAIT / 被其他进程接手）时退回到内核自动选端口，
+    // 避免用户每次都要手动改端口才能启动。
     let bind = format!("{host}:{port}");
-    let server = Server::http(&bind).map_err(|error| format!("绑定 {bind} 失败: {error}"))?;
+    let server = match Server::http(&bind) {
+        Ok(server) => server,
+        Err(error) if port != 0 => {
+            let fallback_bind = format!("{host}:0");
+            eprintln!(
+                "[SuperAI api] 绑定 {bind} 失败（{error}），退回到自动选端口 {fallback_bind}"
+            );
+            Server::http(&fallback_bind)
+                .map_err(|fallback_error| format!("绑定 {fallback_bind} 失败: {fallback_error}"))?
+        }
+        Err(error) => return Err(format!("绑定 {bind} 失败: {error}")),
+    };
     let actual_port = server
         .server_addr()
         .to_ip()
@@ -733,7 +749,12 @@ fn start_internal(
     let accept_join = thread::Builder::new()
         .name("superai-api".into())
         .spawn(move || {
-            run_server(server, stop_flag_for_thread, api_key_owned, target_for_thread);
+            run_server(
+                server,
+                stop_flag_for_thread,
+                api_key_owned,
+                target_for_thread,
+            );
         })
         .map_err(|error| format!("创建服务线程失败: {error}"))?;
 
@@ -786,16 +807,12 @@ pub fn list_models() -> Result<Vec<Value>, String> {
 /// API 服务是否正在运行且挂了 sidecar。
 pub fn is_running_with_sidecar() -> bool {
     let guard = lock();
-    guard
-        .as_ref()
-        .is_some_and(|r| r.proxy_target.is_some())
+    guard.as_ref().is_some_and(|r| r.proxy_target.is_some())
 }
 
 fn clone_target() -> Result<ProxyTarget, String> {
     let guard = lock();
-    let runtime = guard
-        .as_ref()
-        .ok_or_else(|| "API 服务未运行".to_string())?;
+    let runtime = guard.as_ref().ok_or_else(|| "API 服务未运行".to_string())?;
     runtime
         .proxy_target
         .clone()
@@ -994,7 +1011,10 @@ pub fn activate_account_by_email(email: &str) -> Result<(), String> {
                     .unwrap_or("")
                     .to_ascii_lowercase();
                 if sidecar_email == wanted_email {
-                    account.get("id").and_then(Value::as_str).map(str::to_string)
+                    account
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 } else {
                     None
                 }
@@ -1222,11 +1242,8 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
         }
     };
 
-    let mut builder = client
-        .request(upstream_method, &url)
-        .header("Authorization", format!("Bearer {}", target.inner_key));
-
     // 透传 Content-Type / Accept 等，但忽略 hop-by-hop 与外层 Authorization
+    let mut passthrough_headers: Vec<(String, String)> = Vec::new();
     for header in request.headers() {
         let name = header.field.as_str().as_str().to_ascii_lowercase();
         if matches!(
@@ -1245,14 +1262,20 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
         ) {
             continue;
         }
-        builder = builder.header(header.field.as_str().as_str(), header.value.as_str());
+        passthrough_headers.push((
+            header.field.as_str().as_str().to_string(),
+            header.value.as_str().to_string(),
+        ));
     }
 
-    if !body.is_empty() {
-        builder = builder.body(body);
-    }
-
-    let upstream_resp = match builder.send() {
+    let mut upstream_resp = match send_sidecar_proxy_request(
+        &client,
+        upstream_method.clone(),
+        &url,
+        target,
+        &passthrough_headers,
+        body.clone(),
+    ) {
         Ok(r) => r,
         Err(error) => {
             let _ = request.respond(json_response(
@@ -1262,11 +1285,61 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
             return;
         }
     };
+
+    if is_chat_path(path) && upstream_resp.status().as_u16() == 403 {
+        let first_headers = response_headers(&upstream_resp, forced_model.as_deref());
+        let first_status = upstream_resp.status().as_u16();
+        let first_body = upstream_resp
+            .bytes()
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default();
+
+        if is_probe_pending_error(&first_body) {
+            if let Ok(inner_client) = build_inner_client() {
+                let refresh = refresh_sidecar_account_capabilities(&inner_client, target);
+                eprintln!(
+                    "[SuperAI API] account capability check triggered by probe_pending: {}",
+                    sanitize_sidecar_log_line(&refresh.to_string())
+                );
+            }
+
+            match send_sidecar_proxy_request(
+                &client,
+                upstream_method,
+                &url,
+                target,
+                &passthrough_headers,
+                body.clone(),
+            ) {
+                Ok(retried) => upstream_resp = retried,
+                Err(error) => {
+                    let _ = request.respond(json_response(
+                        502,
+                        &json!({"error": {"message": format!("sidecar 不可达: {error}"), "type": "bad_gateway"}}),
+                    ));
+                    return;
+                }
+            }
+        } else {
+            let response = Response::new(
+                StatusCode(first_status),
+                first_headers,
+                Cursor::new(first_body),
+                None,
+                None,
+            );
+            let _ = request.respond(response);
+            return;
+        }
+    }
     // 把最近使用账号的探测放后台线程，避免给客户端 respond 之前再多打
     // 一次 sidecar GET — 之前是同步调用，会拖慢 SSE 首字节，并在高并发
     // 下让 /auth/accounts 被反复打。fire-and-forget 即可，结果只用于
     // UI 高亮，丢失一次没关系。
-    if matches!(path, "/v1/chat/completions" | "/v1/messages" | "/v1/responses") {
+    if matches!(
+        path,
+        "/v1/chat/completions" | "/v1/messages" | "/v1/responses"
+    ) {
         let target_for_probe = target.clone();
         let _ = thread::Builder::new()
             .name("windsurf-api-last-used".into())
@@ -1279,6 +1352,37 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
 
     // 收集响应头（除 hop-by-hop 与 Content-Length；body 长度让 tiny_http 自行决定）。
     let status = upstream_resp.status().as_u16();
+    let headers = response_headers(&upstream_resp, forced_model.as_deref());
+
+    let response = Response::new(StatusCode(status), headers, upstream_resp, None, None);
+    let _ = request.respond(response);
+}
+
+fn send_sidecar_proxy_request(
+    client: &reqwest::blocking::Client,
+    method: reqwest::Method,
+    url: &str,
+    target: &ProxyTarget,
+    passthrough_headers: &[(String, String)],
+    body: Vec<u8>,
+) -> Result<reqwest::blocking::Response, reqwest::Error> {
+    let mut builder = client
+        .request(method, url)
+        .header("Authorization", format!("Bearer {}", target.inner_key));
+
+    for (name, value) in passthrough_headers {
+        builder = builder.header(name, value);
+    }
+    if !body.is_empty() {
+        builder = builder.body(body);
+    }
+    builder.send()
+}
+
+fn response_headers(
+    upstream_resp: &reqwest::blocking::Response,
+    forced_model: Option<&str>,
+) -> Vec<Header> {
     let mut headers: Vec<Header> = Vec::new();
     for (k, v) in upstream_resp.headers().iter() {
         let name_lower = k.as_str().to_ascii_lowercase();
@@ -1311,9 +1415,25 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
             headers.push(h);
         }
     }
+    headers
+}
 
-    let response = Response::new(StatusCode(status), headers, upstream_resp, None, None);
-    let _ = request.respond(response);
+fn is_chat_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/chat/completions" | "/v1/messages" | "/v1/responses"
+    )
+}
+
+fn is_probe_pending_error(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    value
+        .get("error")
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind == "probe_pending")
 }
 
 fn update_last_used_account_from_sidecar(client: &reqwest::blocking::Client, target: &ProxyTarget) {
@@ -1544,8 +1664,12 @@ mod tests {
         let (code, _) = http_get(&addr, "/nope", Some(key));
         assert_eq!(code, 404);
 
-        let (code, body) =
-            http_post(&addr, "/v1/chat/completions", key, r#"{"model":"x","messages":[]}"#);
+        let (code, body) = http_post(
+            &addr,
+            "/v1/chat/completions",
+            key,
+            r#"{"model":"x","messages":[]}"#,
+        );
         assert_eq!(code, 501);
         assert!(body.contains("not_implemented"), "body: {body}");
 
