@@ -70,7 +70,7 @@ const WINDSURF_USER_STATUS_PATH: &str =
     "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
-const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.3-codex";
+const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.5";
 const SUPERAI_AES_KEY_HEX: &str =
     "b9c1e79783adb25cdb3667ae62c168e18868438d62a47428abeb7b41491ff2ee";
 const SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
@@ -411,6 +411,16 @@ fn init_app_db(conn: &Connection) -> Result<(), String> {
         value_json TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+
+      -- 公开版 SuperAI 账号的本地累计用量缓存。
+      -- key = batch_key 的 sha256 hex；value 是 baseline / consumed / last_remote /
+      -- exhausted_at 的 JSON 快照。删账号时写入，重新导入同一 batch_key 时
+      -- 24h 内会恢复，避免用户误删 / 重导后使用记录被清零。
+      CREATE TABLE IF NOT EXISTS public_usage_history (
+        key TEXT PRIMARY KEY,
+        snapshot_json TEXT NOT NULL,
+        saved_at INTEGER NOT NULL
+      );
       "#,
     )
     .map_err(|error| format!("初始化 SQLite 数据库失败: {error}"))?;
@@ -476,22 +486,95 @@ fn read_accounts_from_conn(conn: &Connection) -> Result<Vec<ManagedAccount>, Str
     Ok(accounts)
 }
 
-fn delete_expired_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
+/// 扫一遍 DB，把所有 license_expires_at 已过期的 SuperAI 账号 DELETE 掉。
+///
+/// 返回 (被删 id 列表, 这一批里是否包含原"当前"账号)。
+///
+/// 仅作用于 provider == "windsurf" 且携带 `license_expires_at` 的账号。
+/// Codex / Gemini、完全版 windsurf（无 license_expires_at）不会被误删。
+fn delete_expired_windsurf_accounts(conn: &Connection) -> Result<(Vec<String>, bool), String> {
     let accounts = read_accounts_from_conn(conn)?;
-    let expired_ids = accounts
-        .into_iter()
-        .filter(|account| account.provider == "windsurf")
-        .filter_map(|account| {
-            windsurf_license_expires_at(&account)
-                .filter(|expires_at| windsurf_license_expired_at(*expires_at))
-                .map(|_| account.id)
-        })
-        .collect::<Vec<_>>();
+    let mut expired_ids: Vec<String> = Vec::new();
+    let mut current_was_expired = false;
+    for account in accounts {
+        if account.provider != "windsurf" {
+            continue;
+        }
+        let Some(expires_at) = windsurf_license_expires_at(&account) else {
+            continue;
+        };
+        if !windsurf_license_expired_at(expires_at) {
+            continue;
+        }
+        if is_current_status(&account.status) {
+            current_was_expired = true;
+        }
+        expired_ids.push(account.id);
+    }
     for id in &expired_ids {
         conn.execute("DELETE FROM accounts WHERE id = ?1", params![id])
             .map_err(|error| format!("删除过期 SuperAI 账号失败: {error}"))?;
     }
+    Ok((expired_ids, current_was_expired))
+}
+
+/// 顶层清理入口：删除过期 SuperAI 账号；如果删掉的是"当前"账号，自动从
+/// 剩余可用 SuperAI 账号里挑一个接管为新的当前账号；没有可用账号就静默。
+///
+/// 选择策略：剩余 windsurf 账号里，先排除已耗尽（公开版本地累计 100%）的，
+/// 再按 `license_expires_at` 升序——优先用快到期的，确保过期前能榨干。
+fn cleanup_expired_windsurf_and_handoff(app: &tauri::AppHandle) -> Result<usize, String> {
+    let conn = open_app_db(app)?;
+    let (expired_ids, current_was_expired) = delete_expired_windsurf_accounts(&conn)?;
+    if expired_ids.is_empty() {
+        return Ok(0);
+    }
+
+    schedule_windsurf_sync(app.clone());
+
+    if current_was_expired {
+        // 在剩余账号里挑一个可用的接管。完全版的 windsurf 账号没有
+        // license_expires_at，排序时排在最后即可；公开版按 license 升序。
+        let remaining = read_accounts_from_conn(&conn)?;
+        let mut candidates: Vec<ManagedAccount> = remaining
+            .into_iter()
+            .filter(|account| {
+                account.provider == "windsurf" && !public_usage_is_exhausted(account)
+            })
+            .collect();
+        candidates.sort_by_key(|account| windsurf_license_expires_at(account).unwrap_or(i64::MAX));
+
+        if let Some(next) = candidates.into_iter().next() {
+            // 写 DB current 标记 + 通知 sidecar 切到这个账号。
+            if let Err(error) = set_account_current_state(&conn, "windsurf", &next.id) {
+                eprintln!("[cleanup] 标记新当前账号失败: {error}");
+            }
+            if let Err(error) = activate_windsurf_account_for_api(app, &next) {
+                eprintln!("[cleanup] 启用接管账号失败: {error}");
+            }
+        }
+    }
+
     Ok(expired_ids.len())
+}
+
+/// 后台定时任务：每分钟清扫已过期的 SuperAI 账号。
+///
+/// 性能：单次 = 一次 DB 读 + 简单数值比较，账号数量级很小，每分钟跑一次
+/// 完全可接受；这样过期账号的停用延迟最多 1 分钟，符合用户预期。
+///
+/// 启动时 setup 也会立即同步跑一次，避免新启动时残留过期账号。
+fn spawn_expired_windsurf_cleanup(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        // 启动后稍等几秒，避开 setup 阶段对 DB 的写竞争。
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        loop {
+            if let Err(error) = cleanup_expired_windsurf_and_handoff(&app) {
+                eprintln!("[cleanup] 清理过期 SuperAI 账号失败: {error}");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    });
 }
 
 fn encrypt_plain_windsurf_accounts(conn: &Connection) -> Result<usize, String> {
@@ -598,6 +681,33 @@ fn account_for_frontend(account: &ManagedAccount) -> ManagedAccount {
             .cloned();
         if let Some(value) = derived.or(cached) {
             redacted.subscription_active_until = Some(value);
+        }
+
+        // 用户用 DevTools 监听 Tauri IPC 也只能看到 hash 占位，看不到任何
+        // 真实邮箱 / 显示名 / 上游 plan_name / windsurf 错误原文。前端 UI
+        // 已经 publicAccountCode() 派生 SUPERAI-XXXXX，与这里清空互不冲突。
+        redacted.email = String::new();
+        redacted.display_name = None;
+        redacted.account_name = None;
+        redacted.plan = None;
+        redacted.plan_type = None;
+        redacted.auth_file_plan_type = None;
+        // account_id / user_id 留 None，前端 fallback 到 account.id（DB 里
+        // 是稳定 hash，本身不含敏感串）。
+        redacted.account_id = None;
+        redacted.user_id = None;
+        // status / quota 里的 reason / error 字段可能直接来自 windsurf 上游
+        // 报错原文，里面常含 windsurf.com、内部 plan_name 等可识别串。
+        if let Some(status) = redacted.status.as_mut() {
+            status.reason = None;
+        }
+        if let Some(quota) = redacted.quota.as_mut() {
+            quota.error = None;
+            // 兜底：剔除所有 `windsurf-*` metric key（windsurf-daily / -weekly /
+            // -credits 等）。常规路径下 `rewrite_quota_for_public_usage` 已经把
+            // metrics 替换成单一 `superai-public`，但若上一次 refresh 失败 / 旧
+            // 数据迁移残留，这里再砍一次确保 IPC 输出干净。
+            quota.metrics.retain(|metric| !metric.key.starts_with("windsurf-"));
         }
     }
     redacted.auth_payload = None;
@@ -3251,7 +3361,7 @@ async fn add_superai_accounts_by_batch_keys(
                     let conn = open_app_db(&app)?;
                     load_account_from_db(&conn, &account.id)?
                 };
-                attach_windsurf_batch_key(&mut full_account, &key, credential.expires_at);
+                attach_windsurf_batch_key(&app, &mut full_account, &key, credential.expires_at);
                 upsert_accounts_into_db(&app, std::slice::from_ref(&full_account))?;
                 imported.push(account_for_frontend(&full_account));
             }
@@ -3262,7 +3372,12 @@ async fn add_superai_accounts_by_batch_keys(
     Ok(ImportResult { imported, failed })
 }
 
-fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str, expires_at: i64) {
+fn attach_windsurf_batch_key(
+    app: &tauri::AppHandle,
+    account: &mut ManagedAccount,
+    key: &str,
+    expires_at: i64,
+) {
     let mut payload = account
         .auth_payload
         .take()
@@ -3280,8 +3395,10 @@ fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str, expires_at
     if is_public_build() {
         account.subscription_active_until = Some(Value::Number(expires_at.into()));
     }
-    // 入库时立刻初始化本地累计：把当前上游 weekly% 当 baseline，consumed 从 0 起算。
-    // bump_public_usage 自带初始化分支。
+    // 删账号 24h 内重新导入同一 batch_key：恢复使用记录，避免被清零。
+    // restore 命中后 PUBLIC_USAGE_KEY_LAST_REMOTE 会有值，bump_public_usage
+    // 不会再走"首次记录"分支，baseline / consumed 都按历史值继续累加。
+    let _ = restore_public_usage_history(app, account, key);
     let _ = bump_public_usage(account);
     rewrite_quota_for_public_usage(account);
 }
@@ -3338,10 +3455,25 @@ fn public_usage_consumed_percent(account: &ManagedAccount) -> i64 {
         .clamp(0, 100)
 }
 
+/// 首次导入时拿到的真实剩余额度（baseline）。
+/// 没记录时返回 None；UI 显示用 100 兜底，避免上游一次都没返回时白屏。
+fn public_usage_baseline(account: &ManagedAccount) -> Option<i64> {
+    windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_BASELINE)
+        .and_then(|v| v.as_i64())
+        .map(|v| v.clamp(0, 100))
+}
+
+/// 本地累计可用剩余 = baseline - consumed。clamp 到 [0, 100]。
+fn public_usage_remaining_percent(account: &ManagedAccount) -> i64 {
+    let baseline = public_usage_baseline(account).unwrap_or(100);
+    let consumed = public_usage_consumed_percent(account);
+    (baseline - consumed).clamp(0, 100)
+}
+
 fn public_usage_is_exhausted(account: &ManagedAccount) -> bool {
     has_public_usage_tracking(account)
         && (windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_EXHAUSTED_AT).is_some()
-            || public_usage_consumed_percent(account) >= 100)
+            || public_usage_remaining_percent(account) <= 0)
 }
 
 fn current_weekly_remaining_from_account(account: &ManagedAccount) -> Option<i64> {
@@ -3357,10 +3489,14 @@ fn current_weekly_remaining_from_account(account: &ManagedAccount) -> Option<i64
 /// 把上游 weekly% 的下降量累计到本地。返回 (是否本次首次耗尽, 当前 consumed%)。
 ///
 /// 语义：
-///   - 第一次记录：以当前 weekly% 当 baseline + last_remote，consumed 起步 0。
-///   - 后续：diff = last_remote - this_weekly；diff > 0 才累加（单调递增）。
-///   - 上游重置（this_weekly > last_remote）：丢弃负 diff，只更新 last_remote。
-///   - consumed 永远 clamp 在 [0,100]；触达 100 即标 unavailable + 已耗尽。
+///   - 第一次记录：以当前 weekly% 当 baseline + last_remote，consumed 起步 0；
+///     UI 显示的剩余 = baseline - consumed = 上游真实剩余（不再强行写成 100%）。
+///     如果删除后 24h 内重新导入同一 batch_key，会从 usage_history 恢复
+///     baseline / consumed / last_remote / exhausted_at，避免使用记录被清零。
+///   - 后续：diff = last_remote - this_weekly；diff > 0 才累加（单调递增）；
+///     上游重置（this_weekly > last_remote）丢弃负 diff，只更新 last_remote。
+///   - consumed clamp 在 [0,100]；只要 baseline - consumed <= 0 就视为耗尽并
+///     软停用账号（不删除，等 license 过期由 cleanup 统一清除）。
 fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
     if !has_public_usage_tracking(account) {
         return (false, 0);
@@ -3379,6 +3515,7 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
         .map(|v| v.clamp(0, 100));
 
     if last_remote.is_none() {
+        // 首次见到这个账号：baseline = 上游当前真实剩余。consumed = 0 起算。
         windsurf_payload_set_value(
             account,
             PUBLIC_USAGE_KEY_BASELINE,
@@ -3396,7 +3533,7 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
                 Value::Number(0.into()),
             );
         }
-        return (false, consumed);
+        return (false, public_usage_consumed_percent(account));
     }
 
     let last_remote = last_remote.unwrap();
@@ -3416,8 +3553,11 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
         Value::Number(weekly.into()),
     );
 
-    let just_exhausted = !already_exhausted && consumed >= 100;
-    if consumed >= 100 {
+    // 剩余以 baseline 为上限：baseline - consumed <= 0 即耗尽。
+    let baseline = public_usage_baseline(account).unwrap_or(100);
+    let remaining = (baseline - consumed).max(0);
+    let just_exhausted = !already_exhausted && remaining <= 0;
+    if remaining <= 0 {
         let now = now_ts();
         if !already_exhausted {
             windsurf_payload_set_value(
@@ -3444,8 +3584,12 @@ fn rewrite_quota_for_public_usage(account: &mut ManagedAccount) {
     if !has_public_usage_tracking(account) {
         return;
     }
-    let consumed = public_usage_consumed_percent(account);
-    let remaining = (100 - consumed).max(0);
+    // remaining = baseline - consumed（首次导入时 baseline 取自上游真实剩余，
+    // 之后不再被上游回血污染）。如果 baseline 还没有，公开版兜底用 100，避免
+    // UI 在上游接口尚未返回时白屏。
+    let baseline = public_usage_baseline(account).unwrap_or(100);
+    let remaining = public_usage_remaining_percent(account);
+    let used = (baseline - remaining).max(0);
     let now = now_ts();
     let last_updated = account
         .quota
@@ -3458,7 +3602,7 @@ fn rewrite_quota_for_public_usage(account: &mut ManagedAccount) {
         label: "日限".to_string(),
         remaining_percent: Some(remaining),
         reset_at: account.subscription_active_until.clone(),
-        detail: Some(format!("已用 {consumed}%")),
+        detail: Some(format!("已用 {used}% / 共 {baseline}%")),
         state: Some(quota_state_from_remaining(remaining)),
     };
     account.quota = Some(AccountQuota {
@@ -3474,6 +3618,168 @@ fn apply_public_usage_after_refresh(account: &mut ManagedAccount) -> bool {
     let (just_exhausted, _) = bump_public_usage(account);
     rewrite_quota_for_public_usage(account);
     just_exhausted
+}
+
+// ---------------------------------------------------------------------------
+// 公开版账号"本地累计用量"持久化历史（24h TTL）
+//
+// 用户误删账号后重新导入同一 batch_key 时，期望使用记录不被清零。我们用
+// `public_usage_history` 表存一份 baseline / consumed / last_remote /
+// exhausted_at 快照，TTL 24h；超过窗口或没命中即按"首次导入"重新初始化。
+// 仅公开版 + windsurf provider + 含 batch_key 的账号生效。
+// ---------------------------------------------------------------------------
+
+const PUBLIC_USAGE_HISTORY_TTL_SECS: i64 = 24 * 60 * 60;
+
+/// batch_key 的稳定 hash，作为 history 表 PK。SHA-256 hex，避免明文落库。
+fn batch_key_history_key(batch_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(batch_key.trim().as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// 从 account 当前 payload 提取 usage 快照（baseline / consumed / last_remote /
+/// exhausted_at）。任一字段为空则返回 None（无值得保存的记录）。
+fn build_public_usage_snapshot(account: &ManagedAccount) -> Option<Value> {
+    let baseline = windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_BASELINE);
+    let last_remote = windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_LAST_REMOTE);
+    let consumed = windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_CONSUMED);
+    let exhausted_at = windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_EXHAUSTED_AT);
+    if baseline.is_none() && last_remote.is_none() && consumed.is_none() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    if let Some(value) = baseline {
+        obj.insert(PUBLIC_USAGE_KEY_BASELINE.to_string(), value);
+    }
+    if let Some(value) = last_remote {
+        obj.insert(PUBLIC_USAGE_KEY_LAST_REMOTE.to_string(), value);
+    }
+    if let Some(value) = consumed {
+        obj.insert(PUBLIC_USAGE_KEY_CONSUMED.to_string(), value);
+    }
+    if let Some(value) = exhausted_at {
+        obj.insert(PUBLIC_USAGE_KEY_EXHAUSTED_AT.to_string(), value);
+    }
+    Some(Value::Object(obj))
+}
+
+/// 删账号前调用：把 public usage 快照写进 history 表。仅对公开版 + 含 batch_key
+/// 的 windsurf 账号生效；其它账号、其它构建模式一律 no-op，不报错。
+fn stash_public_usage_history(app: &tauri::AppHandle, account: &ManagedAccount) {
+    if !is_public_build() || account.provider != "windsurf" {
+        return;
+    }
+    let Some(batch_key) = windsurf_payload_string(account, "batch_key") else {
+        return;
+    };
+    let Some(snapshot) = build_public_usage_snapshot(account) else {
+        return;
+    };
+    let snapshot_json = match serde_json::to_string(&snapshot) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[usage-history] 序列化失败: {error}");
+            return;
+        }
+    };
+    // 用与 windsurf 账号正文同一把 AES key 加密落库。明文 snapshot 含 baseline /
+    // consumed / last_remote 等本地用量信息，不希望用户直接打开 sqlite 就能改。
+    let cipher_text = match superai_encrypt_text(&snapshot_json) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[usage-history] 加密失败: {error}");
+            return;
+        }
+    };
+    let key = batch_key_history_key(&batch_key);
+    let now = now_ts();
+    match open_app_db(app) {
+        Ok(conn) => {
+            // 顺手清掉超过 TTL 的旧记录，避免表无限制膨胀。
+            let _ = conn.execute(
+                "DELETE FROM public_usage_history WHERE saved_at < ?1",
+                params![now - PUBLIC_USAGE_HISTORY_TTL_SECS],
+            );
+            if let Err(error) = conn.execute(
+                "INSERT INTO public_usage_history (key, snapshot_json, saved_at) \
+                 VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(key) DO UPDATE SET snapshot_json = excluded.snapshot_json, saved_at = excluded.saved_at",
+                params![key, cipher_text, now],
+            ) {
+                eprintln!("[usage-history] 写入失败: {error}");
+            }
+        }
+        Err(error) => eprintln!("[usage-history] 打开 DB 失败: {error}"),
+    }
+}
+
+/// 重新导入时调用：若 24h 内有同一 batch_key 的快照，回填到 account.auth_payload。
+/// 命中并写回字段返回 true，未命中返回 false。
+fn restore_public_usage_history(
+    app: &tauri::AppHandle,
+    account: &mut ManagedAccount,
+    batch_key: &str,
+) -> bool {
+    if !is_public_build() || account.provider != "windsurf" {
+        return false;
+    }
+    let key = batch_key_history_key(batch_key);
+    let conn = match open_app_db(app) {
+        Ok(conn) => conn,
+        Err(error) => {
+            eprintln!("[usage-history] 打开 DB 失败: {error}");
+            return false;
+        }
+    };
+    let now = now_ts();
+    // TTL 过期的快照视为不存在；顺手清理掉。
+    let _ = conn.execute(
+        "DELETE FROM public_usage_history WHERE saved_at < ?1",
+        params![now - PUBLIC_USAGE_HISTORY_TTL_SECS],
+    );
+    let row: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT snapshot_json, saved_at FROM public_usage_history WHERE key = ?1",
+            params![key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    let Some((cipher_text, saved_at)) = row else {
+        return false;
+    };
+    if now - saved_at > PUBLIC_USAGE_HISTORY_TTL_SECS {
+        return false;
+    }
+    // snapshot 在 stash 时用 AES 加密；解密失败视为脏数据丢弃。
+    let snapshot_json = match superai_decrypt_text(&cipher_text) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[usage-history] 解密失败: {error}");
+            return false;
+        }
+    };
+    let snapshot: Value = match serde_json::from_str(&snapshot_json) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[usage-history] 反序列化失败: {error}");
+            return false;
+        }
+    };
+    let Some(obj) = snapshot.as_object() else {
+        return false;
+    };
+    for field in [
+        PUBLIC_USAGE_KEY_BASELINE,
+        PUBLIC_USAGE_KEY_LAST_REMOTE,
+        PUBLIC_USAGE_KEY_CONSUMED,
+        PUBLIC_USAGE_KEY_EXHAUSTED_AT,
+    ] {
+        if let Some(value) = obj.get(field).cloned() {
+            windsurf_payload_set_value(account, field, value);
+        }
+    }
+    true
 }
 
 fn emit_account_exhausted(app: &tauri::AppHandle, account: &ManagedAccount) {
@@ -5122,12 +5428,9 @@ fn start_window_drag(window: tauri::Window) -> Result<(), String> {
 
 #[tauri::command]
 fn list_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
+    let _ = cleanup_expired_windsurf_and_handoff(&app);
     let conn = open_app_db(&app)?;
     encrypt_plain_windsurf_accounts(&conn)?;
-    let removed = delete_expired_windsurf_accounts(&conn)?;
-    if removed > 0 {
-        schedule_windsurf_sync(app.clone());
-    }
     enforce_single_current_account(&conn)?;
     read_accounts_from_conn(&conn).map(accounts_for_frontend)
 }
@@ -5235,13 +5538,10 @@ async fn refresh_provider_accounts(
 
 #[tauri::command]
 async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
+    let _ = cleanup_expired_windsurf_and_handoff(&app);
     let mut accounts = {
         let conn = open_app_db(&app)?;
         encrypt_plain_windsurf_accounts(&conn)?;
-        let removed = delete_expired_windsurf_accounts(&conn)?;
-        if removed > 0 {
-            schedule_windsurf_sync(app.clone());
-        }
         read_accounts_from_conn(&conn)?
     };
 
@@ -5272,6 +5572,13 @@ async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccoun
 #[allow(non_snake_case)]
 fn delete_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
+    // 删之前先把账号读出来，给公开版 + batch_key 的 SuperAI 账号 stash 一份
+    // 使用记录到 public_usage_history（24h 内重新导入会自动恢复）。
+    if let Ok(account) = load_account_from_db(&conn, &accountId) {
+        drop(conn);
+        stash_public_usage_history(&app, &account);
+    }
+    let conn = open_app_db(&app)?;
     let deleted = conn
         .execute("DELETE FROM accounts WHERE id = ?1", params![accountId])
         .map_err(|error| format!("删除账号失败: {error}"))?;
@@ -5289,6 +5596,19 @@ fn delete_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
 fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
     let account = load_account_from_db(&conn, &accountId)?;
+    // 兜底：SuperAI 账号有效期已过 / 公开版本地累计已耗尽 → 不允许启用，
+    // 避免上游 422 / 用户误把已停用账号挂起。前端理应同步过滤，但万一不一致
+    // 走到这里也得明确拦掉。
+    if account.provider == "windsurf" {
+        if let Some(expires_at) = windsurf_license_expires_at(&account) {
+            if windsurf_license_expired_at(expires_at) {
+                return Err("该账号有效期已过，无法启用，请删除后重新导入".to_string());
+            }
+        }
+        if public_usage_is_exhausted(&account) {
+            return Err("该账号本地累计额度已耗尽，无法启用".to_string());
+        }
+    }
     match account.provider.as_str() {
         "codex" => write_codex_auth(&account)?,
         "gemini" => write_gemini_auth(&account)?,
@@ -5825,7 +6145,7 @@ fn set_api_service_default_model(
     write_settings_record(&app, &settings)?;
     // 在跑就立刻热更，不在跑只持久化等下次启动。
     let _ = windsurf_api::update_default_model(&settings.api_service_default_model);
-    // 顺手把 ~/.codex/config.toml managed block 的 model 行原地改写，
+    // 顺手把 ~/.codex/config.toml 的 model 行原地改写，
     // 这样 codex 重启后 TUI 顶部 `model:` 跟 SuperAI UI 一致。
     // 用户没点过"配置Codex"时该函数返回 false，不会擅自创建文件。
     if let Err(error) = rewrite_managed_model_line(&settings.api_service_default_model) {
@@ -5908,22 +6228,20 @@ async fn stop_api_service(
 
 // ---------- 一键配置 Codex App ----------
 //
-// 直接改写 `~/.codex/config.toml`：在文件最前面写一个 SuperAI managed block，
+// 直接改写 `~/.codex/config.toml`：生成一份干净的 SuperAI 配置，
 // 内含：
 //   - 顶层 `model_provider = "superai"` / `model = "<选中的模型>"`
 //   - `[model_providers.superai]` 段，把 base_url、wire_api 写好，并通过
-//     `http_headers.Authorization = "Bearer <key>"` 把鉴权一并写进配置文件，
-//     避免依赖环境变量。
+//     `requires_openai_auth = true` 让 codex 从 `~/.codex/auth.json` 的
+//     `OPENAI_API_KEY` 字段读取 SuperAI key 当 bearer token。
 //
-// 用户原有的顶层 `model_provider` / `model` 行会被**注释**为
-// `# disabled by SuperAI: ...`，保留可回滚（用户手动去掉注释就恢复原状）。
-// 其它一切（其它 provider 段、profile 段、unrelated 配置）一律不动。
+// `config.toml` 完全由 SuperAI 接管：写入时**不**备份（我们覆盖整文件，
+// 多次点"配置 Codex"也不会丢失任何"用户原配置"，因为第一次点的时候就已经覆盖了）；
+// 恢复时直接删除 SuperAI 写的 config.toml，让 codex 回到自己的默认行为。
 //
-// 首次写入前会备份原 `config.toml` 到 `config.toml.superai-bak`，永久保留。
-
-const SUPERAI_TOML_BEGIN: &str = "# >>> SuperAI managed block (auto-generated, do not edit) >>>";
-const SUPERAI_TOML_END: &str = "# <<< SuperAI managed block <<<";
-const SUPERAI_DISABLED_PREFIX: &str = "# disabled by SuperAI: ";
+// `auth.json` 不一样：里面可能有 ChatGPT 登录态，所以只在**首次**写入前
+// 备份到 `auth.json.superai-bak`，已有备份就跳过 —— 这样反复点配置不会
+// 把真正的原 `auth.json` 覆盖掉。
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -5931,9 +6249,6 @@ struct CodexAppSetupResult {
     config_path: String,
     base_url: String,
     model_id: String,
-    backup_path: Option<String>,
-    /// 用户原有的顶层 key 被注释了几行（便于在 UI 提示是否动到了用户配置）。
-    disabled_user_keys: usize,
     /// 若动到了 `~/.codex/auth.json`，这里是原文件的备份路径。
     auth_backup_path: Option<String>,
     /// 为 true 表示我们把 auth.json 的 ChatGPT tokens 清空了（只保留 API key 模式），
@@ -5941,79 +6256,18 @@ struct CodexAppSetupResult {
     auth_neutralized: bool,
 }
 
-/// 删除已有的 SuperAI managed block（如果存在）。保留前后用户内容原样。
-fn strip_superai_managed_block(content: &str) -> String {
-    let bytes = content.as_bytes();
-    let begin = match content.find(SUPERAI_TOML_BEGIN) {
-        Some(i) => i,
-        None => return content.to_string(),
-    };
-    let end = match content[begin..].find(SUPERAI_TOML_END) {
-        Some(rel) => begin + rel,
-        None => return content.to_string(),
-    };
-    let after_end = match content[end..].find('\n') {
-        Some(rel) => end + rel + 1,
-        None => content.len(),
-    };
-    let mut start = begin;
-    if start > 0 && bytes[start - 1] == b'\n' {
-        start -= 1;
-    }
-    let mut out = String::with_capacity(content.len());
-    out.push_str(&content[..start]);
-    out.push_str(&content[after_end..]);
-    out
-}
-
-fn has_external_superai_provider_section(stripped: &str) -> bool {
-    stripped.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed == "[model_providers.superai]" || trimmed == "[ model_providers.superai ]"
-    })
-}
-
-/// 判断一行是不是顶层 `<key> =` 或 `<key>=` 形式的赋值。
-fn is_top_level_assignment_for(line: &str, key: &str) -> bool {
-    let trimmed = line.trim_start();
-    let rest = match trimmed.strip_prefix(key) {
-        Some(r) => r,
-        None => return false,
-    };
-    let next = rest.chars().next();
-    matches!(next, Some(c) if c == '=' || c.is_whitespace())
-}
-
-/// 把内容里出现在**顶层**（即不在任何 `[section]` 内）的某些 key 注释掉。
-/// 已注释或已是我们的"disabled by SuperAI"行不会重复处理。
-/// 返回 (新内容, 被注释行数)。
-fn comment_out_top_level_keys(content: &str, keys: &[&str]) -> (String, usize) {
-    let mut out_lines: Vec<String> = Vec::with_capacity(content.lines().count());
-    let mut in_top_level = true;
-    let mut disabled_count = 0usize;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        // 进入/离开 section 头。
-        if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.starts_with("[[") {
-            in_top_level = false;
-            out_lines.push(line.to_string());
-            continue;
-        }
-        if in_top_level
-            && !trimmed.starts_with('#')
-            && keys.iter().any(|k| is_top_level_assignment_for(line, k))
-        {
-            out_lines.push(format!("{SUPERAI_DISABLED_PREFIX}{line}"));
-            disabled_count += 1;
-        } else {
-            out_lines.push(line.to_string());
-        }
-    }
-    let mut new_content = out_lines.join("\n");
-    if content.ends_with('\n') {
-        new_content.push('\n');
-    }
-    (new_content, disabled_count)
+/// 判断这份 `config.toml` 是不是 SuperAI 写的。
+///
+/// 判定：同时包含顶层 `model_provider = "superai"` 行和 `[model_providers.superai]`
+/// 段。两个都在才算我们写的；否则一律不动文件（恢复逻辑会留给用户自己处理）。
+fn config_is_superai_owned(content: &str) -> bool {
+    let has_top = content
+        .lines()
+        .any(|line| line.trim() == "model_provider = \"superai\"");
+    let has_section = content
+        .lines()
+        .any(|line| line.trim() == "[model_providers.superai]");
+    has_top && has_section
 }
 
 /// 转义 TOML basic string 里的字符。我们的 API key 是 `agt_wsf_<hex>`，
@@ -6034,61 +6288,57 @@ fn escape_toml_basic_string(s: &str) -> String {
     out
 }
 
-/// 写入 codex `~/.codex/config.toml` 的 SuperAI managed block。
+/// 写入 codex `~/.codex/config.toml` 的 SuperAI 配置。
 ///
 /// 设计：
 /// - `model` 字段直接用 SuperAI UI 当前选中的真实模型名（如 `claude-opus-4.7-medium`）。
 ///   这样 codex TUI 顶部那行 `model:` 跟 SuperAI UI 一致，不再误导。
 /// - SuperAI 切模型时，前端调 `set_api_service_default_model`，后端会顺手
-///   `rewrite_managed_model_line()` 把这行原地改掉，下次 codex 重启就显示新模型；
+///   `rewrite_managed_model_line()` 把这行改掉，下次 codex 重启就显示新模型；
 ///   codex 进程没重启时，proxy 内存里 default_model 也已热更，请求立即生效。
-/// - 用真实模型名 + proxy 不改写（请求/响应一致）→ codex CLI 不会触发
-///   cyber-safety 误报；只剩一条 `Model metadata not found` cosmetic 提示，
-///   ylsagi 等所有 custom provider 都有，无解。
-fn build_superai_managed_block(base_url: &str, model_id: &str, api_key: &str) -> String {
+///
+/// 鉴权选择 `requires_openai_auth = true`（**不**设 `env_key`）：
+///   - codex-rs 里 `env_key` 是"强制查环境变量"语义：设了之后，进程启动时
+///     该 env var 不存在就直接报 `Missing environment variable: OPENAI_API_KEY`，
+///     **不会**回落到 `auth.json`。所以不能用 env_key 引用 auth.json 字段。
+///   - 不设 env_key + `requires_openai_auth = true` 时，codex 会走 OpenAI auth
+///     流程，从 `~/.codex/auth.json` 读 `OPENAI_API_KEY` 当 bearer token；
+///     桌面版 settings 面板也认这种形态（渲染成"OpenAI 兼容站点用 API key"）。
+///   - 之前用 `experimental_bearer_token` + `http_headers.Authorization` 虽然
+///     codex CLI 能跑，但桌面版 settings UI 不认这种鉴权形态，左下角面板和
+///     历史会话视图会整个坏掉。
+fn build_superai_managed_block(base_url: &str, model_id: &str, _api_key: &str) -> String {
     let url = escape_toml_basic_string(base_url);
     let model = escape_toml_basic_string(model_id);
-    let bearer = escape_toml_basic_string(&format!("Bearer {api_key}"));
-    // 鉴权直接走 `experimental_bearer_token`：
-    //   - codex-rs 在 `bearer_auth_for_provider` 里会优先用它，
-    //     避免去查 env_key / auth.json，启动不再依赖 OPENAI_API_KEY 环境变量。
-    //   - 不设 `env_key` / `requires_openai_auth`，因为这两项只对内置
-    //     `openai` provider 有效；自定义 provider 设了 `env_key` 会强制
-    //     从环境变量读 API key，读不到就报 `Missing environment variable`。
-    //   - 同时在 `http_headers.Authorization` 里再写一份 Bearer 作为兜底，
-    //     旧版本 codex 不认 `experimental_bearer_token` 时也能跑。
     format!(
-        "{begin}\n\
-model_provider = \"superai\"\n\
+        "model_provider = \"superai\"\n\
 model = \"{model}\"\n\
+model_reasoning_effort = \"medium\"\n\
+approval_policy = \"on-request\"\n\
+sandbox_mode = \"workspace-write\"\n\
+network_access = \"enabled\"\n\
 model_context_window = 200000\n\
 model_max_output_tokens = 32768\n\
 disable_response_storage = true\n\
+personality = \"pragmatic\"\n\
+service_tier = \"fast\"\n\
 \n\
 [model_providers.superai]\n\
 name = \"SuperAI\"\n\
 base_url = \"{url}\"\n\
 wire_api = \"responses\"\n\
-experimental_bearer_token = \"{api_key_escaped}\"\n\
-\n\
-[model_providers.superai.http_headers]\n\
-Authorization = \"{bearer}\"\n\
-{end}\n",
-        begin = SUPERAI_TOML_BEGIN,
-        end = SUPERAI_TOML_END,
-        api_key_escaped = escape_toml_basic_string(api_key),
+requires_openai_auth = true\n\
+",
     )
 }
 
-/// 当 SuperAI UI 切换模型时调用：原地把 managed block 里的
+/// 当 SuperAI UI 切换模型时调用：原地把 SuperAI 配置里的
 /// `model = "..."` 那一行改成新模型名。
 ///
-/// - 文件不存在 / 没 SuperAI managed 标记 / 没找到 model 行 → 一律不动文件，返回 false。
+/// - 文件不存在 / 不是 SuperAI 配置 / 没找到 model 行 → 一律不动文件，返回 false。
 ///   说明用户还没点"配置 Codex"，不该擅自创建文件。
 /// - 改动成功返回 true。
 ///
-/// 比直接重新生成整个 managed block 更安全：保留用户在 block 之外的自定义内容、
-/// 也不会重复处理 disabled keys 的注释。
 fn rewrite_managed_model_line(model_id: &str) -> Result<bool, String> {
     let codex_home = match codex_home_dir() {
         Ok(path) => path,
@@ -6099,22 +6349,14 @@ fn rewrite_managed_model_line(model_id: &str) -> Result<bool, String> {
         return Ok(false);
     }
     let existing = read_to_string(&config_path)?;
-    let Some(begin) = existing.find(SUPERAI_TOML_BEGIN) else {
+    if !config_is_superai_owned(&existing) {
         return Ok(false);
-    };
-    let Some(end_rel) = existing[begin..].find(SUPERAI_TOML_END) else {
-        return Ok(false);
-    };
-    let block_end = begin + end_rel + SUPERAI_TOML_END.len();
-
-    let head = &existing[..begin];
-    let block = &existing[begin..block_end];
-    let tail = &existing[block_end..];
+    }
 
     let escaped = escape_toml_basic_string(model_id);
-    let mut new_lines: Vec<String> = Vec::with_capacity(block.lines().count());
+    let mut new_lines: Vec<String> = Vec::with_capacity(existing.lines().count());
     let mut replaced = false;
-    for line in block.lines() {
+    for line in existing.lines() {
         let trimmed = line.trim_start();
         if !replaced && trimmed.starts_with("model = \"") {
             new_lines.push(format!("model = \"{escaped}\""));
@@ -6126,12 +6368,10 @@ fn rewrite_managed_model_line(model_id: &str) -> Result<bool, String> {
     if !replaced {
         return Ok(false);
     }
-    let new_block = new_lines.join("\n");
-
-    let mut next = String::with_capacity(existing.len() + 32);
-    next.push_str(head);
-    next.push_str(&new_block);
-    next.push_str(tail);
+    let mut next = new_lines.join("\n");
+    if existing.ends_with('\n') && !next.ends_with('\n') {
+        next.push('\n');
+    }
 
     if next == existing {
         return Ok(false);
@@ -6170,11 +6410,17 @@ fn neutralize_codex_auth_json(
         None
     };
 
-    // 2) 判断是否需要改写：若已经是 "仅 API key + tokens=null" 的 SuperAI 形态，就不重复写。
+    // 2) 判断是否需要改写：若已经是 "仅 API key" 的 SuperAI 形态，就不重复写。
+    //
+    // 历史教训：之前我们写 `{ OPENAI_API_KEY, tokens: null, last_refresh: null }`，
+    // 想着"显式声明 ChatGPT 登录态被清空"。但 codex 桌面版的设置面板会去读
+    // `tokens.id_token` 之类的子字段，遇到 `null` 而不是 missing 直接报错，
+    // 左下角设置 + 历史会话视图整个挂掉。参考 ylscode / 第三方站点工作配置，
+    // auth.json 就只放 `OPENAI_API_KEY` 一个字段，`tokens` / `last_refresh` 必须**缺失**
+    // 而不是 null。codex CLI/app 见到没 tokens 自然走 OPENAI_API_KEY 鉴权路径，
+    // 设置面板也会渲染成"OpenAI 兼容站点用 API key"的标准状态。
     let desired = serde_json::json!({
         "OPENAI_API_KEY": api_key,
-        "tokens": serde_json::Value::Null,
-        "last_refresh": serde_json::Value::Null,
     });
     if auth_path.exists() {
         if let Ok(existing) = fs::read_to_string(&auth_path) {
@@ -6229,56 +6475,10 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
         .map_err(|error| format!("创建目录失败 {}: {error}", codex_home.display()))?;
 
     let config_path = codex_home.join("config.toml");
-    let existing = if config_path.exists() {
-        read_to_string(&config_path)?
-    } else {
-        String::new()
-    };
 
-    let stripped = strip_superai_managed_block(&existing);
-
-    if has_external_superai_provider_section(&stripped) {
-        return Err(format!(
-            "{} 中已存在 [model_providers.superai] 段，但不在 SuperAI 自动管理范围内。请先手动删除该段再点一键配置，以免覆盖你的自定义内容。",
-            config_path.display(),
-        ));
-    }
-
-    // 首次写入前做一次性原始备份，永久保留，方便用户随时回滚。
-    let backup_path_buf = codex_home.join("config.toml.superai-bak");
-    let backup_path = if config_path.exists() && !backup_path_buf.exists() {
-        fs::copy(&config_path, &backup_path_buf)
-            .map_err(|error| format!("备份 {} 失败: {error}", config_path.display()))?;
-        Some(backup_path_buf.display().to_string())
-    } else if backup_path_buf.exists() {
-        Some(backup_path_buf.display().to_string())
-    } else {
-        None
-    };
-
-    // 把用户已有的顶层 model_provider / model / preferred_auth_method 注释掉，
-    // 避免与 managed block 重复定义（TOML 重复 key 会解析失败）。
-    let (user_body, disabled_user_keys) = comment_out_top_level_keys(
-        &stripped,
-        &[
-            "model_provider",
-            "model",
-            "preferred_auth_method",
-            "model_context_window",
-            "model_max_output_tokens",
-            "disable_response_storage",
-        ],
-    );
-
-    // managed block 放最前面：顶层 key 在 TOML 里必须先于任何 [section] 出现。
-    let managed = build_superai_managed_block(&base_url, &model_id, &api_key);
-    let mut next = String::with_capacity(managed.len() + user_body.len() + 2);
-    next.push_str(&managed);
-    let trimmed_user = user_body.trim_start_matches('\n').to_string();
-    if !trimmed_user.is_empty() {
-        next.push('\n');
-        next.push_str(&trimmed_user);
-    }
+    // config.toml 完全由 SuperAI 接管：直接整文件覆盖，不做任何备份。
+    // 多次点"配置 Codex"也不会丢东西 —— 真有过用户原配置，也只会在最早那一次被覆盖。
+    let mut next = build_superai_managed_block(&base_url, &model_id, &api_key);
     if !next.ends_with('\n') {
         next.push('\n');
     }
@@ -6292,14 +6492,13 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
 
     // 中和 auth.json：清掉 ChatGPT tokens，只保留 API key 模式，
     // 让官方 Codex 不再展示 ChatGPT 额度，也不再拿 ChatGPT access_token 发请求。
+    // 这一步**会**做幂等备份（仅首次），避免反复点配置 Codex 把真原文件覆盖。
     let (auth_backup_path, auth_neutralized) = neutralize_codex_auth_json(&codex_home, &api_key)?;
 
     Ok(CodexAppSetupResult {
         config_path: config_path.display().to_string(),
         base_url,
         model_id,
-        backup_path,
-        disabled_user_keys,
         auth_backup_path,
         auth_neutralized,
     })
@@ -6310,81 +6509,55 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
 pub struct CodexAppRestoreResult {
     /// 实际生效的恢复动作，给前端展示用。
     pub steps: Vec<String>,
-    /// 哪些备份文件被使用 / 找到。
-    pub config_restored_from_backup: bool,
+    /// 是否真的把 auth.json 从 `.superai-bak` 备份恢复回来了。
     pub auth_restored_from_backup: bool,
-}
-
-/// 把 `# disabled by SuperAI: <line>` 这样被我们注释掉的顶层 keys 取消注释。
-fn uncomment_superai_disabled_lines(content: &str) -> String {
-    let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
-    for line in content.lines() {
-        if let Some(rest) = line.strip_prefix(SUPERAI_DISABLED_PREFIX) {
-            out.push(rest.to_string());
-        } else {
-            out.push(line.to_string());
-        }
-    }
-    let mut new_content = out.join("\n");
-    if content.ends_with('\n') {
-        new_content.push('\n');
-    }
-    new_content
+    /// 是否把 SuperAI 自己写的 config.toml 删掉，让 codex 回到默认。
+    pub config_removed: bool,
 }
 
 /// 把 `~/.codex` 还原成 SuperAI 接管之前的样子。
 ///
-/// 优先级：
-/// 1. 若有 `.superai-bak` 备份 → 直接 cp 回原文件（最忠实）
-/// 2. 没备份但 SuperAI managed block 在 → 移除 block + 还原"被注释的顶层 keys"
-///    （`# disabled by SuperAI: model = "..."` → `model = "..."`），让用户原配置生效
-/// 3. 没 managed block 也没 .superai-bak → no-op（用户可能从未点过配置 Codex）
-///
-/// auth.json 同理，但只支持"有备份就恢复，没备份就跳过"，因为我们写的
-/// `{ OPENAI_API_KEY, tokens=null }` 没法机械还原成 ChatGPT 登录态。
+/// 现在的策略很简单：
+/// - **`config.toml`**：完全由 SuperAI 写入，没备份；恢复时只要这份文件是
+///   SuperAI 自己写的（同时含顶层 `model_provider = "superai"` 和
+///   `[model_providers.superai]`），直接删掉，codex 回到默认行为。
+///   不是 SuperAI 写的就保留 —— 我们没碰过用户自己手写的内容。
+/// - **`auth.json`**：有 `.superai-bak` 备份就 cp 回去；没备份就跳过（我们写的
+///   "仅 OPENAI_API_KEY" 形态没法机械反推 ChatGPT 登录态）。
 #[tauri::command]
 fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, String> {
     let codex_home = codex_home_dir()?;
     let config_path = codex_home.join("config.toml");
     let auth_path = codex_home.join("auth.json");
-    let config_bak = codex_home.join("config.toml.superai-bak");
     let auth_bak = codex_home.join("auth.json.superai-bak");
 
     let mut steps: Vec<String> = Vec::new();
-    let mut config_restored_from_backup = false;
     let mut auth_restored_from_backup = false;
+    let mut config_removed = false;
 
-    // ---- config.toml ----
-    if config_bak.exists() {
-        fs::copy(&config_bak, &config_path)
-            .map_err(|error| format!("恢复 config.toml 失败: {error}"))?;
-        steps.push(format!(
-            "已用 {} 覆盖回 {}",
-            config_bak.display(),
-            config_path.display(),
-        ));
-        config_restored_from_backup = true;
-    } else if config_path.exists() {
+    // ---- config.toml：是 SuperAI 写的就删 ----
+    if config_path.exists() {
         let existing = read_to_string(&config_path)?;
-        let stripped = strip_superai_managed_block(&existing);
-        let restored = uncomment_superai_disabled_lines(&stripped);
-        if restored != existing {
-            write_string_atomic(&config_path, &restored)?;
+        if config_is_superai_owned(&existing) {
+            fs::remove_file(&config_path).map_err(|error| {
+                format!("删除 SuperAI 写的 config.toml 失败: {error}")
+            })?;
             steps.push(format!(
-                "未找到 config.toml.superai-bak，已就地移除 managed block 并恢复被注释的 keys（{}）",
+                "已删除 SuperAI 写的 {}（codex 回到默认行为）",
                 config_path.display(),
             ));
+            config_removed = true;
         } else {
             steps.push(format!(
-                "config.toml 中无 SuperAI 痕迹，跳过（{}）",
+                "config.toml 非 SuperAI 接管，原样保留（{}）",
                 config_path.display(),
             ));
         }
     } else {
-        steps.push("没有 ~/.codex/config.toml，无需恢复".to_string());
+        steps.push("没有 ~/.codex/config.toml，无需处理".to_string());
     }
 
-    // ---- auth.json ----
+    // ---- auth.json：有备份就 cp 回去 ----
     if auth_bak.exists() {
         fs::copy(&auth_bak, &auth_path)
             .map_err(|error| format!("恢复 auth.json 失败: {error}"))?;
@@ -6408,8 +6581,8 @@ fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, St
 
     Ok(CodexAppRestoreResult {
         steps,
-        config_restored_from_backup,
         auth_restored_from_backup,
+        config_removed,
     })
 }
 
@@ -6476,7 +6649,7 @@ pub fn run() {
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                let app_size = LogicalSize::new(1240.0, 820.0);
+                let app_size = LogicalSize::new(1180.0, 720.0);
                 window.set_resizable(false)?;
                 window.set_min_size(Some(app_size))?;
                 window.set_max_size(Some(app_size))?;
@@ -6510,6 +6683,22 @@ pub fn run() {
             }
 
             let handle = app.handle().clone();
+
+            // 启动时立刻扫一遍过期 SuperAI 账号；之后每分钟再跑一次。
+            // 仅 provider == "windsurf" + license_expires_at 已过期的账号会被删，
+            // 软停用（100% 已耗尽）账号保留不动，等到期再统一清掉。
+            // 删到当前账号会自动从剩余账号里挑下一个接管。
+            match cleanup_expired_windsurf_and_handoff(&handle) {
+                Ok(removed) if removed > 0 => {
+                    eprintln!("[startup] 已清理 {removed} 个过期 SuperAI 账号");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("[startup] 清理过期 SuperAI 账号失败: {error}");
+                }
+            }
+            spawn_expired_windsurf_cleanup(handle.clone());
+
             if let Ok(mut settings) = read_settings_record(&handle) {
                 let _ = ensure_api_service_key(&handle, &mut settings);
                 if settings.api_service_enabled {

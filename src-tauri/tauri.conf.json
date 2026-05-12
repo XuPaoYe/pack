@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Super AI",
-  "version": "1.0.3",
+  "version": "1.0.5",
   "identifier": "cn.talentisan.super-ai",
   "build": {
     "frontendDist": "../dist",
@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "Super AI",
-        "width": 1240,
-        "height": 820,
+        "width": 1180,
+        "height": 720,
         "minWidth": 1180,
-        "minHeight": 760,
+        "minHeight": 720,
         "center": true,
         "decorations": true,
         "titleBarStyle": "Overlay",

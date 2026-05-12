@@ -3,8 +3,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import clsx from "clsx";
 import {
   BadgeCheck,
@@ -28,7 +26,6 @@ import {
   Monitor,
   Moon,
   Plus,
-  Info,
   Power,
   RefreshCw,
   RotateCcw,
@@ -46,17 +43,19 @@ import {
 } from "lucide-react";
 import "./App.css";
 import logoUrl from "./assets/logo.svg";
+import { useUpdater } from "./hooks/useUpdater";
+import { useNotice } from "./hooks/useNotice";
+import { ForceUpdateModal } from "./components/ForceUpdateModal";
+import { NoticeToast } from "./components/NoticeToast";
+import { noticeToneConfig } from "./components/noticeTone";
 import { CodexIcon } from "./components/icons/CodexIcon";
 import { GeminiIcon } from "./components/icons/GeminiIcon";
 import { SuperaiIcon } from "./components/icons/SuperaiIcon";
 import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/accountPresentation";
 import {
-  createLogId,
   loadAppLogs as loadAppLogsRaw,
   persistAppLogs,
   pruneAppLogs,
-  type AppLogEntry,
-  type NoticeTone,
 } from "./lib/appLogs";
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
@@ -111,33 +110,15 @@ type ApiServiceStatus = {
 };
 
 type SwitchAccountResult = ManagedAccount[];
-type Notice = { tone: NoticeTone; text: string };
 type ExportPreview = {
   payload: string;
   kind: "json" | "key";
   label: string;
   fileBase: string;
 };
-type ForceUpdateState = {
-  update: Update;
-  phase: "ready" | "downloading" | "installing" | "error";
-  version: string;
-  currentVersion: string;
-  downloadedBytes: number;
-  totalBytes: number | null;
-  error?: string;
-};
-
-const NOTICE_TIMEOUT_MS = 7000;
 const ACCOUNT_PAGE_SIZE = 12;
 const ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS = 15_000;
 const API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS = 3_000;
-
-const noticeToneConfig: Record<NoticeTone, { icon: typeof Info; label: string }> = {
-  success: { icon: BadgeCheck, label: "成功" },
-  error: { icon: CircleAlert, label: "错误" },
-  info: { icon: Info, label: "提示" },
-};
 
 const modeConfig: Record<
   ImportMode,
@@ -530,7 +511,7 @@ function modelFamiliesForBuild() {
     : MODEL_FAMILIES;
 }
 
-const FALLBACK_FAMILY_KEY = "gpt-5.3-codex";
+const FALLBACK_FAMILY_KEY = "gpt-5.5";
 
 type ApiModelPref = {
   family: string;
@@ -761,16 +742,14 @@ type CodexAppSetupResult = {
   configPath: string;
   baseUrl: string;
   modelId: string;
-  backupPath: string | null;
-  disabledUserKeys: number;
   authBackupPath: string | null;
   authNeutralized: boolean;
 };
 
 type CodexAppRestoreResult = {
   steps: string[];
-  configRestoredFromBackup: boolean;
   authRestoredFromBackup: boolean;
+  configRemoved: boolean;
 };
 
 function ApiServiceCard({
@@ -977,67 +956,6 @@ function ApiServiceConfigPanel({
   );
 }
 
-function NoticeToast({ notice, onClose }: { notice: Notice; onClose: () => void }) {
-  const config = noticeToneConfig[notice.tone];
-  const Icon = config.icon;
-
-  return (
-    <div className="toast" data-tone={notice.tone} role="status" aria-live="polite">
-      <Icon className="toast-icon" size={16} aria-hidden="true" />
-      <span className="toast-text">
-        <b>{config.label}</b>
-        {sanitizeUserFacingText(notice.text)}
-      </span>
-      <button onClick={onClose} aria-label="关闭提示">×</button>
-    </div>
-  );
-}
-
-function formatBytes(bytes: number) {
-  if (bytes <= 0) return "0 KB";
-  const units = ["B", "KB", "MB", "GB"];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / 1024 ** index;
-  return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
-}
-
-function ForceUpdateModal({ state, onInstall }: { state: ForceUpdateState; onInstall: () => void }) {
-  const progressPercent = state.totalBytes ? Math.min(100, Math.round((state.downloadedBytes / state.totalBytes) * 100)) : 0;
-  const isWorking = state.phase === "downloading" || state.phase === "installing";
-
-  return (
-    <div className="modal-overlay force-update-overlay">
-      <aside className="force-update-panel modal-content" role="alertdialog" aria-modal="true" aria-labelledby="force-update-title">
-        <div className="force-update-icon">
-          <Download size={24} strokeWidth={2.1} />
-        </div>
-        <div className="force-update-copy">
-          <h2 id="force-update-title">发现新版本</h2>
-          <p>
-            Super AI {state.version} 已可用，当前版本 {state.currentVersion}。必须升级后才能继续使用。
-          </p>
-        </div>
-        {(state.phase === "downloading" || state.phase === "installing") && (
-          <div className="force-update-progress" aria-label="升级进度">
-            <div>
-              <span>{state.phase === "installing" ? "正在安装" : "正在下载"}</span>
-              <b>{state.totalBytes ? `${progressPercent}%` : formatBytes(state.downloadedBytes)}</b>
-            </div>
-            <i>
-              <span style={{ width: state.totalBytes ? `${progressPercent}%` : "35%" }} />
-            </i>
-          </div>
-        )}
-        {state.phase === "error" && <p className="force-update-error">{state.error ?? "升级失败，请重试。"}</p>}
-        <button className="primary force-update-button" onClick={onInstall} disabled={isWorking}>
-          {state.phase === "error" ? <RotateCw size={18} /> : <Download size={18} />}
-          {state.phase === "error" ? "重试升级" : isWorking ? "升级中" : "立即升级"}
-        </button>
-      </aside>
-    </div>
-  );
-}
-
 function AppModal({
   title,
   description,
@@ -1096,9 +1014,6 @@ function App() {
   const [refreshingProviders, setRefreshingProviders] = useState<Set<Provider>>(() => new Set());
   const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
   const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
-  const [notice, setNotice] = useState<Notice | null>(null);
-  const [appLogs, setAppLogs] = useState<AppLogEntry[]>(loadAppLogs);
-  const [forceUpdate, setForceUpdate] = useState<ForceUpdateState | null>(null);
   const [apiService, setApiService] = useState<ApiServiceStatus | null>(null);
   const [isApiServiceBusy, setIsApiServiceBusy] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({
@@ -1107,7 +1022,7 @@ function App() {
     maskSensitive: false,
     apiServiceHost: "0.0.0.0",
     apiServicePort: 0,
-    apiServiceDefaultModel: "gpt-5.3-codex",
+    apiServiceDefaultModel: "gpt-5.5",
   });
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
@@ -1116,7 +1031,6 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const accountListRef = useRef<HTMLDivElement | null>(null);
   const oauthPollTimers = useRef<Partial<Record<OAuthProvider, number>>>({});
-  const noticeTimer = useRef<number | null>(null);
   const hasStartedStartupRefresh = useRef(false);
   const activeAccountRefreshInFlight = useRef<string | null>(null);
   const [accountScrollbar, setAccountScrollbar] = useState({
@@ -1131,78 +1045,8 @@ function App() {
       return null;
     }
   }, []);
-
-  const installForceUpdate = useCallback(async () => {
-    if (!forceUpdate) return;
-    let downloadedBytes = 0;
-
-    try {
-      setForceUpdate((current) =>
-        current
-          ? {
-              ...current,
-              phase: "downloading",
-              downloadedBytes: 0,
-              totalBytes: null,
-              error: undefined,
-            }
-          : current,
-      );
-
-      const handleDownloadEvent = (event: DownloadEvent) => {
-        if (event.event === "Started") {
-          downloadedBytes = 0;
-          setForceUpdate((current) =>
-            current
-              ? {
-                  ...current,
-                  phase: "downloading",
-                  downloadedBytes: 0,
-                  totalBytes: event.data.contentLength ?? null,
-                }
-              : current,
-          );
-          return;
-        }
-
-        if (event.event === "Progress") {
-          downloadedBytes += event.data.chunkLength;
-          setForceUpdate((current) =>
-            current
-              ? {
-                  ...current,
-                  downloadedBytes,
-                }
-              : current,
-          );
-          return;
-        }
-
-        setForceUpdate((current) =>
-          current
-            ? {
-                ...current,
-                phase: "installing",
-                downloadedBytes: current.totalBytes ?? current.downloadedBytes,
-              }
-            : current,
-        );
-      };
-
-      await forceUpdate.update.downloadAndInstall(handleDownloadEvent);
-      await relaunch();
-    } catch (error) {
-      setForceUpdate((current) =>
-        current
-          ? {
-              ...current,
-              phase: "error",
-              error: sanitizeUserFacingText(`升级失败：${String(error)}`),
-            }
-          : current,
-      );
-    }
-  }, [forceUpdate]);
+  const apiServiceRunning = Boolean(apiService?.running);
+  const apiServiceActualPort = apiService?.actualPort ?? null;
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -1276,75 +1120,16 @@ function App() {
     };
   }, [pagedAccounts.length, activeProvider, query, currentAccountPage, updateAccountScrollbar]);
 
-  const closeNotice = useCallback(() => {
-    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
-    noticeTimer.current = null;
-    setNotice(null);
-  }, []);
+  const { notice, closeNotice, showNotice, appendAppLog, appLogs, setAppLogs } = useNotice({
+    sanitize: sanitizeUserFacingText,
+    initialLogs: loadAppLogs(),
+  });
 
-  const appendAppLog = useCallback((tone: NoticeTone, text: string) => {
-    const sanitizedText = sanitizeUserFacingText(text);
-    setAppLogs((current) =>
-      pruneAppLogs([
-        {
-          id: createLogId(),
-          tone,
-          text: sanitizedText,
-          createdAt: Date.now(),
-        },
-        ...current,
-      ]),
-    );
-  }, []);
-
-  const showNotice = useCallback((tone: NoticeTone, text: string) => {
-    const sanitizedText = sanitizeUserFacingText(text);
-    appendAppLog(tone, sanitizedText);
-    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
-    setNotice({ tone, text: sanitizedText });
-    noticeTimer.current = window.setTimeout(() => {
-      setNotice(null);
-      noticeTimer.current = null;
-    }, NOTICE_TIMEOUT_MS);
-  }, [appendAppLog]);
-
-  useEffect(() => {
-    if (import.meta.env.DEV || !isTauri()) return;
-    let isCancelled = false;
-
-    async function checkForUpdateOnLaunch() {
-      try {
-        const update = await check();
-        if (!update || isCancelled) return;
-        setForceUpdate({
-          update,
-          phase: "ready",
-          version: update.version,
-          currentVersion: update.currentVersion,
-          downloadedBytes: 0,
-          totalBytes: null,
-        });
-      } catch (error) {
-        if (!isCancelled) {
-          const message = String(error);
-          const isUpdaterUnconfigured =
-            message.includes("plugins > updater doesn't exist") ||
-            (message.includes("updater") && message.includes("configuration"));
-          if (isUpdaterUnconfigured) {
-            appendAppLog("info", "远程升级未配置，已跳过启动更新检测。");
-          } else {
-            showNotice("error", `检测更新失败：${message}`);
-          }
-        }
-      }
-    }
-
-    void checkForUpdateOnLaunch();
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [appendAppLog, showNotice]);
+  const { forceUpdate, installForceUpdate } = useUpdater({
+    appendAppLog,
+    showError: (message) => showNotice("error", message),
+    sanitize: sanitizeUserFacingText,
+  });
 
   const reloadAccountsSoon = useCallback((delay = 1800) => {
     window.setTimeout(() => {
@@ -1923,7 +1708,6 @@ function App() {
         if (timer) window.clearTimeout(timer);
       });
       oauthPollTimers.current = {};
-      if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
     };
   }, [refreshAllAccountsOnLaunch]);
 
@@ -1947,10 +1731,7 @@ function App() {
 
   // 服务在跑就拉一次 sidecar 的模型清单。
   useEffect(() => {
-    if (!isTauri() || !apiService?.running) {
-      setApiServiceModels([]);
-      return;
-    }
+    if (!isTauri() || !apiServiceRunning) return;
     let cancelled = false;
     invoke<ApiServiceModel[]>("list_api_service_models")
       .then((list) => {
@@ -1962,10 +1743,10 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [apiService?.running, apiService?.actualPort]);
+  }, [apiServiceRunning, apiServiceActualPort]);
 
   useEffect(() => {
-    if (!isTauri() || !apiService?.running) return undefined;
+    if (!isTauri() || !apiServiceRunning) return undefined;
     let cancelled = false;
 
     const syncActiveApiAccount = () => {
@@ -1985,7 +1766,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [apiService?.running, apiService?.actualPort]);
+  }, [apiServiceRunning, apiServiceActualPort]);
 
   // 自启失败的事件 → toast。
   useEffect(() => {
@@ -2027,7 +1808,7 @@ function App() {
     if (isApiServiceBusy) return;
     setIsApiServiceBusy(true);
     try {
-      const command = apiService?.running ? "stop_api_service" : "start_api_service";
+      const command = apiServiceRunning ? "stop_api_service" : "start_api_service";
       const status = await invoke<ApiServiceStatus>(command);
       setApiService(status);
       showNotice(
@@ -2039,7 +1820,7 @@ function App() {
     } finally {
       setIsApiServiceBusy(false);
     }
-  }, [isApiServiceBusy, showNotice, apiService?.running]);
+  }, [isApiServiceBusy, showNotice, apiServiceRunning]);
 
   const applyApiPref = useCallback(
     (updater: (prev: ApiModelPref) => ApiModelPref) => {
@@ -2101,21 +1882,8 @@ function App() {
     }
     setIsConfiguringCodex(true);
     try {
-      const result = await invoke<CodexAppSetupResult>("configure_codex_app");
-      const parts: string[] = [
-        "Codex 已切换到 SuperAI 通道，历史会话保留。请重启一次 codex 进程 / 桌面版生效。",
-        "之后在 SuperAI 切模型时，~/.codex/config.toml 自动同步，无需再点此按钮（codex 进程下次启动就会读到新模型）。",
-        "额度请在 SuperAI 中查看，官方 Codex 不再显示 ChatGPT 额度。",
-      ];
-      if (result.authNeutralized && result.authBackupPath) {
-        parts.push(`原 ChatGPT 登录已备份到 ${result.authBackupPath}，需要时可手动恢复。`);
-      }
-      if (result.disabledUserKeys > 0) {
-        parts.push(
-          `已自动注释原有 ${result.disabledUserKeys} 行顶层配置，可在 ${result.configPath} 手动恢复。`,
-        );
-      }
-      showNotice("success", parts.join(" "));
+      await invoke<CodexAppSetupResult>("configure_codex_app");
+      showNotice("success", "Codex 已配置完成，请重启 Codex App / CLI 生效。");
     } catch (error) {
       showNotice("error", `配置 Codex 失败：${String(error)}`);
     } finally {
@@ -2130,15 +1898,8 @@ function App() {
     }
     setIsRestoringCodex(true);
     try {
-      const result = await invoke<CodexAppRestoreResult>("restore_codex_app");
-      const restored: string[] = [];
-      if (result.configRestoredFromBackup) restored.push("config.toml");
-      if (result.authRestoredFromBackup) restored.push("auth.json");
-      const headline = restored.length > 0
-        ? `已从备份恢复：${restored.join(" / ")}。请重启 codex 进程 / 桌面版生效。`
-        : "未发现备份文件，已尽量移除 SuperAI 痕迹。请重启 codex 生效。";
-      const detail = (result.steps ?? []).filter(Boolean).join(" ");
-      showNotice("success", detail ? `${headline} ${detail}` : headline);
+      await invoke<CodexAppRestoreResult>("restore_codex_app");
+      showNotice("success", "Codex 已恢复完成，请重启 Codex App / CLI 生效。");
     } catch (error) {
       showNotice("error", `恢复 Codex 配置失败：${String(error)}`);
     } finally {
@@ -2422,7 +2183,7 @@ function App() {
       </section>
 
       {notice && (
-        <NoticeToast notice={notice} onClose={closeNotice} />
+        <NoticeToast notice={notice} onClose={closeNotice} sanitize={sanitizeUserFacingText} />
       )}
 
       {forceUpdate && (

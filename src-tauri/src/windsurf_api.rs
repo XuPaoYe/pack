@@ -15,7 +15,7 @@ use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, LazyLock, Mutex};
+use std::sync::{mpsc, Arc, LazyLock, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -51,12 +51,25 @@ pub struct WindsurfApiStatus {
 }
 
 /// 反向代理目标。生产模式下指向我们 spawn 的 sidecar；测试模式为 None。
+///
+/// `default_model` 用 `Arc<RwLock<_>>` 包起来，是为了让 UI 上切模型 /
+/// 调推理强度时能热更：`update_default_model` 写一次，运行中的服务线程
+/// （持有的是同一份 Arc 的克隆）下一次请求读到的就是新值，无需重启。
 #[derive(Clone)]
 struct ProxyTarget {
     base_url: String, // e.g. http://127.0.0.1:39721
     inner_key: String,
     /// 聊天接口统一写入的默认模型；为空表示不注入。
-    default_model: String,
+    default_model: Arc<RwLock<String>>,
+}
+
+impl ProxyTarget {
+    fn default_model_snapshot(&self) -> String {
+        self.default_model
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
 }
 
 struct Sidecar {
@@ -185,7 +198,7 @@ pub fn current_status(
         let default_model = runtime
             .proxy_target
             .as_ref()
-            .map(|target| target.default_model.clone())
+            .map(|target| target.default_model_snapshot())
             .unwrap_or_default();
         WindsurfApiStatus {
             running: true,
@@ -473,6 +486,15 @@ fn spawn_sidecar(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Windows 下如果不设 CREATE_NO_WINDOW，子进程会弹出一个 cmd 控制台窗口。
+    // sidecar 是 bun 编出的 console 子系统可执行文件，必须显式隐藏。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|error| format!("启动 sidecar 失败: {error}"))?;
@@ -646,23 +668,30 @@ pub fn start(
     let target = ProxyTarget {
         base_url: format!("http://127.0.0.1:{sidecar_port}"),
         inner_key,
-        default_model: default_model.trim().to_string(),
+        default_model: Arc::new(RwLock::new(default_model.trim().to_string())),
     };
 
     start_internal(host, port, api_key, Some(target), Some(sidecar))
 }
 
 /// 更新当前正在跑的服务的默认模型。无运行时返回 Err。
+///
+/// 通过共享的 `Arc<RwLock<String>>` 改写，服务线程下一次请求读到的就是新值，
+/// 不需要重启 API 服务（之前是 clone 进线程的快照，必须重启才生效）。
 pub fn update_default_model(model: &str) -> Result<(), String> {
-    let mut guard = lock();
+    let guard = lock();
     let runtime = guard
-        .as_mut()
+        .as_ref()
         .ok_or_else(|| "API 服务未运行".to_string())?;
     let target = runtime
         .proxy_target
-        .as_mut()
+        .as_ref()
         .ok_or_else(|| "API 服务未挂 sidecar".to_string())?;
-    target.default_model = model.trim().to_string();
+    let mut slot = target
+        .default_model
+        .write()
+        .map_err(|error| format!("获取默认模型写锁失败: {error}"))?;
+    *slot = model.trim().to_string();
     Ok(())
 }
 
@@ -698,7 +727,7 @@ fn start_internal(
     let target_for_thread = target.clone();
     let default_model = target
         .as_ref()
-        .map(|proxy| proxy.default_model.clone())
+        .map(|proxy| proxy.default_model_snapshot())
         .unwrap_or_default();
 
     let accept_join = thread::Builder::new()
@@ -1123,8 +1152,11 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
     // 强制改写成 SuperAI UI 当前选中的模型 + reasoning effort 后缀。
     // 这样用户只需在 SuperAI 一处切模型，所有上层 UI 自动跟随，
     // 不会出现"codex TUI 显示 A、实际打 B"或"两处不同步"的混乱。
+    // 每次请求都从共享 RwLock 拿一次最新值，这样 UI 切模型 / 改 effort 后
+    // 下一条上行请求立刻用新模型，不必重启服务。
+    let current_default_model = target.default_model_snapshot();
     let mut forced_model: Option<String> = None;
-    if !target.default_model.is_empty()
+    if !current_default_model.is_empty()
         && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/responses")
         && !body.is_empty()
     {
@@ -1137,15 +1169,14 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
                     .to_string();
                 obj.insert(
                     "model".to_string(),
-                    Value::String(target.default_model.clone()),
+                    Value::String(current_default_model.clone()),
                 );
                 if let Ok(new_body) = serde_json::to_vec(&value) {
                     body = new_body;
-                    forced_model = Some(target.default_model.clone());
-                    if requested_model != target.default_model {
+                    forced_model = Some(current_default_model.clone());
+                    if requested_model != current_default_model {
                         eprintln!(
-                            "[SuperAI API] model override: {requested_model} -> {}",
-                            target.default_model
+                            "[SuperAI API] model override: {requested_model} -> {current_default_model}"
                         );
                     }
                 }
