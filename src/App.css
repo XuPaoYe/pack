@@ -1798,11 +1798,20 @@ h2 {
 }
 
 .force-update-button {
-  width: 100%;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
+}
+
+.force-update-actions {
+  width: 100%;
+  display: grid;
+  gap: 10px;
+}
+
+.force-update-actions .force-update-button {
+  width: 100%;
 }
 
 .confirm-icon {
@@ -2110,6 +2119,84 @@ h2 {
 
 .log-note {
   margin: 0 2px;
+}
+
+.about-body {
+  display: grid;
+  gap: 16px;
+  padding: 16px;
+}
+
+.about-hero {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface) 76%, var(--control));
+}
+
+.about-logo {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  overflow: hidden;
+  border-radius: 11px;
+  background: #059669;
+}
+
+.about-logo img {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.about-hero strong,
+.about-hero span {
+  display: block;
+}
+
+.about-hero strong {
+  color: var(--text-strong);
+  font-size: 15px;
+  font-weight: 750;
+}
+
+.about-hero span {
+  margin-top: 3px;
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.about-meta {
+  display: grid;
+  gap: 8px;
+}
+
+.about-meta div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 42px;
+  padding: 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+}
+
+.about-meta dt {
+  color: var(--text-soft);
+  font-size: 12px;
+}
+
+.about-meta dd {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
 }
 
 .export-body {

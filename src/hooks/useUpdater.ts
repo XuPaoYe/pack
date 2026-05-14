@@ -11,18 +11,20 @@ export type ForceUpdateState = {
   downloadedBytes: number;
   totalBytes: number | null;
   error?: string;
+  errorKind?: "download" | "install" | "unknown";
 };
 
 export type UpdaterHooks = {
   appendAppLog: (tone: "info" | "error", text: string) => void;
   showError: (text: string) => void;
   sanitize: (text: string) => string;
+  beforeInstall?: () => Promise<void> | void;
 };
 
 // 启动检测 + 15 分钟轮询，避免必须重启 App 才能感知发布。
 const POLL_INTERVAL_MS = 15 * 60 * 1000;
 
-export function useUpdater({ appendAppLog, showError, sanitize }: UpdaterHooks) {
+export function useUpdater({ appendAppLog, showError, sanitize, beforeInstall }: UpdaterHooks) {
   const [forceUpdate, setForceUpdate] = useState<ForceUpdateState | null>(null);
 
   useEffect(() => {
@@ -38,6 +40,7 @@ export function useUpdater({ appendAppLog, showError, sanitize }: UpdaterHooks) 
       try {
         const update = await check();
         if (!update || isCancelled) return;
+        appendAppLog("info", `发现新版本 ${update.version}，当前版本 ${update.currentVersion}。`);
         // 已经检出过同一次更新（或正在下载/安装），不要覆盖当前状态：
         // 否则下载进度条会被重置回 ready，弹窗也会从启动那个变成轮询那个。
         setForceUpdate((current) => {
@@ -87,6 +90,7 @@ export function useUpdater({ appendAppLog, showError, sanitize }: UpdaterHooks) 
   const installForceUpdate = useCallback(async () => {
     if (!forceUpdate) return;
     let downloadedBytes = 0;
+    let installStarted = false;
 
     try {
       setForceUpdate((current) =>
@@ -101,6 +105,8 @@ export function useUpdater({ appendAppLog, showError, sanitize }: UpdaterHooks) 
           : current,
       );
 
+      appendAppLog("info", `开始下载并安装 Super AI ${forceUpdate.version}。`);
+      await beforeInstall?.();
       const handleDownloadEvent = (event: DownloadEvent) => {
         if (event.event === "Started") {
           downloadedBytes = 0;
@@ -135,26 +141,38 @@ export function useUpdater({ appendAppLog, showError, sanitize }: UpdaterHooks) 
             ? {
                 ...current,
                 phase: "installing",
+                errorKind: undefined,
                 downloadedBytes: current.totalBytes ?? current.downloadedBytes,
               }
             : current,
         );
+        installStarted = true;
       };
 
       await forceUpdate.update.downloadAndInstall(handleDownloadEvent);
+      appendAppLog("info", "升级安装完成，正在重启应用。");
       await relaunch();
     } catch (error) {
+      const errorKind = installStarted ? "install" : downloadedBytes > 0 ? "download" : "unknown";
+      const prefix =
+        errorKind === "install"
+          ? "安装更新失败"
+          : errorKind === "download"
+            ? "下载更新失败"
+            : "升级失败";
+      appendAppLog("error", `${prefix}：${String(error)}`);
       setForceUpdate((current) =>
         current
           ? {
               ...current,
               phase: "error",
-              error: sanitize(`升级失败：${String(error)}`),
+              errorKind,
+              error: sanitize(`${prefix}：${String(error)}`),
             }
           : current,
       );
     }
-  }, [forceUpdate, sanitize]);
+  }, [appendAppLog, beforeInstall, forceUpdate, sanitize]);
 
   return { forceUpdate, installForceUpdate };
 }

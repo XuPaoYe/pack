@@ -155,8 +155,8 @@ jobs:
           args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
 
   # 4 个平台 build job 全部成功后，把 release 里的 latest.json 改写成 OSS-ready
-  # 版本（URL 指向 ai.talentisan.cn/SuperAI/v{ver}/...）。用户只要把 release 里
-  # 的 latest.json 直接拷到 OSS 的 SuperAI/latest.json 就能用。
+  # 版本（URL 指向 ai.talentisan.cn/SuperAI/v{ver}/...）。用户手动把 release 里
+  # 的 latest.json 和对应安装包上传到 OSS 后，线上 updater 才会生效。
   rewrite-latest-json:
     name: Rewrite latest.json for OSS
     needs: build

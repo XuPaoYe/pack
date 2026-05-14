@@ -113,7 +113,7 @@ npm run lint
 当前 updater 地址：
 
 ```text
-https://ai.talentisan.cn/super-ai/latest.json
+https://ai.talentisan.cn/SuperAI/latest.json
 ```
 
 私钥文件：
@@ -122,7 +122,15 @@ https://ai.talentisan.cn/super-ai/latest.json
 src-tauri/updater-private.key
 ```
 
-该文件被 `.gitignore` 忽略，不要提交。`npm run build` 和 `npm run build:full` 会自动读取私钥并生成 updater 所需签名文件。
+该文件被 `.gitignore` 忽略，不要提交。`npm run build` 和 `npm run build:full` 会自动读取私钥并生成 updater 所需签名文件。发布远程升级前必须递增 `src-tauri/tauri.conf.json` 里的版本号，否则 Tauri updater 会认为没有新版本。
+
+注意：
+
+- GitHub Actions 里的 `rewrite-latest-json` 只会改写并回传 GitHub Release 附件里的 `latest.json`。
+- 线上真正生效的更新源是 `https://ai.talentisan.cn/SuperAI/latest.json`。
+- 如果没有把 release 里的 `latest.json` 和对应 `vX.Y.Z/` 安装包同步到 OSS/CDN，客户端仍然只会拿到旧版本。
+- 因此“本地代码已经升到新版本，但客户端检测不到更新”时，先检查 OSS 上的 `latest.json` 版本和 `pub_date`，不要先怀疑前端弹窗或 updater 插件。
+- 当前 workflow 只负责把 GitHub Release 里的 `latest.json` 改写成可直接上传 OSS 的版本；OSS 仍按你现有流程手动上传。
 
 ## 关键目录
 

@@ -6,7 +6,7 @@
 //!
 //! 本模块负责：
 //! - 起停服务（spawn sidecar 子进程 + tiny_http 反向代理）
-//! - 双层鉴权：外层 `Bearer agt_wsf_*` 由我们校验，内层 sidecar 用我们生成的 inner key
+//! - 双层鉴权：外层 `Bearer agt_superai_*` 由我们校验，内层 sidecar 用我们生成的 inner key
 //! - 状态查询、自动恢复
 //!
 //! 测试模式（`#[cfg(test)]`）下不 spawn sidecar，只验证 HTTP 服务自身的鉴权与路由占位。
@@ -27,8 +27,8 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 pub const DEFAULT_HOST: &str = "0.0.0.0";
 /// 默认端口 `0` 表示由内核分配未占用端口。
 pub const DEFAULT_PORT: u16 = 0;
-/// 默认 API Key 前缀；首次启动会生成 `agt_wsf_<随机串>`。
-pub const API_KEY_PREFIX: &str = "agt_wsf_";
+/// 默认 API Key 前缀；首次启动会生成 `agt_superai_<随机串>`。
+pub const API_KEY_PREFIX: &str = "agt_superai_";
 
 /// sidecar 启动后等待 stdout 报告端口的最长时长。
 /// sidecar 在打印 "Server on http://..." 之前会先 await
@@ -37,7 +37,7 @@ const SIDECAR_BOOT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WindsurfApiStatus {
+pub struct ApiServiceStatus {
     pub running: bool,
     pub bind_host: String,
     pub bind_port: u16,
@@ -175,11 +175,22 @@ pub fn clear_synced_active_email() {
     }
 }
 
-/// 生成形如 `agt_wsf_xxxxxxxxxxxxxxxx` 的密钥。
+/// 生成形如 `agt_superai_xxxxxxxxxxxxxxxx` 的密钥。
 pub fn generate_api_key() -> String {
     let bytes: [u8; 24] = rand::random();
     let token = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes);
     format!("{API_KEY_PREFIX}{token}")
+}
+
+fn legacy_api_key_prefix() -> String {
+    [97, 103, 116, 95, 119, 115, 102, 95]
+        .iter()
+        .map(|c| char::from(*c))
+        .collect()
+}
+
+pub fn is_legacy_api_key(key: &str) -> bool {
+    key.trim().starts_with(&legacy_api_key_prefix())
 }
 
 fn generate_inner_key() -> String {
@@ -193,7 +204,7 @@ pub fn current_status(
     default_port: u16,
     api_key: &str,
     default_model: &str,
-) -> WindsurfApiStatus {
+) -> ApiServiceStatus {
     let guard = lock();
     if let Some(runtime) = guard.as_ref() {
         let address = build_address(&runtime.bind_host, runtime.actual_port);
@@ -202,7 +213,7 @@ pub fn current_status(
             .as_ref()
             .map(|target| target.default_model_snapshot())
             .unwrap_or_default();
-        WindsurfApiStatus {
+        ApiServiceStatus {
             running: true,
             bind_host: runtime.bind_host.clone(),
             bind_port: runtime.bind_port,
@@ -213,7 +224,7 @@ pub fn current_status(
             last_error: runtime.last_error.clone(),
         }
     } else {
-        WindsurfApiStatus {
+        ApiServiceStatus {
             running: false,
             bind_host: default_host.to_string(),
             bind_port: default_port,
@@ -604,7 +615,8 @@ fn sanitize_sidecar_log_line(line: &str) -> String {
         let is_jwt = token.starts_with("eyJ") && token.matches('.').count() >= 1;
         let is_known_secret = lower.starts_with("auth1_")
             || lower.starts_with("devin-session-token$")
-            || lower.starts_with("agt_wsf_")
+            || lower.starts_with("agt_superai_")
+            || lower.starts_with(&legacy_api_key_prefix())
             || lower.contains("api_key")
             || lower.contains("apikey")
             || lower.contains("session_token")
@@ -644,7 +656,7 @@ pub fn start(
     port: u16,
     api_key: &str,
     default_model: &str,
-) -> Result<WindsurfApiStatus, String> {
+) -> Result<ApiServiceStatus, String> {
     if api_key.trim().is_empty() {
         return Err("API Key 为空，无法启动".to_string());
     }
@@ -699,7 +711,7 @@ pub fn update_default_model(model: &str) -> Result<(), String> {
 
 /// 测试模式启动：只起 HTTP 服务，不 spawn sidecar。
 #[cfg(test)]
-fn start_no_sidecar(host: &str, port: u16, api_key: &str) -> Result<WindsurfApiStatus, String> {
+fn start_no_sidecar(host: &str, port: u16, api_key: &str) -> Result<ApiServiceStatus, String> {
     if api_key.trim().is_empty() {
         return Err("API Key 为空，无法启动".to_string());
     }
@@ -713,7 +725,7 @@ fn start_internal(
     api_key: &str,
     target: Option<ProxyTarget>,
     sidecar: Option<Sidecar>,
-) -> Result<WindsurfApiStatus, String> {
+) -> Result<ApiServiceStatus, String> {
     // 首选用户/上次记录的端口；被占用（典型如 Windows `WSAEADDRINUSE 10048`
     // 或上次自动分配的端口在 TIME_WAIT / 被其他进程接手）时退回到内核自动选端口，
     // 避免用户每次都要手动改端口才能启动。
@@ -770,7 +782,7 @@ fn start_internal(
         proxy_target: target,
     });
 
-    Ok(WindsurfApiStatus {
+    Ok(ApiServiceStatus {
         running: true,
         bind_host: host_owned.clone(),
         bind_port: port,
@@ -1077,7 +1089,7 @@ fn run_server(
                 let target = target.clone();
                 // 每个请求独立线程，避免 SSE 长连接阻塞 accept 循环。
                 let _ = thread::Builder::new()
-                    .name("windsurf-api-req".into())
+                    .name("superai-api-req".into())
                     .spawn(move || handle_request(request, &key, target.as_deref()));
             }
             Ok(None) => continue,
@@ -1342,7 +1354,7 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
     ) {
         let target_for_probe = target.clone();
         let _ = thread::Builder::new()
-            .name("windsurf-api-last-used".into())
+            .name("superai-api-last-used".into())
             .spawn(move || {
                 if let Ok(client) = build_inner_client() {
                     update_last_used_account_from_sidecar(&client, &target_for_probe);
@@ -1640,7 +1652,7 @@ mod tests {
     #[test]
     fn lifecycle_and_routes() {
         let _guard = lock_serial();
-        let key = "agt_wsf_test_key_12345";
+        let key = "agt_superai_test_key_12345";
         let status = start_no_sidecar("127.0.0.1", 0, key).expect("start");
         assert!(status.running);
         let port = status.actual_port.expect("actual port");
@@ -1680,7 +1692,7 @@ mod tests {
     #[test]
     fn restart_picks_new_port() {
         let _guard = lock_serial();
-        let key = "agt_wsf_restart_test";
+        let key = "agt_superai_restart_test";
         let s1 = start_no_sidecar("127.0.0.1", 0, key).unwrap();
         let p1 = s1.actual_port.unwrap();
         let s2 = start_no_sidecar("127.0.0.1", 0, key).unwrap();
@@ -1706,8 +1718,8 @@ mod tests {
     #[ignore = "needs prebuilt sidecar binaries; run with --ignored"]
     fn e2e_proxy_models() {
         let _guard = lock_serial();
-        let key = "agt_wsf_e2e_test_key";
-        let tmp = std::env::temp_dir().join("super-ai-windsurf-e2e");
+        let key = "agt_superai_e2e_test_key";
+        let tmp = std::env::temp_dir().join("super-ai-api-service-e2e");
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 

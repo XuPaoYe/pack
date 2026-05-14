@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getVersion } from "@tauri-apps/api/app";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -20,6 +21,7 @@ import {
   ExternalLink,
   FileJson,
   FolderDown,
+  Info,
   KeyRound,
   Laptop,
   LockKeyhole,
@@ -59,6 +61,8 @@ import {
 } from "./lib/appLogs";
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
+
+declare const __APP_BUILD_TIME__: string;
 
 type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey" | "password";
 type OAuthProvider = "codex" | "gemini";
@@ -295,8 +299,7 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
     account.quota?.metrics?.length
       ? account.quota.metrics
       : [
-          { key: "codex-5h", label: "5H", remainingPercent: 0 },
-          { key: "codex-weekly", label: "周限", remainingPercent: 0 },
+          { key: "quota-primary", label: shouldHideAccountDetails(account) ? "日限" : "状态", remainingPercent: undefined, state: "unknown" as AccountState },
         ];
   const hideDetails = shouldHideAccountDetails(account);
   let metrics = rawMetrics;
@@ -308,16 +311,16 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
         localizeQuotaLabel(metric.label) === "日限",
     );
     // 公开版兜底：daily 用完后上游可能走 credits 分支或 metric 缺失，
-    // 此时也强制显示一根 0% 进度条，避免"用完就不见"。
+    // 此时显示未知态，避免把"还没刷新出来"误判成 0%。
     if (metrics.length === 0) {
-      metrics = [{ key: "superai-daily", label: "日限", remainingPercent: 0, state: "unavailable" }];
+      metrics = [{ key: "superai-daily", label: "日限", remainingPercent: undefined, state: "unknown" }];
     }
   }
 
   return (
     <div className="quota-meters">
       {metrics.slice(0, 3).map((metric) => {
-        const remaining = isUnavailable ? 0 : metric.remainingPercent;
+        const remaining = metric.remainingPercent;
         const state = isUnavailable ? "unavailable" : (metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available"));
         const shouldHideReset = shouldHideAccountDetails(account);
         const resetText = shouldHideReset ? "" : isUnavailable ? "--" : (formatResetTime(metric.resetAt) ?? "--");
@@ -1004,13 +1007,18 @@ function App() {
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
+  const [isAboutOpen, setIsAboutOpen] = useState(false);
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
   const [pendingBatchDelete, setPendingBatchDelete] = useState<ManagedAccount[] | null>(null);
-  const [isBusy, setIsBusy] = useState(false);
+  const [isAccountBusy, setIsAccountBusy] = useState(false);
+  const [isExportBusy, setIsExportBusy] = useState(false);
+  const [isImportBusy, setIsImportBusy] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+  const [switchingAccountId, setSwitchingAccountId] = useState<string | null>(null);
+  const [refreshingActionAccountId, setRefreshingActionAccountId] = useState<string | null>(null);
   const [isFileImporting, setIsFileImporting] = useState(false);
   const [refreshingAccountIds, setRefreshingAccountIds] = useState<Set<string>>(() => new Set());
   const [refreshingProviders, setRefreshingProviders] = useState<Set<Provider>>(() => new Set());
@@ -1027,6 +1035,7 @@ function App() {
     apiServiceDefaultModel: "gpt-5.5",
   });
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
+  const [appVersion, setAppVersion] = useState(() => (isTauri() ? "读取中" : "开发模式"));
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
   const [isConfiguringCodex, setIsConfiguringCodex] = useState(false);
   const [isRestoringCodex, setIsRestoringCodex] = useState(false);
@@ -1049,6 +1058,14 @@ function App() {
   }, []);
   const apiServiceRunning = Boolean(apiService?.running);
   const apiServiceActualPort = apiService?.actualPort ?? null;
+  const appBuildTime = useMemo(() => formatDateTime(__APP_BUILD_TIME__) ?? __APP_BUILD_TIME__, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    void getVersion()
+      .then((version) => setAppVersion(version))
+      .catch(() => setAppVersion("未知"));
+  }, []);
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -1127,16 +1144,33 @@ function App() {
     initialLogs: loadAppLogs(),
   });
 
+  const stopApiServiceForUpdate = useCallback(async () => {
+    if (!isTauri() || !apiServiceRunning) return;
+    setIsApiServiceBusy(true);
+    try {
+      const status = await invoke<ApiServiceStatus>("stop_api_service");
+      setApiService(status);
+      appendAppLog("info", "安装更新前已停止本地 API 服务。");
+    } catch (error) {
+      const message = `停止 API 服务失败，已取消更新安装：${String(error)}`;
+      appendAppLog("error", message);
+      throw new Error(message, { cause: error });
+    } finally {
+      setIsApiServiceBusy(false);
+    }
+  }, [apiServiceRunning, appendAppLog]);
+
   const { forceUpdate, installForceUpdate } = useUpdater({
     appendAppLog,
     showError: (message) => showNotice("error", message),
     sanitize: sanitizeUserFacingText,
+    beforeInstall: stopApiServiceForUpdate,
   });
 
   const reloadAccountsSoon = useCallback((delay = 1800) => {
     window.setTimeout(() => {
       void invoke<ManagedAccount[]>("list_accounts")
-        .then((storedAccounts) => setAccounts(storedAccounts))
+        .then((storedAccounts) => setAccounts(sortAccountsForView(storedAccounts)))
         .catch(() => undefined);
     }, delay);
   }, []);
@@ -1226,6 +1260,7 @@ function App() {
   };
 
   const closeImportModal = () => {
+    if (isImportBusy) return;
     setIsImportModalOpen(false);
     setMode(defaultImportModeForProvider(activeProvider));
     setPasteValue("");
@@ -1236,19 +1271,32 @@ function App() {
 
   const applyImportResult = (
     result: BackendImportResult,
-    options: { closeModal?: boolean; successText?: string } = {},
+    options: { closeModal?: boolean; successText?: string; accountsToPersist?: ManagedAccount[] } = {},
   ) => {
     if (result.imported.length > 0) {
       setAccounts((current) => mergeAccounts(current, result.imported));
-      void invoke("upsert_accounts", { accounts: result.imported })
-        .catch(() => undefined)
-        .finally(() => refreshImportedAccountStatus(result.imported));
+      const accountsToPersist = options.accountsToPersist ?? result.imported;
+      if (accountsToPersist.length > 0) {
+        void invoke("upsert_accounts", { accounts: accountsToPersist })
+          .catch(() => undefined)
+          .finally(() => refreshImportedAccountStatus(result.imported));
+      } else {
+        refreshImportedAccountStatus(result.imported);
+        reloadAccountsSoon(300);
+      }
       if (options.closeModal ?? true) {
         closeImportModal();
         setPasteValue("");
       }
       setAccountPage(1);
-      showNotice("success", options.successText ?? `已添加 ${result.imported.length} 个账号`);
+      const successText = options.successText ?? `已添加 ${result.imported.length} 个账号`;
+      if (result.failed.length > 0) {
+        appendAppLog("error", `导入时另有 ${result.failed.length} 项失败：${result.failed[0]?.reason ?? "未知错误"}`);
+      }
+      showNotice(
+        result.failed.length > 0 ? "info" : "success",
+        result.failed.length > 0 ? `${successText}，另有 ${result.failed.length} 项失败` : successText,
+      );
     } else if (result.failed.length > 0) {
       showNotice("error", result.failed[0]?.reason ?? "未添加账号");
     } else {
@@ -1262,60 +1310,77 @@ function App() {
         jsonContent: content,
         label,
       });
-      return result;
-    } catch {
-      return parseAuthJson(content, "paste", label);
+      return { result, accountsToPersist: [] };
+    } catch (backendError) {
+      try {
+        const result = parseAuthJson(content, "paste", label);
+        return { result, accountsToPersist: result.imported };
+      } catch {
+        throw backendError;
+      }
     }
   };
 
   const handleFileImport = async (files: FileList | null) => {
     if (!files?.length) return;
-    setIsBusy(true);
+    if (isImportBusy) return;
+    setIsImportBusy(true);
     setIsFileImporting(true);
     const allFailures: ImportFailure[] = [];
     const allImported: ManagedAccount[] = [];
+    const accountsToPersist: ManagedAccount[] = [];
     try {
       for (const file of Array.from(files)) {
         const content = await file.text();
-        const result = await parseWithBackend(content, file.name);
+        const parsed = await parseWithBackend(content, file.name);
+        const { result } = parsed;
         allImported.push(...result.imported);
         allFailures.push(...result.failed);
+        accountsToPersist.push(...parsed.accountsToPersist);
       }
       if (allImported.length > 0) {
         applyImportResult(
           { imported: allImported, failed: allFailures },
+          { accountsToPersist },
         );
       } else {
         showNotice("error", allFailures[0]?.reason ?? "没有发现可添加的账号");
       }
+    } catch (error) {
+      showNotice("error", `导入文件失败：${String(error)}`);
     } finally {
       setIsFileImporting(false);
-      setIsBusy(false);
+      setIsImportBusy(false);
     }
   };
 
   const handlePasteImport = async () => {
-    setIsBusy(true);
+    if (isImportBusy) return;
+    setIsImportBusy(true);
     try {
-      const result = await parseWithBackend(pasteValue, "粘贴内容");
-      applyImportResult(result);
+      const { result, accountsToPersist } = await parseWithBackend(pasteValue, "粘贴内容");
+      applyImportResult(result, { accountsToPersist });
+    } catch (error) {
+      showNotice("error", `解析粘贴内容失败：${String(error)}`);
     } finally {
-      setIsBusy(false);
+      setIsImportBusy(false);
     }
   };
 
   const handleLocalImport = async (provider: OAuthProvider) => {
-    setIsBusy(true);
+    if (isImportBusy) return;
+    setIsImportBusy(true);
     try {
       const command = provider === "codex" ? "import_codex_from_local" : "import_gemini_from_local";
       const result = await invoke<BackendImportResult>(command);
       applyImportResult(
         result,
+        { accountsToPersist: [] },
       );
     } catch (error) {
       showNotice("error", `读取本机 ${providerLabel(provider)} 失败：${String(error)}`);
     } finally {
-      setIsBusy(false);
+      setIsImportBusy(false);
     }
   };
 
@@ -1333,7 +1398,7 @@ function App() {
       }
       applyImportResult(
         result,
-        { successText: `${providerLabel(provider)} OAuth 登录成功，已添加 ${result.imported.length} 个账号` },
+        { successText: `${providerLabel(provider)} OAuth 登录成功，已添加 ${result.imported.length} 个账号`, accountsToPersist: [] },
       );
       setPendingOAuth((current) => ({ ...current, [provider]: undefined }));
       clearOAuthPoll(provider);
@@ -1361,7 +1426,8 @@ function App() {
 
   const handleOAuthStart = async (provider: OAuthProvider) => {
     clearOAuthPoll(provider);
-    setIsBusy(true);
+    if (isImportBusy) return;
+    setIsImportBusy(true);
     try {
       const command = provider === "codex" ? "start_codex_oauth" : "start_gemini_oauth";
       const result = await invoke<OAuthStartResult>(command);
@@ -1371,7 +1437,7 @@ function App() {
     } catch (error) {
       showNotice("error", `${providerLabel(provider)} OAuth 启动失败：${String(error)}`);
     } finally {
-      setIsBusy(false);
+      setIsImportBusy(false);
     }
   };
 
@@ -1423,6 +1489,7 @@ function App() {
     close();
   };
   const handleAddAccount = () => {
+    if (isImportBusy) return;
     setMode(defaultImportModeForProvider(activeProvider));
     setIsImportModalOpen(true);
   };
@@ -1434,13 +1501,15 @@ function App() {
       showNotice("error", "请输入 SuperAI 邮箱和密码");
       return;
     }
-    setIsBusy(true);
+    if (isImportBusy) return;
+    setIsImportBusy(true);
     try {
       const account = await invoke<ManagedAccount>("add_superai_account_by_password", {
         email,
         password,
       });
       setAccounts((current) => mergeAccounts(current, [account]));
+      refreshImportedAccountStatus([account]);
       setSuperaiPasswordEmail("");
       setSuperaiPasswordPwd("");
       closeImportModal();
@@ -1448,7 +1517,7 @@ function App() {
     } catch (error) {
       showNotice("error", `导入失败：${String(error)}`);
     } finally {
-      setIsBusy(false);
+      setIsImportBusy(false);
     }
   };
 
@@ -1461,12 +1530,14 @@ function App() {
       showNotice("error", "请粘贴 SuperAI 批量密钥");
       return;
     }
-    setIsBusy(true);
+    if (isImportBusy) return;
+    setIsImportBusy(true);
     try {
       const result = await invoke<BackendImportResult>("add_superai_accounts_by_batch_keys", { keys });
       applyImportResult(result, {
         closeModal: result.imported.length > 0,
         successText: `已添加 ${result.imported.length} 个 SuperAI 账号`,
+        accountsToPersist: [],
       });
       if (result.imported.length > 0) {
         setSuperaiBatchKeys("");
@@ -1474,7 +1545,7 @@ function App() {
     } catch (error) {
       showNotice("error", `批量导入失败：${String(error)}`);
     } finally {
-      setIsBusy(false);
+      setIsImportBusy(false);
     }
   };
   const handleProviderChange = (provider: Provider) => {
@@ -1494,13 +1565,17 @@ function App() {
     setAppLogs((current) => pruneAppLogs(current));
     setIsLogsOpen(true);
   };
+  const handleAbout = () => {
+    setIsAboutOpen(true);
+  };
   const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
     setSettings((current) => ({ ...current, [key]: value }));
   };
   const handleToggleAccount = async (account: ManagedAccount) => {
     if (isCurrentAccount(account)) return;
     if ((account.status ?? fallbackStatus(account)).state === "unavailable") return;
-    setIsBusy(true);
+    if (switchingAccountId) return;
+    setSwitchingAccountId(account.id);
     try {
       const providerAccounts = await invoke<SwitchAccountResult>("switch_account", { accountId: account.id });
       setAccounts((current) =>
@@ -1511,12 +1586,13 @@ function App() {
     } catch (error) {
       showNotice("error", `启用账号失败：${String(error)}`);
     } finally {
-      setIsBusy(false);
+      setSwitchingAccountId(null);
     }
   };
 
   const handleRefreshAccount = async (account: ManagedAccount) => {
-    setIsBusy(true);
+    if (refreshingActionAccountId) return;
+    setRefreshingActionAccountId(account.id);
     setRefreshingAccountIds((current) => new Set(current).add(account.id));
     try {
       const refreshed = await invoke<ManagedAccount>("refresh_account", { accountId: account.id });
@@ -1530,7 +1606,7 @@ function App() {
         next.delete(account.id);
         return next;
       });
-      setIsBusy(false);
+      setRefreshingActionAccountId(null);
     }
   };
   const handleRefreshVisibleAccounts = async () => {
@@ -1559,6 +1635,8 @@ function App() {
   };
   const exportFileBase = (label: string) => label.replace(/[^a-z0-9._-]+/gi, "_");
   const handleExportAccount = async (account: ManagedAccount) => {
+    if (isExportBusy) return;
+    setIsExportBusy(true);
     let payload: string;
     const isPublicKeyExport = shouldHideAccountDetails(account);
     try {
@@ -1568,6 +1646,8 @@ function App() {
     } catch (error) {
       showNotice("error", `导出账号失败：${String(error)}`);
       return;
+    } finally {
+      setIsExportBusy(false);
     }
     setExportPreview({
       payload,
@@ -1588,11 +1668,13 @@ function App() {
     });
   };
   const handleBatchExport = async () => {
+    if (isExportBusy) return;
     const selectedAccounts = filteredAccounts.filter((account) => selectedExportIds.has(account.id));
     if (selectedAccounts.length === 0) {
       showNotice("error", "请选择要导出的账号");
       return;
     }
+    setIsExportBusy(true);
     try {
       const exported = await Promise.all(
         selectedAccounts.map(async (account) => {
@@ -1616,6 +1698,8 @@ function App() {
       setSelectedExportIds(new Set());
     } catch (error) {
       showNotice("error", `批量导出失败：${String(error)}`);
+    } finally {
+      setIsExportBusy(false);
     }
   };
   const handleBatchDelete = () => {
@@ -1627,22 +1711,22 @@ function App() {
     setPendingBatchDelete(selectedAccounts);
   };
   const confirmBatchDelete = async () => {
-    if (!pendingBatchDelete || isBusy) return;
+    if (!pendingBatchDelete || isAccountBusy) return;
     const targets = pendingBatchDelete;
-    setIsBusy(true);
+    setIsAccountBusy(true);
     try {
       let nextAccounts = accounts;
       for (const account of targets) {
         nextAccounts = await invoke<ManagedAccount[]>("delete_account", { accountId: account.id });
       }
-      setAccounts(nextAccounts);
+      setAccounts(sortAccountsForView(nextAccounts));
       setSelectedExportIds(new Set());
       setPendingBatchDelete(null);
       showNotice("success", `已删除 ${targets.length} 个账号`);
     } catch (error) {
       showNotice("error", `批量删除失败：${String(error)}`);
     } finally {
-      setIsBusy(false);
+      setIsAccountBusy(false);
     }
   };
   const downloadExportPreview = (preview: ExportPreview) => {
@@ -1674,7 +1758,7 @@ function App() {
     setIsDeletingAccount(true);
     try {
       const nextAccounts = await invoke<ManagedAccount[]>("delete_account", { accountId: account.id });
-      setAccounts(nextAccounts);
+      setAccounts(sortAccountsForView(nextAccounts));
       setPendingDeleteAccount(null);
       showNotice("success", `已删除 ${accountDisplayLabel(account)}`);
     } catch (error) {
@@ -1691,7 +1775,7 @@ function App() {
   useEffect(() => {
     void invoke<ManagedAccount[]>("list_accounts")
       .then((storedAccounts) => {
-        setAccounts(storedAccounts);
+        setAccounts(sortAccountsForView(storedAccounts));
         refreshAllAccountsOnLaunch(storedAccounts);
       })
       .catch(() => undefined);
@@ -1968,7 +2052,7 @@ function App() {
       className={clsx(
         "shell",
         settings.maskSensitive && "privacy-mask",
-        (isImportModalOpen || isSettingsOpen || isLogsOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
+        (isImportModalOpen || isSettingsOpen || isLogsOpen || isAboutOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
       )}
       onMouseDownCapture={handleShellTopDrag}
     >
@@ -2021,6 +2105,10 @@ function App() {
             <Settings size={18} />
             设置
           </button>
+          <button onClick={handleAbout}>
+            <Info size={18} />
+            关于
+          </button>
         </div>
       </aside>
 
@@ -2047,16 +2135,16 @@ function App() {
                 <button
                   className="secondary"
                   onClick={() => void handleBatchExport()}
-                  disabled={isBusy || selectedExportIds.size === 0}
+                  disabled={isAccountBusy || isExportBusy || selectedExportIds.size === 0}
                   title={selectedExportIds.size === 0 ? "请先勾选账号" : `导出选中的 ${selectedExportIds.size} 个账号`}
                 >
-                  <Download size={18} />
-                  导出{selectedExportIds.size > 0 ? ` (${selectedExportIds.size})` : ""}
+                  <Download size={18} className={clsx(isExportBusy && "spin")} />
+                  {isExportBusy ? "生成中" : `导出${selectedExportIds.size > 0 ? ` (${selectedExportIds.size})` : ""}`}
                 </button>
                 <button
                   className="secondary danger-action"
                   onClick={() => handleBatchDelete()}
-                  disabled={isBusy || selectedExportIds.size === 0}
+                  disabled={isAccountBusy || selectedExportIds.size === 0}
                   title={selectedExportIds.size === 0 ? "请先勾选账号" : `删除选中的 ${selectedExportIds.size} 个账号`}
                 >
                   <Trash2 size={18} />
@@ -2156,15 +2244,39 @@ function App() {
                           aria-label={isCurrentAccount(account) ? "当前账号" : "设为当前账号"}
                           title={isCurrentAccount(account) ? "当前账号" : "设为当前"}
                           onClick={() => handleToggleAccount(account)}
-                          disabled={isCurrentAccount(account) || (account.status ?? fallbackStatus(account)).state === "unavailable"}
+                          disabled={
+                            isCurrentAccount(account) ||
+                            switchingAccountId !== null ||
+                            (account.status ?? fallbackStatus(account)).state === "unavailable"
+                          }
                         >
-                          <BadgeCheck size={15} strokeWidth={1.75} />
+                          <BadgeCheck
+                            size={15}
+                            strokeWidth={1.75}
+                            className={clsx(switchingAccountId === account.id && "spin")}
+                          />
                         </button>
-                        <button className="icon-button" aria-label="刷新账号" title="刷新" onClick={() => handleRefreshAccount(account)} disabled={refreshingAccountIds.has(account.id)}>
+                        <button
+                          className="icon-button"
+                          aria-label="刷新账号"
+                          title="刷新"
+                          onClick={() => handleRefreshAccount(account)}
+                          disabled={
+                            refreshingAccountIds.has(account.id) ||
+                            refreshingActionAccountId !== null ||
+                            refreshingProviders.has(account.provider)
+                          }
+                        >
                           <RefreshCw size={15} strokeWidth={1.75} className={clsx(refreshingAccountIds.has(account.id) && "spin")} />
                         </button>
-                        <button className="icon-button" aria-label="导出账号" title="导出" onClick={() => void handleExportAccount(account)}>
-                          <Download size={15} strokeWidth={1.75} />
+                        <button
+                          className="icon-button"
+                          aria-label={isExportBusy ? "正在生成导出" : "导出账号"}
+                          title={isExportBusy ? "正在生成导出" : "导出"}
+                          onClick={() => void handleExportAccount(account)}
+                          disabled={isExportBusy}
+                        >
+                          <Download size={15} strokeWidth={1.75} className={clsx(isExportBusy && "spin")} />
                         </button>
                         <button className="icon-button danger" aria-label="删除账号" title="删除" onClick={() => handleDeleteAccount(account)}>
                           <Trash2 size={15} strokeWidth={1.75} />
@@ -2213,7 +2325,11 @@ function App() {
       )}
 
       {forceUpdate && (
-        <ForceUpdateModal state={forceUpdate} onInstall={() => void installForceUpdate()} />
+        <ForceUpdateModal
+          state={forceUpdate}
+          onInstall={() => void installForceUpdate()}
+          onViewLogs={handleLogs}
+        />
       )}
 
       {isImportModalOpen && (
@@ -2254,9 +2370,9 @@ function App() {
                     spellCheck={false}
                     placeholder={'{\n  "tokens": {\n    "id_token": "...",\n    "access_token": "...",\n    "refresh_token": "..."\n  }\n}'}
                   />
-                  <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim() || isBusy}>
+                  <button className="wide primary" onClick={handlePasteImport} disabled={!pasteValue.trim() || isImportBusy}>
                     <Clipboard size={20} />
-                    {isBusy ? "处理中..." : "解析并添加"}
+                    {isImportBusy ? "处理中..." : "解析并添加"}
                   </button>
                 </>
               )}
@@ -2271,7 +2387,7 @@ function App() {
                     hidden
                     onChange={(event) => handleFileImport(event.target.files)}
                   />
-                  <button className={clsx("drop-zone", isFileImporting && "loading")} onClick={() => fileInputRef.current?.click()} disabled={isBusy}>
+                  <button className={clsx("drop-zone", isFileImporting && "loading")} onClick={() => fileInputRef.current?.click()} disabled={isImportBusy}>
                     <Upload size={28} />
                     <strong>{isFileImporting ? "正在导入 JSON..." : "选择 JSON 文件"}</strong>
                     <span>{isFileImporting ? "正在解析并刷新账号信息" : "支持 auth.json、oauth_creds.json、导出数组"}</span>
@@ -2281,9 +2397,9 @@ function App() {
 
               {mode === "local" && activeProvider !== PROVIDER_WSF && (
                 <>
-                  <button className="drop-zone local-import-button" onClick={() => handleLocalImport(activeProvider as OAuthProvider)} disabled={isBusy}>
+                  <button className="drop-zone local-import-button" onClick={() => handleLocalImport(activeProvider as OAuthProvider)} disabled={isImportBusy}>
                     <FolderDown size={28} />
-                    <strong>{isBusy ? "正在读取本机账号..." : `读取 ${providerLabel(activeProvider)} 本机账号`}</strong>
+                    <strong>{isImportBusy ? "正在读取本机账号..." : `读取 ${providerLabel(activeProvider)} 本机账号`}</strong>
                     <span>{providerLabel(activeProvider)} 本机凭证只在当前设备处理</span>
                   </button>
                 </>
@@ -2306,15 +2422,15 @@ function App() {
                     onChange={(event) => setSuperaiBatchKeys(event.target.value)}
                     placeholder="一行一个批量密钥"
                     spellCheck={false}
-                    disabled={isBusy}
+                    disabled={isImportBusy}
                   />
                   <button
                     className="wide primary"
                     onClick={() => void handleSuperaiBatchKeyImport()}
-                    disabled={!superaiBatchKeys.trim() || isBusy}
+                    disabled={!superaiBatchKeys.trim() || isImportBusy}
                   >
                     <KeyRound size={20} />
-                    {isBusy ? "导入中..." : "批量导入"}
+                    {isImportBusy ? "导入中..." : "批量导入"}
                   </button>
                 </>
               )}
@@ -2330,7 +2446,7 @@ function App() {
                       placeholder="name@example.com"
                       autoComplete="off"
                       spellCheck={false}
-                      disabled={isBusy}
+                      disabled={isImportBusy}
                     />
                   </label>
                   <label className="field">
@@ -2342,17 +2458,17 @@ function App() {
                       placeholder="SuperAI 登录密码"
                       autoComplete="new-password"
                       spellCheck={false}
-                      disabled={isBusy}
+                      disabled={isImportBusy}
                     />
                   </label>
                   <p className="superai-password-tip">凭证仅在本机加密保存，导入完成后建议立即修改密码或启用二步验证。</p>
                   <button
                     className="wide primary"
                     onClick={() => void handleSuperaiPasswordImport()}
-                    disabled={!superaiPasswordEmail.trim() || !superaiPasswordPwd || isBusy}
+                    disabled={!superaiPasswordEmail.trim() || !superaiPasswordPwd || isImportBusy}
                   >
                     <LockKeyhole size={20} />
-                    {isBusy ? "导入中..." : "登录并导入"}
+                    {isImportBusy ? "导入中..." : "登录并导入"}
                   </button>
                 </div>
               )}
@@ -2527,6 +2643,38 @@ function App() {
         </AppModal>
       )}
 
+      {isAboutOpen && (
+        <AppModal
+          title="关于"
+          description="当前安装的 Super AI 版本信息"
+          closeLabel="关闭关于"
+          className="about-panel"
+          onClose={() => setIsAboutOpen(false)}
+        >
+          <div className="about-body">
+            <div className="about-hero">
+              <div className="about-logo">
+                <img src={logoUrl} alt="" />
+              </div>
+              <div>
+                <strong>Super AI</strong>
+                <span>安静可靠的本地账号管理工具</span>
+              </div>
+            </div>
+            <dl className="about-meta">
+              <div>
+                <dt>当前版本</dt>
+                <dd>{appVersion}</dd>
+              </div>
+              <div>
+                <dt>更新时间</dt>
+                <dd>{appBuildTime}</dd>
+              </div>
+            </dl>
+          </div>
+        </AppModal>
+      )}
+
       {exportPreview && (
         <AppModal
           title="导出账号"
@@ -2582,7 +2730,7 @@ function App() {
         <div
           className="modal-overlay"
           onMouseDown={(event) => handleModalBackdropMouseDown(event, () => {
-            if (!isBusy) setPendingBatchDelete(null);
+            if (!isAccountBusy) setPendingBatchDelete(null);
           })}
         >
           <aside className="confirm-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
@@ -2594,11 +2742,11 @@ function App() {
               <p>共 {pendingBatchDelete.length} 个账号将被移除</p>
             </div>
             <div className="confirm-actions">
-              <button className="secondary" onClick={() => setPendingBatchDelete(null)} disabled={isBusy}>
+              <button className="secondary" onClick={() => setPendingBatchDelete(null)} disabled={isAccountBusy}>
                 取消
               </button>
-              <button className="danger-button" onClick={() => void confirmBatchDelete()} disabled={isBusy}>
-                {isBusy ? "删除中..." : `删除 ${pendingBatchDelete.length} 个`}
+              <button className="danger-button" onClick={() => void confirmBatchDelete()} disabled={isAccountBusy}>
+                {isAccountBusy ? "删除中..." : `删除 ${pendingBatchDelete.length} 个`}
               </button>
             </div>
           </aside>

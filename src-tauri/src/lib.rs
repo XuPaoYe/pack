@@ -5740,14 +5740,28 @@ async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccoun
                     mark_account_unavailable(account, error);
                 }
             }
+            "windsurf" => {
+                if let Err(error) = refresh_windsurf_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
             _ => {}
         }
-        if was_current {
+        let just_exhausted = apply_public_usage_after_refresh(account);
+        if was_current && !public_usage_is_exhausted(account) {
             mark_account_current(account);
+        }
+        if just_exhausted {
+            emit_account_exhausted(&app, account);
         }
     }
 
-    upsert_existing_accounts_into_db(&app, &accounts).map(accounts_for_frontend)
+    let any_exhausted = accounts.iter().any(public_usage_is_exhausted);
+    let result = upsert_existing_accounts_into_db(&app, &accounts).map(accounts_for_frontend)?;
+    if any_exhausted {
+        schedule_windsurf_sync(app.clone());
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -6259,7 +6273,8 @@ fn ensure_api_service_key(
     app: &tauri::AppHandle,
     settings: &mut AppSettings,
 ) -> Result<(), String> {
-    if settings.api_service_key.trim().is_empty() {
+    let key = settings.api_service_key.trim();
+    if key.is_empty() || windsurf_api::is_legacy_api_key(key) {
         settings.api_service_key = windsurf_api::generate_api_key();
         write_settings_record(app, settings)?;
     }
@@ -6269,7 +6284,7 @@ fn ensure_api_service_key(
 #[tauri::command]
 fn get_api_service_status(
     app: tauri::AppHandle,
-) -> Result<windsurf_api::WindsurfApiStatus, String> {
+) -> Result<windsurf_api::ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
     Ok(windsurf_api::current_status(
@@ -6283,7 +6298,7 @@ fn get_api_service_status(
 #[tauri::command]
 async fn start_api_service(
     app: tauri::AppHandle,
-) -> Result<windsurf_api::WindsurfApiStatus, String> {
+) -> Result<windsurf_api::ApiServiceStatus, String> {
     tauri::async_runtime::spawn_blocking(move || start_api_service_impl(app))
         .await
         .map_err(|error| format!("启动 API 服务任务失败: {error}"))?
@@ -6291,7 +6306,7 @@ async fn start_api_service(
 
 fn start_api_service_impl(
     app: tauri::AppHandle,
-) -> Result<windsurf_api::WindsurfApiStatus, String> {
+) -> Result<windsurf_api::ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
     let data_dir = app
@@ -6418,7 +6433,7 @@ fn schedule_windsurf_sync(app: tauri::AppHandle) {
 #[tauri::command]
 async fn stop_api_service(
     app: tauri::AppHandle,
-) -> Result<windsurf_api::WindsurfApiStatus, String> {
+) -> Result<windsurf_api::ApiServiceStatus, String> {
     tauri::async_runtime::spawn_blocking(move || stop_api_service_impl(app))
         .await
         .map_err(|error| format!("停止 API 服务任务失败: {error}"))?
@@ -6468,7 +6483,7 @@ fn config_is_superai_owned(content: &str) -> bool {
     has_top && has_section
 }
 
-/// 转义 TOML basic string 里的字符。我们的 API key 是 `agt_wsf_<hex>`，
+/// 转义 TOML basic string 里的字符。我们的 API key 是 `agt_superai_<hex>`，
 /// 实际只会落在 ASCII 安全集合里，但兜底处理一下双引号 / 反斜杠 / 控制符。
 fn escape_toml_basic_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -6782,7 +6797,7 @@ fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, St
     })
 }
 
-fn stop_api_service_impl(app: tauri::AppHandle) -> Result<windsurf_api::WindsurfApiStatus, String> {
+fn stop_api_service_impl(app: tauri::AppHandle) -> Result<windsurf_api::ApiServiceStatus, String> {
     windsurf_api::stop()?;
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
@@ -6796,28 +6811,6 @@ fn stop_api_service_impl(app: tauri::AppHandle) -> Result<windsurf_api::Windsurf
         &settings.api_service_key,
         &effective_api_service_model(&settings.api_service_default_model),
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn plan_status_proto_quota_tags_keep_daily_and_weekly_distinct() {
-        let field_map: HashMap<&str, &str> =
-            windsurf_plan_status_proto_field_map().into_iter().collect();
-
-        assert_eq!(
-            field_map.get("daily_quota_remaining_percent"),
-            Some(&"int_15")
-        );
-        assert_eq!(
-            field_map.get("weekly_quota_remaining_percent"),
-            Some(&"int_14")
-        );
-        assert_eq!(field_map.get("daily_quota_reset_at_unix"), Some(&"int_18"));
-        assert_eq!(field_map.get("weekly_quota_reset_at_unix"), Some(&"int_17"));
-    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -6966,4 +6959,26 @@ pub fn run() {
                 let _ = windsurf_api::stop();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_status_proto_quota_tags_keep_daily_and_weekly_distinct() {
+        let field_map: HashMap<&str, &str> =
+            windsurf_plan_status_proto_field_map().into_iter().collect();
+
+        assert_eq!(
+            field_map.get("daily_quota_remaining_percent"),
+            Some(&"int_15")
+        );
+        assert_eq!(
+            field_map.get("weekly_quota_remaining_percent"),
+            Some(&"int_14")
+        );
+        assert_eq!(field_map.get("daily_quota_reset_at_unix"), Some(&"int_18"));
+        assert_eq!(field_map.get("weekly_quota_reset_at_unix"), Some(&"int_17"));
+    }
 }

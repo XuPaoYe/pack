@@ -12,14 +12,30 @@ function formatBytes(bytes: number) {
 export function ForceUpdateModal({
   state,
   onInstall,
+  onViewLogs,
 }: {
   state: ForceUpdateState;
   onInstall: () => void;
+  onViewLogs: () => void;
 }) {
   const progressPercent = state.totalBytes
     ? Math.min(100, Math.round((state.downloadedBytes / state.totalBytes) * 100))
     : 0;
   const isWorking = state.phase === "downloading" || state.phase === "installing";
+  const retryLabel =
+    state.errorKind === "install"
+      ? "重新安装"
+      : state.errorKind === "download"
+        ? "重新下载"
+        : "重试升级";
+  const helperText =
+    state.phase === "error"
+      ? state.errorKind === "install"
+        ? "安装阶段失败，通常是文件占用或系统权限拦截。关闭相关进程后再试。"
+        : state.errorKind === "download"
+          ? "下载阶段失败，检查网络或稍后再试。"
+          : "本次升级未完成，请重试。"
+      : "Super AI 必须升级到新版本后才能继续使用。";
 
   return (
     <div className="modal-overlay force-update-overlay">
@@ -35,7 +51,7 @@ export function ForceUpdateModal({
         <div className="force-update-copy">
           <h2 id="force-update-title">发现新版本</h2>
           <p>
-            Super AI {state.version} 已可用，当前版本 {state.currentVersion}。必须升级后才能继续使用。
+            Super AI {state.version} 已可用，当前版本 {state.currentVersion}。{helperText}
           </p>
         </div>
         {(state.phase === "downloading" || state.phase === "installing") && (
@@ -52,10 +68,17 @@ export function ForceUpdateModal({
         {state.phase === "error" && (
           <p className="force-update-error">{state.error ?? "升级失败，请重试。"}</p>
         )}
-        <button className="primary force-update-button" onClick={onInstall} disabled={isWorking}>
-          {state.phase === "error" ? <RotateCw size={18} /> : <Download size={18} />}
-          {state.phase === "error" ? "重试升级" : isWorking ? "升级中" : "立即升级"}
-        </button>
+        <div className="force-update-actions">
+          {state.phase === "error" && (
+            <button className="secondary force-update-button" onClick={onViewLogs} disabled={isWorking}>
+              查看日志
+            </button>
+          )}
+          <button className="primary force-update-button" onClick={onInstall} disabled={isWorking}>
+            {state.phase === "error" ? <RotateCw size={18} /> : <Download size={18} />}
+            {state.phase === "error" ? retryLabel : isWorking ? "升级中" : "立即升级"}
+          </button>
+        </div>
       </aside>
     </div>
   );
