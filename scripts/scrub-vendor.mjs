@@ -160,8 +160,8 @@ const authPath = join(OUT_DIR, "src", "auth.js");
   const src = readFileSync(authPath, "utf8");
   // 用正则吃掉两个完整函数（含函数体），整段替换成 no-op。
   // 函数体里没有嵌套独立顶层 `^}`，所以 /^}/m 就能稳定匹配右括号。
-  const saveRe = /function saveAccounts\(\) \{[\s\S]*?\n\}\n/;
-  const saveSyncRe = /export function saveAccountsSync\(\) \{[\s\S]*?\n\}\n/;
+  const saveRe = /function saveAccounts\(\) \{[\s\S]*?\r?\n\}\r?\n/;
+  const saveSyncRe = /export function saveAccountsSync\(\) \{[\s\S]*?\r?\n\}\r?\n/;
   if (!saveRe.test(src) || !saveSyncRe.test(src)) {
     console.error("[scrub-vendor] auth.js saveAccounts/saveAccountsSync body regex failed; aborting");
     process.exit(2);
