@@ -8,6 +8,17 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release version shown in Actions, e.g. v1.1.2"
+        required: true
+        type: string
+      release_note:
+        description: "Short release note shown in Actions"
+        required: true
+        type: string
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Release {0}: {1}', inputs.release_version, inputs.release_note) || format('Release {0}', github.ref_name) }}
 
 permissions:
   contents: write  # 让 tauri-action 能创建 release 并上传产物

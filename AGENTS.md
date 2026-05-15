@@ -105,6 +105,14 @@ When adding screens, prefer:
 - Do not commit generated `dist/` output unless explicitly requested.
 - Keep README user-facing and AGENTS.md agent-facing.
 
+## Release / GitHub Actions Rules
+
+- GitHub release workflow must keep all four packaging targets unless the user explicitly says otherwise: macOS arm64, macOS x64, Windows x64, Windows arm64.
+- Manual `workflow_dispatch` release runs must always provide a concrete `release_version` such as `v1.1.2` and a short `release_note`; do not run a nameless workflow that only shows `release` in the Actions list.
+- Action run names should be readable at a glance, e.g. `Release v1.1.2: public build latest code`, so later debugging can identify which version and purpose produced the artifacts.
+- If packaging is triggered from a branch instead of a tag, mention the source branch/ref in the final status and confirm the commit SHA that was built.
+- When fixing release workflow failures, keep changes scoped to CI/build scripts and do not remove target platforms as a workaround unless the user approves it.
+
 ## Windsurf 本地 API 服务
 
 Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authorization: Bearer agt_superai_*` 调用本机推理。架构：
