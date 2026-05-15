@@ -92,6 +92,21 @@ jobs:
       - name: Install npm deps
         run: npm ci
 
+      # 把 git tag / 手动输入的版本号写回 tauri.conf.json + Cargo.toml，
+      # 否则 tauri-action 会按 conf 里的旧版本命名产物（如
+      # Super AI_0.1.0_x64-setup.exe），而 updater 的 latest.json URL
+      # 路径用的是 tag 版本，二者拼起来 404。
+      - name: Sync version from tag/input
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_VERSION="${{ inputs.release_version }}"
+          else
+            RAW_VERSION="${GITHUB_REF_NAME}"
+          fi
+          node scripts/sync-version.mjs "$RAW_VERSION"
+
       # build-sidecar.sh 会：
       #   1. bun build --compile 把 vendor 子模块打成 superai-api-<triple>(.exe)
       #   2. 自动从上游分发渠道拉对应平台的 runtime 二进制
