@@ -158,18 +158,6 @@ const loggerPath = join(OUT_DIR, "src", "dashboard", "logger.js");
 const authPath = join(OUT_DIR, "src", "auth.js");
 {
   const src = readFileSync(authPath, "utf8");
-
-  const saveAnchor = "function saveAccounts() {\n  if (_saveInFlight) { _savePending = true; return; }";
-  if (!src.includes(saveAnchor)) {
-    console.error("[scrub-vendor] auth.js saveAccounts anchor not found; aborting");
-    process.exit(2);
-  }
-  const saveSyncAnchor = "export function saveAccountsSync() {\n  const tempFile = ACCOUNTS_FILE + '.shutdown.tmp';";
-  if (!src.includes(saveSyncAnchor)) {
-    console.error("[scrub-vendor] auth.js saveAccountsSync anchor not found; aborting");
-    process.exit(2);
-  }
-
   // 用正则吃掉两个完整函数（含函数体），整段替换成 no-op。
   // 函数体里没有嵌套独立顶层 `^}`，所以 /^}/m 就能稳定匹配右括号。
   const saveRe = /function saveAccounts\(\) \{[\s\S]*?\n\}\n/;

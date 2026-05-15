@@ -85,28 +85,12 @@ jobs:
           TARGET: ${{ matrix.sidecar_target }}
         run: bash scripts/build-sidecar.sh
 
-      - name: Tauri build & release
-        uses: tauri-apps/tauri-action@v0
+      - name: Tauri build
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # public 构建：邮箱 / token 脱敏，UI 显示 SUPERAI-XXXXXXX。
           # 想发完全版改成不注入这一行，或者再加一个 release-full.yml。
           VITE_SUPERAI_PUBLIC_BUILD: "1"
           # 有 updater 私钥时打开（仓库 secret 里塞这两个就行）：
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: ${{ github.ref_name }}
-          tauriScript: npm exec tauri
-          releaseName: "Super AI ${{ github.ref_name }}"
-          releaseBody: |
-            See AGENTS.md / README for what's in this build.
-
-            Artifacts:
-            - macOS arm64 dmg (M-series)
-            - macOS x64 dmg (Intel)
-            - Windows x64 NSIS installer + MSI
-            - Windows arm64 NSIS installer + MSI
-          releaseDraft: true
-          prerelease: false
-          args: --target ${{ matrix.tauri_target }}
+        run: npm exec tauri -- build --target ${{ matrix.tauri_target }}
