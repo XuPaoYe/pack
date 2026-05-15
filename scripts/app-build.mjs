@@ -2,10 +2,9 @@ import { spawnSync } from "node:child_process";
 
 const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
 
-const typecheck = spawnSync("npx", ["tsc", "-b"], {
+const typecheck = spawnSync(npmBin, ["exec", "tsc", "--", "-b"], {
   env: process.env,
   stdio: "inherit",
-  shell: process.platform === "win32",
 });
 
 if ((typecheck.status ?? 1) !== 0) {
