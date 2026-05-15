@@ -71,9 +71,11 @@ const WINDSURF_USER_STATUS_PATH: &str =
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
 const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.3-codex";
-const SUPERAI_AES_KEY_HEX: &str =
+const LEGACY_SUPERAI_AES_KEY_HEX: &str =
     "b9c1e79783adb25cdb3667ae62c168e18868438d62a47428abeb7b41491ff2ee";
-const SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
+const LEGACY_SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
+const SUPERAI_DATA_KEY_FILE: &str = "super_ai.key";
+static SUPERAI_DATA_KEY: LazyLock<Mutex<Option<[u8; 32]>>> = LazyLock::new(|| Mutex::new(None));
 
 fn is_public_build() -> bool {
     option_env!("VITE_SUPERAI_PUBLIC_BUILD") == Some("1")
@@ -379,7 +381,60 @@ fn app_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir.join("super_ai.sqlite"))
 }
 
+fn superai_data_key_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("读取应用数据目录失败: {error}"))?;
+    fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("创建应用数据目录失败 {}: {error}", data_dir.display()))?;
+    Ok(data_dir.join(SUPERAI_DATA_KEY_FILE))
+}
+
+fn ensure_superai_data_key(app: &tauri::AppHandle) -> Result<(), String> {
+    if SUPERAI_DATA_KEY
+        .lock()
+        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let path = superai_data_key_path(app)?;
+    let key = if path.exists() {
+        let raw = read_to_string(&path)?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(raw.trim())
+            .or_else(|_| hex::decode(raw.trim()))
+            .map_err(|error| format!("读取 SuperAI 数据密钥失败 {}: {error}", path.display()))?;
+        decoded
+            .try_into()
+            .map_err(|_| "SuperAI 数据密钥长度必须为 32 字节".to_string())?
+    } else {
+        let key: [u8; 32] = rand::random();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+        write_string_atomic(&path, &encoded)?;
+        key
+    };
+
+    let mut cache = SUPERAI_DATA_KEY
+        .lock()
+        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?;
+    *cache = Some(key);
+    Ok(())
+}
+
+fn superai_data_key() -> Result<[u8; 32], String> {
+    SUPERAI_DATA_KEY
+        .lock()
+        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?
+        .as_ref()
+        .copied()
+        .ok_or_else(|| "SuperAI 数据密钥尚未初始化".to_string())
+}
+
 fn open_app_db(app: &tauri::AppHandle) -> Result<Connection, String> {
+    ensure_superai_data_key(app)?;
     let path = app_db_path(app)?;
     let conn = Connection::open(&path)
         .map_err(|error| format!("打开 SQLite 数据库失败 {}: {error}", path.display()))?;
@@ -544,7 +599,12 @@ fn parse_stored_account_json(account_json: &str) -> Result<ManagedAccount, Strin
             .get("payload")
             .and_then(Value::as_str)
             .ok_or_else(|| "SuperAI 加密账号记录缺少 payload".to_string())?;
-        let decrypted = superai_decrypt_text(payload)?;
+        let decrypted = value
+            .get("iv")
+            .and_then(Value::as_str)
+            .map(|iv| superai_decrypt_text(payload, iv))
+            .unwrap_or_else(|| Err("SuperAI 加密账号记录缺少 iv".to_string()))
+            .or_else(|_| superai_decrypt_text_legacy(payload))?;
         serde_json::from_str::<ManagedAccount>(&decrypted)
             .map_err(|error| format!("解析 SuperAI 加密账号记录失败: {error}"))
     } else {
@@ -741,10 +801,12 @@ fn serialize_account_for_storage(account: &ManagedAccount) -> Result<String, Str
     if account.provider != "windsurf" {
         return Ok(account_json);
     }
-    let encrypted = superai_encrypt_text(&account_json)?;
+    let (encrypted, iv) = superai_encrypt_text(&account_json)?;
     let wrapper = serde_json::json!({
         "encrypted": true,
         "provider": "windsurf",
+        "keyVersion": 2,
+        "iv": iv,
         "payload": encrypted,
     });
     serde_json::to_string(&wrapper).map_err(|error| format!("序列化 SuperAI 加密账号失败: {error}"))
@@ -903,25 +965,38 @@ fn apply_windsurf_license_expiry(account: &mut ManagedAccount) {
     }
 }
 
-fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
-    let key = hex::decode(SUPERAI_AES_KEY_HEX).map_err(|error| format!("解析 SuperAI AES key 失败: {error}"))?;
-    let iv = hex::decode(SUPERAI_AES_IV_HEX).map_err(|error| format!("解析 SuperAI AES iv 失败: {error}"))?;
+fn legacy_superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
+    let key = hex::decode(LEGACY_SUPERAI_AES_KEY_HEX)
+        .map_err(|error| format!("解析旧版 SuperAI AES key 失败: {error}"))?;
+    let iv = hex::decode(LEGACY_SUPERAI_AES_IV_HEX)
+        .map_err(|error| format!("解析旧版 SuperAI AES iv 失败: {error}"))?;
     let key: [u8; 32] = key.try_into().map_err(|_| "SuperAI AES key 长度必须为 32 字节".to_string())?;
     let iv: [u8; 16] = iv.try_into().map_err(|_| "SuperAI AES iv 长度必须为 16 字节".to_string())?;
     Ok((key, iv))
 }
 
-fn superai_encrypt_text(plain: &str) -> Result<String, String> {
+fn superai_encrypt_text(plain: &str) -> Result<(String, String), String> {
     type Aes256CbcEnc = cbc::Encryptor<Aes256>;
-    let (key, iv) = superai_aes_key_iv()?;
+    let key = superai_data_key()?;
+    let iv: [u8; 16] = rand::random();
     let encrypted = Aes256CbcEnc::new(&key.into(), &iv.into())
         .encrypt_padded_vec_mut::<Pkcs7>(plain.as_bytes());
-    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(encrypted),
+        base64::engine::general_purpose::STANDARD.encode(iv),
+    ))
 }
 
-fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
+fn superai_decrypt_text(cipher_text: &str, iv_text: &str) -> Result<String, String> {
     type Aes256CbcDec = cbc::Decryptor<Aes256>;
-    let (key, iv) = superai_aes_key_iv()?;
+    let key = superai_data_key()?;
+    let iv = base64::engine::general_purpose::STANDARD
+        .decode(iv_text.trim())
+        .or_else(|_| URL_SAFE_NO_PAD.decode(iv_text.trim()))
+        .map_err(|_| "SuperAI AES IV 不是有效 base64".to_string())?;
+    let iv: [u8; 16] = iv
+        .try_into()
+        .map_err(|_| "SuperAI AES IV 长度必须为 16 字节".to_string())?;
     let raw = cipher_text.trim();
     let encrypted = base64::engine::general_purpose::STANDARD
         .decode(raw)
@@ -931,6 +1006,36 @@ fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
         .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
         .map_err(|_| "AES 解密失败或 PKCS#7 填充无效".to_string())?;
     String::from_utf8(decrypted).map_err(|_| "AES 明文不是有效 UTF-8".to_string())
+}
+
+fn superai_decrypt_text_legacy(cipher_text: &str) -> Result<String, String> {
+    type Aes256CbcDec = cbc::Decryptor<Aes256>;
+    let (key, iv) = legacy_superai_aes_key_iv()?;
+    let raw = cipher_text.trim();
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(raw))
+        .map_err(|_| "AES 密文不是有效 base64".to_string())?;
+    let decrypted = Aes256CbcDec::new(&key.into(), &iv.into())
+        .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
+        .map_err(|_| "旧版 AES 解密失败或 PKCS#7 填充无效".to_string())?;
+    String::from_utf8(decrypted).map_err(|_| "AES 明文不是有效 UTF-8".to_string())
+}
+
+fn encode_portable_superai_cipher(plain: &str) -> Result<String, String> {
+    let (cipher, iv) = superai_encrypt_text(plain)?;
+    Ok(format!("sa2.{iv}.{cipher}"))
+}
+
+fn decode_portable_superai_cipher(text: &str) -> Result<String, String> {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("sa2.") {
+        let (iv, cipher) = rest
+            .split_once('.')
+            .ok_or_else(|| "SuperAI 密钥缺少 iv 或 payload".to_string())?;
+        return superai_decrypt_text(cipher, iv);
+    }
+    superai_decrypt_text_legacy(trimmed)
 }
 
 fn bool_field(value: Option<&Value>) -> Option<bool> {
@@ -3140,7 +3245,7 @@ fn parse_windsurf_batch_key_line(line: &str) -> Result<WindsurfBatchCredential, 
     let candidates = [
         trimmed.to_string(),
         decode_batch_key_text(trimmed).unwrap_or_default(),
-        superai_decrypt_text(trimmed).unwrap_or_default(),
+        decode_portable_superai_cipher(trimmed).unwrap_or_default(),
     ];
     for candidate in candidates.iter().filter(|value| !value.trim().is_empty()) {
         if let Ok(value) = serde_json::from_str::<Value>(candidate) {
@@ -3280,7 +3385,7 @@ fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str, expires_at
     if is_public_build() {
         account.subscription_active_until = Some(Value::Number(expires_at.into()));
     }
-    // 入库时立刻初始化本地累计：把当前上游 weekly% 当 baseline，consumed 从 0 起算。
+    // 入库时立刻初始化本地累计：把当前上游 daily% 当 baseline，consumed 从 0 起算。
     // bump_public_usage 自带初始化分支。
     let _ = bump_public_usage(account);
     rewrite_quota_for_public_usage(account);
@@ -3289,8 +3394,8 @@ fn attach_windsurf_batch_key(account: &mut ManagedAccount, key: &str, expires_at
 // ---------------------------------------------------------------------------
 // 公开版（批量密钥）账号的"本地累计用量"独立追踪
 //
-// 上游 windsurf 的 weekly% 会按计费周期重置，但我们卖给用户的是固定额度：
-// 入库时记录 baseline，之后每次刷新做 max(0, last_remote - weekly) 单调累加，
+// 上游 windsurf 的 daily% 会按自然周期重置，但公开版 UI 展示的是"日限"：
+// 入库时记录 baseline，之后每次刷新做 max(0, last_remote - daily) 单调累加，
 // 累计 100% 即软停用账号（保留记录给 license 到期时由删号路径自然清理）。
 // 仅 windsurf provider + 含 batch_key 的账号生效，其他账号 helper 全部 no-op。
 // ---------------------------------------------------------------------------
@@ -3299,6 +3404,8 @@ const PUBLIC_USAGE_KEY_BASELINE: &str = "usage_baseline_remaining";
 const PUBLIC_USAGE_KEY_LAST_REMOTE: &str = "usage_last_remote_remaining";
 const PUBLIC_USAGE_KEY_CONSUMED: &str = "usage_consumed_local";
 const PUBLIC_USAGE_KEY_EXHAUSTED_AT: &str = "usage_exhausted_at";
+const PUBLIC_USAGE_KEY_BASIS: &str = "usage_basis";
+const PUBLIC_USAGE_BASIS_DAILY: &str = "daily";
 
 fn windsurf_payload_get_value(account: &ManagedAccount, key: &str) -> Option<Value> {
     account
@@ -3315,6 +3422,12 @@ fn windsurf_payload_set_value(account: &mut ManagedAccount, key: &str, value: Va
         .get_or_insert_with(|| Value::Object(serde_json::Map::new()));
     if let Some(obj) = payload.as_object_mut() {
         obj.insert(key.to_string(), value);
+    }
+}
+
+fn windsurf_payload_remove_value(account: &mut ManagedAccount, key: &str) {
+    if let Some(obj) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
+        obj.remove(key);
     }
 }
 
@@ -3338,38 +3451,56 @@ fn public_usage_consumed_percent(account: &ManagedAccount) -> i64 {
         .clamp(0, 100)
 }
 
+fn public_usage_baseline_percent(account: &ManagedAccount) -> i64 {
+    windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_BASELINE)
+        .and_then(|v| v.as_i64())
+        .unwrap_or(100)
+        .clamp(0, 100)
+}
+
+fn public_usage_remaining_percent(account: &ManagedAccount) -> i64 {
+    (public_usage_baseline_percent(account) - public_usage_consumed_percent(account)).clamp(0, 100)
+}
+
 fn public_usage_is_exhausted(account: &ManagedAccount) -> bool {
     has_public_usage_tracking(account)
         && (windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_EXHAUSTED_AT).is_some()
-            || public_usage_consumed_percent(account) >= 100)
+            || public_usage_remaining_percent(account) <= 0)
 }
 
-fn current_weekly_remaining_from_account(account: &ManagedAccount) -> Option<i64> {
+fn public_usage_basis_is_daily(account: &ManagedAccount) -> bool {
+    windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_BASIS)
+        .and_then(|v| v.as_str().map(str::to_string))
+        .as_deref()
+        == Some(PUBLIC_USAGE_BASIS_DAILY)
+}
+
+fn current_daily_remaining_from_account(account: &ManagedAccount) -> Option<i64> {
     account
         .quota
         .as_ref()?
         .metrics
         .iter()
-        .find(|m| m.key == "windsurf-weekly")
+        .find(|m| m.key == "windsurf-daily")
         .and_then(|m| m.remaining_percent)
 }
 
-/// 把上游 weekly% 的下降量累计到本地。返回 (是否本次首次耗尽, 当前 consumed%)。
+/// 把上游 daily% 的下降量累计到本地。返回 (是否本次首次耗尽, 当前 consumed%)。
 ///
 /// 语义：
-///   - 第一次记录：以当前 weekly% 当 baseline + last_remote，consumed 起步 0。
-///   - 后续：diff = last_remote - this_weekly；diff > 0 才累加（单调递增）。
-///   - 上游重置（this_weekly > last_remote）：丢弃负 diff，只更新 last_remote。
+///   - 第一次记录：以当前 daily% 当 baseline + last_remote，consumed 起步 0。
+///   - 后续：diff = last_remote - this_daily；diff > 0 才累加（单调递增）。
+///   - 上游重置（this_daily > last_remote）：丢弃负 diff，只更新 last_remote。
 ///   - consumed 永远 clamp 在 [0,100]；触达 100 即标 unavailable + 已耗尽。
 fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
     if !has_public_usage_tracking(account) {
         return (false, 0);
     }
-    let Some(weekly) = current_weekly_remaining_from_account(account) else {
+    let Some(daily) = current_daily_remaining_from_account(account) else {
         // 公开版账号刚导入但还没有 quota（极少见），保留当前状态等下次刷新。
         return (false, public_usage_consumed_percent(account));
     };
-    let weekly = weekly.clamp(0, 100);
+    let daily = daily.clamp(0, 100);
 
     let already_exhausted =
         windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_EXHAUSTED_AT).is_some();
@@ -3378,29 +3509,33 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
         .and_then(|v| v.as_i64())
         .map(|v| v.clamp(0, 100));
 
-    if last_remote.is_none() {
+    if last_remote.is_none() || !public_usage_basis_is_daily(account) {
         windsurf_payload_set_value(
             account,
             PUBLIC_USAGE_KEY_BASELINE,
-            Value::Number(weekly.into()),
+            Value::Number(daily.into()),
         );
         windsurf_payload_set_value(
             account,
             PUBLIC_USAGE_KEY_LAST_REMOTE,
-            Value::Number(weekly.into()),
+            Value::Number(daily.into()),
         );
-        if windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_CONSUMED).is_none() {
-            windsurf_payload_set_value(
-                account,
-                PUBLIC_USAGE_KEY_CONSUMED,
-                Value::Number(0.into()),
-            );
-        }
-        return (false, consumed);
+        windsurf_payload_set_value(
+            account,
+            PUBLIC_USAGE_KEY_BASIS,
+            Value::String(PUBLIC_USAGE_BASIS_DAILY.to_string()),
+        );
+        windsurf_payload_set_value(
+            account,
+            PUBLIC_USAGE_KEY_CONSUMED,
+            Value::Number(0.into()),
+        );
+        windsurf_payload_remove_value(account, PUBLIC_USAGE_KEY_EXHAUSTED_AT);
+        return (false, 0);
     }
 
     let last_remote = last_remote.unwrap();
-    let diff = last_remote - weekly;
+    let diff = last_remote - daily;
     if diff > 0 {
         consumed = (consumed + diff).clamp(0, 100);
         windsurf_payload_set_value(
@@ -3413,11 +3548,12 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
     windsurf_payload_set_value(
         account,
         PUBLIC_USAGE_KEY_LAST_REMOTE,
-        Value::Number(weekly.into()),
+        Value::Number(daily.into()),
     );
 
-    let just_exhausted = !already_exhausted && consumed >= 100;
-    if consumed >= 100 {
+    let remaining = public_usage_remaining_percent(account);
+    let just_exhausted = !already_exhausted && remaining <= 0;
+    if remaining <= 0 {
         let now = now_ts();
         if !already_exhausted {
             windsurf_payload_set_value(
@@ -3439,13 +3575,14 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
 }
 
 /// 公开版下用本地 consumed 覆盖 quota.metrics，UI 进度条因此显示"还剩 N%"
-/// 而不是上游 windsurf weekly%（避免上游重置后 UI 假性回血）。
+/// 而不是直接透出上游 windsurf daily%（避免上游重置后 UI 假性回血）。
 fn rewrite_quota_for_public_usage(account: &mut ManagedAccount) {
     if !has_public_usage_tracking(account) {
         return;
     }
     let consumed = public_usage_consumed_percent(account);
-    let remaining = (100 - consumed).max(0);
+    let baseline = public_usage_baseline_percent(account);
+    let remaining = public_usage_remaining_percent(account);
     let now = now_ts();
     let last_updated = account
         .quota
@@ -3458,7 +3595,7 @@ fn rewrite_quota_for_public_usage(account: &mut ManagedAccount) {
         label: "日限".to_string(),
         remaining_percent: Some(remaining),
         reset_at: account.subscription_active_until.clone(),
-        detail: Some(format!("已用 {consumed}%")),
+        detail: Some(format!("已用 {consumed}% / 共 {baseline}%")),
         state: Some(quota_state_from_remaining(remaining)),
     };
     account.quota = Some(AccountQuota {
@@ -3513,7 +3650,7 @@ fn public_windsurf_export_key(account: &ManagedAccount) -> Result<String, String
         "password": credential.password,
         "expires_at": expires_at,
     });
-    superai_encrypt_text(&payload.to_string())
+    encode_portable_superai_cipher(&payload.to_string())
 }
 
 #[tauri::command]

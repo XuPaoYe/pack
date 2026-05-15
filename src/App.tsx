@@ -942,6 +942,11 @@ function formatBytes(bytes: number) {
   return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
 }
 
+function clampApiServicePort(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(65535, Math.max(0, Math.trunc(value)));
+}
+
 function ForceUpdateModal({ state, onInstall }: { state: ForceUpdateState; onInstall: () => void }) {
   const progressPercent = state.totalBytes ? Math.min(100, Math.round((state.downloadedBytes / state.totalBytes) * 100)) : 0;
   const isWorking = state.phase === "downloading" || state.phase === "installing";
@@ -2555,7 +2560,7 @@ function App() {
                       value={settings.apiServicePort}
                       onChange={(event) => {
                         const next = Number(event.target.value);
-                        updateSetting("apiServicePort", Number.isFinite(next) ? next : 0);
+                        updateSetting("apiServicePort", clampApiServicePort(next));
                       }}
                     />
                   </label>
