@@ -31,26 +31,35 @@ jobs:
       # Windows 用原生 windows-latest runner 出 nsis exe + msi，零交叉编译。
       matrix:
         include:
+          # Mac 必须包含 'app' 才会产 .app.tar.gz 给 updater 用；dmg 同时出给首次安装。
           - name: macOS arm64 (M series)
             os: macos-latest
             tauri_target: aarch64-apple-darwin
             sidecar_target: darwin-arm64
             rust_targets: aarch64-apple-darwin
+            bundles: app,dmg
           - name: macOS x64 (Intel)
             os: macos-latest
             tauri_target: x86_64-apple-darwin
             sidecar_target: darwin-x64
             rust_targets: x86_64-apple-darwin
+            bundles: app,dmg
+          # Win 只出 NSIS（setup.exe）；MSI 主要是企业 GPO 场景，先省略。
+          # Windows tauri 2 是直接给 NSIS .exe 签名（产 .exe.sig），nsis 单项即可。
           - name: Windows x64 (Intel)
             os: windows-latest
             tauri_target: x86_64-pc-windows-msvc
             sidecar_target: windows-x64
             rust_targets: x86_64-pc-windows-msvc
+            bundles: nsis
+          # bun 1.2.x 不支持 windows-arm64 交叉编译，1.3.x cross-compile runtime 又损坏。
+          # 用 windows-11-arm 原生 ARM64 runner，bun 直接当原生编译，零交叉问题。
           - name: Windows arm64
-            os: windows-latest
+            os: windows-11-arm
             tauri_target: aarch64-pc-windows-msvc
             sidecar_target: windows-arm64
             rust_targets: aarch64-pc-windows-msvc
+            bundles: nsis
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -62,7 +71,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "22"
           cache: npm
 
       - name: Setup Bun（编 sidecar 要 bun --compile）
@@ -75,12 +84,6 @@ jobs:
         with:
           targets: ${{ matrix.rust_targets }}
 
-      - name: Resolve Rust binaries
-        shell: bash
-        run: |
-          echo "CARGO_BIN=$(rustup which cargo)" >> "$GITHUB_ENV"
-          echo "RUSTC_BIN=$(rustup which rustc)" >> "$GITHUB_ENV"
-
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -92,24 +95,102 @@ jobs:
         run: npm ci
 
       # build-sidecar.sh 会：
-      #   1. bun build --compile 把 vendor/windsurfapi 打成 superai-api-<triple>(.exe)
-      #   2. 自动从 windsurf.com / GitHub Release 拉对应平台的 LS 二进制
+      #   1. bun build --compile 把 vendor 子模块打成 superai-api-<triple>(.exe)
+      #   2. 自动从上游分发渠道拉对应平台的 runtime 二进制
       #      → 写到 src-tauri/binaries/language_server-<triple>(.exe)
       # tauri build 之后会被 externalBin 自动 bundle 进 dmg/exe/msi。
+      # bun --compile 在 Windows runner 上下载交叉编译 runtime 偶发"download
+      # incomplete"，重试 3 次足够覆盖网络抖动。
       - name: Build sidecar binaries
         shell: bash
         env:
           TARGET: ${{ matrix.sidecar_target }}
-        run: bash scripts/build-sidecar.sh
+        run: |
+          for i in 1 2 3; do
+            if bash scripts/build-sidecar.sh; then exit 0; fi
+            echo "▶ build-sidecar.sh failed (attempt $i/3), retrying in 5s..."
+            sleep 5
+          done
+          exit 1
 
-      - name: Tauri build
+      # 第一次尝试；continue-on-error 让它失败也不直接 fail job，留给下面的 retry。
+      # 典型 flake：macOS dmg 打包调 AppleScript/Finder 在无 GUI CI runner 上偶发挂
+      # （参考 tauri#3055）。重试一般秒过，因为 cargo 产物已缓存，只需重走 bundle 阶段。
+      - name: Tauri build & release (attempt 1)
+        id: tauri_build
+        continue-on-error: true
+        uses: tauri-apps/tauri-action@v0
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # public 构建：邮箱 / token 脱敏，UI 显示 SUPERAI-XXXXXXX。
           # 想发完全版改成不注入这一行，或者再加一个 release-full.yml。
           VITE_SUPERAI_PUBLIC_BUILD: "1"
-          CARGO: ${{ env.CARGO_BIN }}
-          RUSTC: ${{ env.RUSTC_BIN }}
-          # 有 updater 私钥时打开（仓库 secret 里塞这两个就行）：
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: npm exec tauri -- build --target ${{ matrix.tauri_target }}
+          # updater 私钥：只有 secret 真的设了才注入；空字符串会被 tauri 当成
+          # 损坏密钥导致 "Missing comment in secret key" 报错。
+          # 想签 updater 时去仓库 secrets 里塞这两个值即可，无需改 yml。
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Super AI ${{ github.ref_name }}"
+          releaseBody: |
+            See AGENTS.md / README for what's in this build.
+
+            Artifacts:
+            - macOS arm64 dmg (M-series)
+            - macOS x64 dmg (Intel)
+            - Windows x64 NSIS installer (.exe)
+            - Windows arm64 NSIS installer (.exe)
+          releaseDraft: true
+          prerelease: false
+          # --bundles 显式列出：dmg/nsis 给用户首次安装；updater 给老版本
+          # 自动升级用（.app.tar.gz / .nsis.zip + .sig）。需要仓库 secrets 里
+          # 已经配好 TAURI_SIGNING_PRIVATE_KEY + TAURI_SIGNING_PRIVATE_KEY_PASSWORD。
+          args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
+
+      # 仅当第一次失败时触发；tauri-action 见 release 已存在会直接追加 artifact，
+      # cargo/rustc 产物沿用上轮缓存，实际只重跑 bundler（dmg/nsis）。
+      - name: Tauri build & release (retry)
+        if: steps.tauri_build.outcome == 'failure'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VITE_SUPERAI_PUBLIC_BUILD: "1"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Super AI ${{ github.ref_name }}"
+          releaseDraft: true
+          prerelease: false
+          args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
+
+  # 4 个平台 build job 全部成功后，把 release 里的 latest.json 改写成 OSS-ready
+  # 版本（URL 指向 ai.talentisan.cn/SuperAI/v{ver}/...）。用户手动把 release 里
+  # 的 latest.json 和对应安装包上传到 OSS 后，线上 updater 才会生效。
+  rewrite-latest-json:
+    name: Rewrite latest.json for OSS
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      - name: Rewrite & re-upload latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # 改这里就能切换发布域名（比如 OSS bucket 直链 / 其他 CDN）。
+          PUBLIC_BASE_URL: https://ai.talentisan.cn/SuperAI
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"        # 例如 v1.0.1
+          VERSION="${TAG#v}"              # 1.0.1
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern latest.json -O latest.json --clobber
+          node scripts/rewrite-updater-json.mjs latest.json "$VERSION" "$PUBLIC_BASE_URL"
+          echo "--- 改写后的 latest.json ---"
+          cat latest.json
+          gh release upload "$TAG" latest.json --repo "$GITHUB_REPOSITORY" --clobber
