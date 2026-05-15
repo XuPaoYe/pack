@@ -52,10 +52,8 @@ jobs:
             sidecar_target: windows-x64
             rust_targets: x86_64-pc-windows-msvc
             bundles: nsis
-          # bun 1.2.x 不支持 windows-arm64 交叉编译，1.3.x cross-compile runtime 又损坏。
-          # 用 windows-11-arm 原生 ARM64 runner，bun 直接当原生编译，零交叉问题。
           - name: Windows arm64
-            os: windows-11-arm
+            os: windows-latest
             tauri_target: aarch64-pc-windows-msvc
             sidecar_target: windows-arm64
             rust_targets: aarch64-pc-windows-msvc
@@ -131,6 +129,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
+          tauriScript: npm exec tauri --
           tagName: ${{ github.ref_name }}
           releaseName: "Super AI ${{ github.ref_name }}"
           releaseBody: |
@@ -159,6 +158,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
+          tauriScript: npm exec tauri --
           tagName: ${{ github.ref_name }}
           releaseName: "Super AI ${{ github.ref_name }}"
           releaseDraft: true
