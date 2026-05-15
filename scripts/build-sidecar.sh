@@ -129,9 +129,18 @@ compile_sidecar() {
   local rust_triple="$2"
   local out="$3"
   echo "▶ bun build --compile --target=$bun_target"
-  bun build --compile --target="$bun_target" \
+  if ! bun build --compile --target="$bun_target" \
     "$VENDOR_DIR/src/index.js" \
-    --outfile "$out"
+    --outfile "$out"; then
+    if [[ "$bun_target" == "bun-windows-arm64" ]]; then
+      echo "⚠️  bun-windows-arm64 编译失败，改用 x64 sidecar 兼容 Windows ARM64" >&2
+      bun build --compile --target="bun-windows-x64" \
+        "$VENDOR_DIR/src/index.js" \
+        --outfile "$out"
+    else
+      return 1
+    fi
+  fi
   repair_macos_binary "$out"
   echo "✓ $out"
 }
