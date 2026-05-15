@@ -18,7 +18,7 @@ on:
         required: true
         type: string
 
-run-name: ${{ github.event_name == 'workflow_dispatch' && format('Release {0}: {1}', inputs.release_version, inputs.release_note) || format('Release {0}', github.ref_name) }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Release {0}: {1}', github.event.inputs.release_version, github.event.inputs.release_note) || format('Release {0}', github.ref_name) }}
 
 permissions:
   contents: write  # 让 tauri-action 能创建 release 并上传产物
