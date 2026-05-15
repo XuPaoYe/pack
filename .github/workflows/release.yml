@@ -59,6 +59,12 @@ jobs:
         with:
           targets: ${{ matrix.rust_targets }}
 
+      - name: Resolve Rust binaries
+        shell: bash
+        run: |
+          echo "CARGO_BIN=$(rustup which cargo)" >> "$GITHUB_ENV"
+          echo "RUSTC_BIN=$(rustup which rustc)" >> "$GITHUB_ENV"
+
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -85,6 +91,8 @@ jobs:
           # public 构建：邮箱 / token 脱敏，UI 显示 SUPERAI-XXXXXXX。
           # 想发完全版改成不注入这一行，或者再加一个 release-full.yml。
           VITE_SUPERAI_PUBLIC_BUILD: "1"
+          CARGO: ${{ env.CARGO_BIN }}
+          RUSTC: ${{ env.RUSTC_BIN }}
           # 有 updater 私钥时打开（仓库 secret 里塞这两个就行）：
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
