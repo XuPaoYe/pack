@@ -118,16 +118,14 @@ const modelsPath = join(OUT_DIR, "src", "models.js");
 const loggerPath = join(OUT_DIR, "src", "dashboard", "logger.js");
 {
   const src = readFileSync(loggerPath, "utf8");
-  const anchor = "    // Persist to disk\n    try {\n      const { app, err } = getStreams();\n      const line = JSON.stringify(entry) + '\\n';";
-  if (!src.includes(anchor)) {
+  const persistRe =
+    /(\s+\/\/ Persist to disk\s+try \{\s+const \{ app, err \} = getStreams\(\);\s+)const line = JSON\.stringify\(entry\) \+ '\\n';/m;
+  if (!persistRe.test(src)) {
     console.error("[scrub-vendor] logger.js persist anchor not found; aborting");
     process.exit(2);
   }
   // 通过 fromCharCode 拼出敏感词，避免最终二进制 strings(1) 还看得到。
-  const replacement = `    // Persist to disk
-    try {
-      const { app, err } = getStreams();
-      const __sw = String.fromCharCode(87,105,110,100,115,117,114,102);
+  const replacement = `$1const __sw = String.fromCharCode(87,105,110,100,115,117,114,102);
       const __swLower = String.fromCharCode(119,105,110,100,115,117,114,102) + 'api';
       const __reA = new RegExp(__sw + 'API', 'g');
       const __reB = new RegExp(__sw + ' API', 'g');
@@ -139,7 +137,7 @@ const loggerPath = join(OUT_DIR, "src", "dashboard", "logger.js");
               .replace(__reC, 'SuperAI').replace(__reD, 'superai-sidecar')
           : v));
       const line = JSON.stringify(sanitized) + '\\n';`;
-  const next = src.replace(anchor, replacement);
+  const next = src.replace(persistRe, replacement);
   writeFileSync(loggerPath, next);
 }
 
