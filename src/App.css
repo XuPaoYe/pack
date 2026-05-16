@@ -1926,6 +1926,20 @@ h2 {
   max-width: 480px;
 }
 
+.danger-setting-row {
+  align-items: flex-start;
+  padding-top: 14px;
+  padding-bottom: 14px;
+}
+
+.danger-setting-row .setting-copy svg {
+  color: #dc2626;
+}
+
+.danger-setting-row .setting-copy p {
+  max-width: 390px;
+}
+
 .setting-copy {
   min-width: 0;
   display: flex;
