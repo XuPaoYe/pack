@@ -171,11 +171,11 @@ const defaultImportMode: ImportMode = "oauth";
 const defaultSuperaiImportMode: ImportMode = "batchKey";
 
 function importModesForProvider(provider: Provider): ImportMode[] {
-  return provider === PROVIDER_WSF ? superaiImportModeOrder : importModeOrder;
+  return provider === PROVIDER_SUPERAI ? superaiImportModeOrder : importModeOrder;
 }
 
 function defaultImportModeForProvider(provider: Provider): ImportMode {
-  return provider === PROVIDER_WSF ? defaultSuperaiImportMode : defaultImportMode;
+  return provider === PROVIDER_SUPERAI ? defaultSuperaiImportMode : defaultImportMode;
 }
 
 function providerLabel(provider: Provider) {
@@ -185,27 +185,23 @@ function providerLabel(provider: Provider) {
 }
 
 // 用 .map(...).join("") 形式构造，绕过 esbuild / vite 的常量折叠，让 dist 里
-// 不出现 Windsurf / windsurf 字面量。直接 String.fromCharCode(87,105,...) 会
-// 被构建器在编译期算成 "Windsurf"，反而塞进 bundle。
-const __WSF: string = [87, 105, 110, 100, 115, 117, 114, 102]
+// 不出现上游品牌字面量。直接 String.fromCharCode(...) 会被构建器在编译期算成明文。
+const __SUPERAI_LEGACY_NAME: string = [87, 105, 110, 100, 115, 117, 114, 102]
   .map((c) => String.fromCharCode(c))
   .join("");
-const __WSFAPI: string = [119, 105, 110, 100, 115, 117, 114, 102, 97, 112, 105]
+const __SUPERAI_LEGACY_PROJECT: string = [119, 105, 110, 100, 115, 117, 114, 102, 97, 112, 105]
   .map((c) => String.fromCharCode(c))
   .join("");
-// 后端 account_for_frontend 出口处把内部协议名 "windsurf" 改写成 "superai"，
-// 所以前端只比较 "superai" 即可。upsert_accounts 入口会反向翻译回去。
-const PROVIDER_WSF = "superai" as const;
+// 后端 account_for_frontend 出口处把内部协议名改写成 "superai"，前端只比较
+// "superai" 即可。upsert_accounts 入口会反向翻译回去。
+const PROVIDER_SUPERAI = "superai" as const;
 
 function sanitizeUserFacingText(text: string) {
-  // 先替换更长的 lowercase 项目代号 windsurfapi，再替换 Windsurf；
-  // 顺序反了会让 "WindsurfAPI" 先变成 "SuperAIAPI"，第二轮 lowercase
-  // 匹配就没机会修正大小写混用的形态。再补一条 case-insensitive 兜底
-  // "WindsurfAPI" 形态，运行时 sidecar 偶发返回的字符串也能干净。
+  // 先替换更长的 lowercase 项目代号，再替换品牌名；顺序反了会留下大小写混用的形态。
   let next = text
-    .replaceAll(__WSFAPI, "superai-sidecar")
-    .replace(new RegExp(__WSF + "API", "gi"), "SuperAI")
-    .replaceAll(__WSF, "SuperAI");
+    .replaceAll(__SUPERAI_LEGACY_PROJECT, "superai-sidecar")
+    .replace(new RegExp(__SUPERAI_LEGACY_NAME + "API", "gi"), "SuperAI")
+    .replaceAll(__SUPERAI_LEGACY_NAME, "SuperAI");
   if (IS_PUBLIC_BUILD) {
     next = next
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account]")
@@ -247,7 +243,7 @@ function publicAccountCode(account: ManagedAccount, prefix: string) {
 }
 
 function shouldHideAccountDetails(account: ManagedAccount) {
-  return IS_PUBLIC_BUILD && account.provider === PROVIDER_WSF;
+  return IS_PUBLIC_BUILD && account.provider === PROVIDER_SUPERAI;
 }
 
 function accountDisplayLabel(account: ManagedAccount) {
@@ -471,7 +467,7 @@ const MODEL_FAMILIES: ModelFamily[] = [
     key: "gemini-3.0-flash",
     label: "Gemini 3.0 Flash",
     aliases: ["Gemini 3.0 Flash", "gemini-3-0-flash"],
-    // 上游 vendor/windsurfapi/src/models.js:155-158 提供 minimal / low / medium / high
+    // 上游模型表提供 minimal / low / medium / high
     // 四个档位；bare `gemini-3.0-flash` 等同 medium。
     efforts: ["minimal", "low", "medium", "high"],
     defaultEffort: "medium",
@@ -994,7 +990,7 @@ function AppModal({
 
 function App() {
   const [accounts, setAccounts] = useState<ManagedAccount[]>([]);
-  const [activeProvider, setActiveProvider] = useState<Provider>(PROVIDER_WSF);
+  const [activeProvider, setActiveProvider] = useState<Provider>(PROVIDER_SUPERAI);
   const [mode, setMode] = useState<ImportMode>(defaultImportMode);
   const [pasteValue, setPasteValue] = useState("");
   const [superaiBatchKeys, setSuperaiBatchKeys] = useState("");
@@ -1083,7 +1079,7 @@ function App() {
     () => ({
       codex: accounts.filter((account) => account.provider === "codex").length,
       gemini: accounts.filter((account) => account.provider === "gemini").length,
-      [PROVIDER_WSF]: accounts.filter((account) => account.provider === PROVIDER_WSF).length,
+      [PROVIDER_SUPERAI]: accounts.filter((account) => account.provider === PROVIDER_SUPERAI).length,
     }),
     [accounts],
   );
@@ -1433,7 +1429,7 @@ function App() {
   const selectedMode = modeConfig[mode];
   const ModeIcon = selectedMode.icon;
   const isActiveProviderOAuthPending =
-    activeProvider !== PROVIDER_WSF && Boolean(pendingOAuth[activeProvider as OAuthProvider]);
+    activeProvider !== PROVIDER_SUPERAI && Boolean(pendingOAuth[activeProvider as OAuthProvider]);
   const oauthAccountLabel = activeProvider === "codex" ? "OpenAI" : "Gemini";
   const localImportDesc =
     activeProvider === "codex" ? "从本地已登录的会话中导入 Codex 账号" : "从本地已登录的会话中导入 Gemini Cli 账号";
@@ -2069,10 +2065,10 @@ function App() {
         </div>
 
         <nav className="nav-list" aria-label="Providers">
-          <button className={clsx(activeProvider === PROVIDER_WSF && "active")} onClick={() => handleProviderChange(PROVIDER_WSF)}>
+          <button className={clsx(activeProvider === PROVIDER_SUPERAI && "active")} onClick={() => handleProviderChange(PROVIDER_SUPERAI)}>
             <SuperaiIcon className="provider-nav-icon superai" />
             <span>SuperAI</span>
-            <b>{counts[PROVIDER_WSF]}</b>
+            <b>{counts[PROVIDER_SUPERAI]}</b>
           </button>
           <button className={clsx(activeProvider === "codex" && "active")} onClick={() => handleProviderChange("codex")}>
             <CodexIcon className="provider-nav-icon codex" />
@@ -2153,7 +2149,7 @@ function App() {
             <div className="account-scroll-frame">
               <div className="account-scroll-shell" ref={accountListRef} onScroll={updateAccountScrollbar}>
                 <div className="account-list card-mode">
-                  {activeProvider === PROVIDER_WSF && (
+                  {activeProvider === PROVIDER_SUPERAI && (
                     <ApiServiceCard
                       status={apiService}
                       busy={isApiServiceBusy}
@@ -2163,7 +2159,7 @@ function App() {
                       onOpenConfig={() => setIsApiConfigOpen(true)}
                     />
                   )}
-                  {filteredAccounts.length === 0 && activeProvider !== PROVIDER_WSF && (
+                  {filteredAccounts.length === 0 && activeProvider !== PROVIDER_SUPERAI && (
                     <div className="empty-state">
                       <SearchX size={48} strokeWidth={1.55} />
                       <strong>暂无账号</strong>
@@ -2360,7 +2356,7 @@ function App() {
                 </div>
               </div>
 
-              {mode === "paste" && activeProvider !== PROVIDER_WSF && (
+              {mode === "paste" && activeProvider !== PROVIDER_SUPERAI && (
                 <>
                   <textarea
                     value={pasteValue}
@@ -2393,7 +2389,7 @@ function App() {
                 </>
               )}
 
-              {mode === "local" && activeProvider !== PROVIDER_WSF && (
+              {mode === "local" && activeProvider !== PROVIDER_SUPERAI && (
                 <>
                   <button className="drop-zone local-import-button" onClick={() => handleLocalImport(activeProvider as OAuthProvider)} disabled={isImportBusy}>
                     <FolderDown size={28} />
@@ -2403,7 +2399,7 @@ function App() {
                 </>
               )}
 
-              {mode === "oauth" && activeProvider !== PROVIDER_WSF && (
+              {mode === "oauth" && activeProvider !== PROVIDER_SUPERAI && (
                 <div className="oauth-flow">
                   <button className={clsx("drop-zone", isActiveProviderOAuthPending && "oauth-pending")} onClick={() => handleOAuthStart(activeProvider as OAuthProvider)}>
                     <LockKeyhole size={28} />
@@ -2413,7 +2409,7 @@ function App() {
                 </div>
               )}
 
-              {mode === "batchKey" && activeProvider === PROVIDER_WSF && (
+              {mode === "batchKey" && activeProvider === PROVIDER_SUPERAI && (
                 <>
                   <textarea
                     value={superaiBatchKeys}
@@ -2433,7 +2429,7 @@ function App() {
                 </>
               )}
 
-              {mode === "password" && activeProvider === PROVIDER_WSF && !IS_PUBLIC_BUILD && (
+              {mode === "password" && activeProvider === PROVIDER_SUPERAI && !IS_PUBLIC_BUILD && (
                 <div className="superai-password-form">
                   <label className="field">
                     <span>邮箱</span>

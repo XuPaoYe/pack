@@ -1,4 +1,4 @@
-mod windsurf_api;
+mod api_service;
 
 use aes::Aes256;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -71,9 +71,11 @@ const WINDSURF_USER_STATUS_PATH: &str =
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
 const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.5";
-const SUPERAI_AES_KEY_HEX: &str =
+const LEGACY_SUPERAI_AES_KEY_HEX: &str =
     "b9c1e79783adb25cdb3667ae62c168e18868438d62a47428abeb7b41491ff2ee";
-const SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
+const LEGACY_SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
+const SUPERAI_DATA_KEY_FILE: &str = "super_ai.key";
+static SUPERAI_DATA_KEY: LazyLock<Mutex<Option<[u8; 32]>>> = LazyLock::new(|| Mutex::new(None));
 
 fn is_public_build() -> bool {
     option_env!("VITE_SUPERAI_PUBLIC_BUILD") == Some("1")
@@ -226,7 +228,7 @@ struct AppSettings {
 }
 
 fn default_api_service_host() -> String {
-    windsurf_api::DEFAULT_HOST.to_string()
+    api_service::DEFAULT_HOST.to_string()
 }
 
 fn default_theme() -> String {
@@ -242,7 +244,7 @@ fn default_app_settings() -> AppSettings {
         auto_detect: true,
         api_service_enabled: false,
         api_service_host: default_api_service_host(),
-        api_service_port: windsurf_api::DEFAULT_PORT,
+        api_service_port: api_service::DEFAULT_PORT,
         api_service_key: String::new(),
         api_service_default_model: DEFAULT_WINDSURF_API_MODEL.to_string(),
     }
@@ -379,7 +381,60 @@ fn app_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir.join("super_ai.sqlite"))
 }
 
+fn superai_data_key_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("读取应用数据目录失败: {error}"))?;
+    fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("创建应用数据目录失败 {}: {error}", data_dir.display()))?;
+    Ok(data_dir.join(SUPERAI_DATA_KEY_FILE))
+}
+
+fn ensure_superai_data_key(app: &tauri::AppHandle) -> Result<(), String> {
+    if SUPERAI_DATA_KEY
+        .lock()
+        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    let path = superai_data_key_path(app)?;
+    let key = if path.exists() {
+        let raw = read_to_string(&path)?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(raw.trim())
+            .or_else(|_| hex::decode(raw.trim()))
+            .map_err(|error| format!("读取 SuperAI 数据密钥失败 {}: {error}", path.display()))?;
+        decoded
+            .try_into()
+            .map_err(|_| "SuperAI 数据密钥长度必须为 32 字节".to_string())?
+    } else {
+        let key: [u8; 32] = rand::random();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+        write_string_atomic(&path, &encoded)?;
+        key
+    };
+
+    let mut cache = SUPERAI_DATA_KEY
+        .lock()
+        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?;
+    *cache = Some(key);
+    Ok(())
+}
+
+fn superai_data_key() -> Result<[u8; 32], String> {
+    SUPERAI_DATA_KEY
+        .lock()
+        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?
+        .as_ref()
+        .copied()
+        .ok_or_else(|| "SuperAI 数据密钥尚未初始化".to_string())
+}
+
 fn open_app_db(app: &tauri::AppHandle) -> Result<Connection, String> {
+    ensure_superai_data_key(app)?;
     let path = app_db_path(app)?;
     let conn = Connection::open(&path)
         .map_err(|error| format!("打开 SQLite 数据库失败 {}: {error}", path.display()))?;
@@ -666,7 +721,12 @@ fn parse_stored_account_json(account_json: &str) -> Result<ManagedAccount, Strin
             .get("payload")
             .and_then(Value::as_str)
             .ok_or_else(|| "SuperAI 加密账号记录缺少 payload".to_string())?;
-        let decrypted = superai_decrypt_text(payload)?;
+        let decrypted = value
+            .get("iv")
+            .and_then(Value::as_str)
+            .map(|iv| superai_decrypt_text(payload, iv))
+            .unwrap_or_else(|| Err("SuperAI 加密账号记录缺少 iv".to_string()))
+            .or_else(|_| superai_decrypt_text_legacy(payload))?;
         serde_json::from_str::<ManagedAccount>(&decrypted)
             .map_err(|error| format!("解析 SuperAI 加密账号记录失败: {error}"))
     } else {
@@ -924,12 +984,14 @@ fn serialize_account_for_storage(account: &ManagedAccount) -> Result<String, Str
     if account.provider != "windsurf" {
         return Ok(account_json);
     }
-    let encrypted = superai_encrypt_text(&account_json)?;
+    let (encrypted, iv) = superai_encrypt_text(&account_json)?;
     // wrapper 里只是个路由标识，跟解密后的内部 provider 解耦。用 "superai"
     // 让用户即使绕过外层 AES 看到 wrapper JSON，也不会看到协议代号。
     let wrapper = serde_json::json!({
         "encrypted": true,
         "provider": "superai",
+        "keyVersion": 2,
+        "iv": iv,
         "payload": encrypted,
     });
     serde_json::to_string(&wrapper).map_err(|error| format!("序列化 SuperAI 加密账号失败: {error}"))
@@ -1100,11 +1162,11 @@ fn apply_windsurf_license_expiry(account: &mut ManagedAccount) {
     }
 }
 
-fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
-    let key = hex::decode(SUPERAI_AES_KEY_HEX)
-        .map_err(|error| format!("解析 SuperAI AES key 失败: {error}"))?;
-    let iv = hex::decode(SUPERAI_AES_IV_HEX)
-        .map_err(|error| format!("解析 SuperAI AES iv 失败: {error}"))?;
+fn legacy_superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
+    let key = hex::decode(LEGACY_SUPERAI_AES_KEY_HEX)
+        .map_err(|error| format!("解析旧版 SuperAI AES key 失败: {error}"))?;
+    let iv = hex::decode(LEGACY_SUPERAI_AES_IV_HEX)
+        .map_err(|error| format!("解析旧版 SuperAI AES iv 失败: {error}"))?;
     let key: [u8; 32] = key
         .try_into()
         .map_err(|_| "SuperAI AES key 长度必须为 32 字节".to_string())?;
@@ -1114,17 +1176,28 @@ fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
     Ok((key, iv))
 }
 
-fn superai_encrypt_text(plain: &str) -> Result<String, String> {
+fn superai_encrypt_text(plain: &str) -> Result<(String, String), String> {
     type Aes256CbcEnc = cbc::Encryptor<Aes256>;
-    let (key, iv) = superai_aes_key_iv()?;
+    let key = superai_data_key()?;
+    let iv: [u8; 16] = rand::random();
     let encrypted = Aes256CbcEnc::new(&key.into(), &iv.into())
         .encrypt_padded_vec_mut::<Pkcs7>(plain.as_bytes());
-    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(encrypted),
+        base64::engine::general_purpose::STANDARD.encode(iv),
+    ))
 }
 
-fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
+fn superai_decrypt_text(cipher_text: &str, iv_text: &str) -> Result<String, String> {
     type Aes256CbcDec = cbc::Decryptor<Aes256>;
-    let (key, iv) = superai_aes_key_iv()?;
+    let key = superai_data_key()?;
+    let iv = base64::engine::general_purpose::STANDARD
+        .decode(iv_text.trim())
+        .or_else(|_| URL_SAFE_NO_PAD.decode(iv_text.trim()))
+        .map_err(|_| "SuperAI AES IV 不是有效 base64".to_string())?;
+    let iv: [u8; 16] = iv
+        .try_into()
+        .map_err(|_| "SuperAI AES IV 长度必须为 16 字节".to_string())?;
     let raw = cipher_text.trim();
     let encrypted = base64::engine::general_purpose::STANDARD
         .decode(raw)
@@ -1134,6 +1207,36 @@ fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
         .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
         .map_err(|_| "AES 解密失败或 PKCS#7 填充无效".to_string())?;
     String::from_utf8(decrypted).map_err(|_| "AES 明文不是有效 UTF-8".to_string())
+}
+
+fn superai_decrypt_text_legacy(cipher_text: &str) -> Result<String, String> {
+    type Aes256CbcDec = cbc::Decryptor<Aes256>;
+    let (key, iv) = legacy_superai_aes_key_iv()?;
+    let raw = cipher_text.trim();
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .or_else(|_| URL_SAFE_NO_PAD.decode(raw))
+        .map_err(|_| "AES 密文不是有效 base64".to_string())?;
+    let decrypted = Aes256CbcDec::new(&key.into(), &iv.into())
+        .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
+        .map_err(|_| "旧版 AES 解密失败或 PKCS#7 填充无效".to_string())?;
+    String::from_utf8(decrypted).map_err(|_| "AES 明文不是有效 UTF-8".to_string())
+}
+
+fn encode_portable_superai_cipher(plain: &str) -> Result<String, String> {
+    let (cipher, iv) = superai_encrypt_text(plain)?;
+    Ok(format!("sa2.{iv}.{cipher}"))
+}
+
+fn decode_portable_superai_cipher(text: &str) -> Result<String, String> {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("sa2.") {
+        let (iv, cipher) = rest
+            .split_once('.')
+            .ok_or_else(|| "SuperAI 密钥缺少 iv 或 payload".to_string())?;
+        return superai_decrypt_text(cipher, iv);
+    }
+    superai_decrypt_text_legacy(trimmed)
 }
 
 fn bool_field(value: Option<&Value>) -> Option<bool> {
@@ -3368,7 +3471,7 @@ fn parse_windsurf_batch_key_line(line: &str) -> Result<WindsurfBatchCredential, 
     let candidates = [
         trimmed.to_string(),
         decode_batch_key_text(trimmed).unwrap_or_default(),
-        superai_decrypt_text(trimmed).unwrap_or_default(),
+        decode_portable_superai_cipher(trimmed).unwrap_or_default(),
     ];
     for candidate in candidates.iter().filter(|value| !value.trim().is_empty()) {
         if let Ok(value) = serde_json::from_str::<Value>(candidate) {
@@ -3840,7 +3943,7 @@ fn stash_public_usage_history(app: &tauri::AppHandle, account: &ManagedAccount) 
     };
     // 用与 windsurf 账号正文同一把 AES key 加密落库。明文 snapshot 含 baseline /
     // consumed / last_remote 等本地用量信息，不希望用户直接打开 sqlite 就能改。
-    let cipher_text = match superai_encrypt_text(&snapshot_json) {
+    let cipher_text = match encode_portable_superai_cipher(&snapshot_json) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("[usage-history] 加密失败: {error}");
@@ -3907,7 +4010,7 @@ fn restore_public_usage_history(
         return false;
     }
     // snapshot 在 stash 时用 AES 加密；解密失败视为脏数据丢弃。
-    let snapshot_json = match superai_decrypt_text(&cipher_text) {
+    let snapshot_json = match decode_portable_superai_cipher(&cipher_text) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("[usage-history] 解密失败: {error}");
@@ -3974,7 +4077,7 @@ fn public_windsurf_export_key(account: &ManagedAccount) -> Result<String, String
         "password": credential.password,
         "expires_at": expires_at,
     });
-    superai_encrypt_text(&payload.to_string())
+    encode_portable_superai_cipher(&payload.to_string())
 }
 
 #[tauri::command]
@@ -5820,15 +5923,15 @@ fn activate_windsurf_account_for_api(
     app: &tauri::AppHandle,
     account: &ManagedAccount,
 ) -> Result<(), String> {
-    if !windsurf_api::is_running_with_sidecar() {
+    if !api_service::is_running_with_sidecar() {
         return Ok(());
     }
 
-    match windsurf_api::activate_account_by_email(&account.email) {
+    match api_service::activate_account_by_email(&account.email) {
         Ok(()) => Ok(()),
         Err(first_error) => {
             sync_superai_accounts_to_api(app.clone())?;
-            windsurf_api::activate_account_by_email(&account.email).map_err(|second_error| {
+            api_service::activate_account_by_email(&account.email).map_err(|second_error| {
                 format!("启用 API 账号失败: {second_error}; 同步前错误: {first_error}")
             })
         }
@@ -5837,12 +5940,12 @@ fn activate_windsurf_account_for_api(
 
 #[tauri::command]
 fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
-    let Some(email) = windsurf_api::last_used_account_email() else {
+    let Some(email) = api_service::last_used_account_email() else {
         return Ok(Vec::new());
     };
     // 幂等短路：sidecar 上次挑的还是这个号 → 我们已经把 "当前" 标签打过，
     // 不必再开 sqlite + AES 解密 + 全表 upsert。前端 setInterval 3s 也几乎零开销。
-    if windsurf_api::last_synced_active_email()
+    if api_service::last_synced_active_email()
         .as_deref()
         .map(|prev| prev.eq_ignore_ascii_case(&email))
         .unwrap_or(false)
@@ -5857,7 +5960,7 @@ fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedA
     };
     let result =
         set_account_current_state(&conn, "windsurf", &account.id).map(accounts_for_frontend)?;
-    windsurf_api::record_synced_active_email(email.to_ascii_lowercase());
+    api_service::record_synced_active_email(email.to_ascii_lowercase());
     Ok(result)
 }
 
@@ -5990,7 +6093,7 @@ fn load_settings(app: tauri::AppHandle) -> Result<Option<AppSettings>, String> {
 #[tauri::command]
 fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), String> {
     apply_system_auto_launch(&app, settings.auto_launch)?;
-    // 前端不维护 windsurf_api_* 字段，从已有记录里继承，避免被默认值覆盖。
+    // 前端不维护旧 API 服务字段，从已有记录里继承，避免被默认值覆盖。
     let mut merged = settings;
     if let Ok(existing) = read_settings_record(&app) {
         // 前端不维护这两项，从已有记录里继承避免被默认值覆盖。
@@ -6274,8 +6377,8 @@ fn ensure_api_service_key(
     settings: &mut AppSettings,
 ) -> Result<(), String> {
     let key = settings.api_service_key.trim();
-    if key.is_empty() || windsurf_api::is_legacy_api_key(key) {
-        settings.api_service_key = windsurf_api::generate_api_key();
+    if key.is_empty() || api_service::is_legacy_api_key(key) {
+        settings.api_service_key = api_service::generate_api_key();
         write_settings_record(app, settings)?;
     }
     Ok(())
@@ -6284,10 +6387,10 @@ fn ensure_api_service_key(
 #[tauri::command]
 fn get_api_service_status(
     app: tauri::AppHandle,
-) -> Result<windsurf_api::ApiServiceStatus, String> {
+) -> Result<api_service::ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
-    Ok(windsurf_api::current_status(
+    Ok(api_service::current_status(
         &settings.api_service_host,
         settings.api_service_port,
         &settings.api_service_key,
@@ -6298,7 +6401,7 @@ fn get_api_service_status(
 #[tauri::command]
 async fn start_api_service(
     app: tauri::AppHandle,
-) -> Result<windsurf_api::ApiServiceStatus, String> {
+) -> Result<api_service::ApiServiceStatus, String> {
     tauri::async_runtime::spawn_blocking(move || start_api_service_impl(app))
         .await
         .map_err(|error| format!("启动 API 服务任务失败: {error}"))?
@@ -6306,14 +6409,14 @@ async fn start_api_service(
 
 fn start_api_service_impl(
     app: tauri::AppHandle,
-) -> Result<windsurf_api::ApiServiceStatus, String> {
+) -> Result<api_service::ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("读取应用数据目录失败: {error}"))?;
-    let status = windsurf_api::start(
+    let status = api_service::start(
         &data_dir,
         &settings.api_service_host,
         settings.api_service_port,
@@ -6348,7 +6451,7 @@ fn start_api_service_impl(
 
 #[tauri::command]
 fn list_api_service_models() -> Result<Vec<serde_json::Value>, String> {
-    windsurf_api::list_models()
+    api_service::list_models()
 }
 
 #[tauri::command]
@@ -6357,7 +6460,7 @@ fn set_api_service_default_model(app: tauri::AppHandle, model: String) -> Result
     settings.api_service_default_model = effective_api_service_model(&model);
     write_settings_record(&app, &settings)?;
     // 在跑就立刻热更，不在跑只持久化等下次启动。
-    let _ = windsurf_api::update_default_model(&settings.api_service_default_model);
+    let _ = api_service::update_default_model(&settings.api_service_default_model);
     // 顺手把 ~/.codex/config.toml 的 model 行原地改写，
     // 这样 codex 重启后 TUI 顶部 `model:` 跟 SuperAI UI 一致。
     // 用户没点过"配置Codex"时该函数返回 false，不会擅自创建文件。
@@ -6414,13 +6517,13 @@ fn sync_superai_accounts_to_api(app: tauri::AppHandle) -> Result<usize, String> 
         .filter_map(windsurf_account_to_sidecar_payload)
         .collect();
     let count = payloads.len();
-    windsurf_api::reconcile_accounts(payloads)?;
+    api_service::reconcile_accounts(payloads)?;
     Ok(count)
 }
 
 /// 后台线程触发同步，避免阻塞 Tauri 命令。
 fn schedule_windsurf_sync(app: tauri::AppHandle) {
-    if !windsurf_api::is_running_with_sidecar() {
+    if !api_service::is_running_with_sidecar() {
         return;
     }
     std::thread::spawn(move || {
@@ -6433,7 +6536,7 @@ fn schedule_windsurf_sync(app: tauri::AppHandle) {
 #[tauri::command]
 async fn stop_api_service(
     app: tauri::AppHandle,
-) -> Result<windsurf_api::ApiServiceStatus, String> {
+) -> Result<api_service::ApiServiceStatus, String> {
     tauri::async_runtime::spawn_blocking(move || stop_api_service_impl(app))
         .await
         .map_err(|error| format!("停止 API 服务任务失败: {error}"))?
@@ -6661,7 +6764,7 @@ fn neutralize_codex_auth_json(
 fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
-    let status = windsurf_api::current_status(
+    let status = api_service::current_status(
         &settings.api_service_host,
         settings.api_service_port,
         &settings.api_service_key,
@@ -6797,15 +6900,15 @@ fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, St
     })
 }
 
-fn stop_api_service_impl(app: tauri::AppHandle) -> Result<windsurf_api::ApiServiceStatus, String> {
-    windsurf_api::stop()?;
+fn stop_api_service_impl(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
+    api_service::stop()?;
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
     if settings.api_service_enabled {
         settings.api_service_enabled = false;
         write_settings_record(&app, &settings)?;
     }
-    Ok(windsurf_api::current_status(
+    Ok(api_service::current_status(
         &settings.api_service_host,
         settings.api_service_port,
         &settings.api_service_key,
@@ -6858,7 +6961,7 @@ pub fn run() {
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
-                let app_size = LogicalSize::new(1180.0, 720.0);
+                let app_size = LogicalSize::new(1040.0, 660.0);
                 window.set_resizable(false)?;
                 window.set_min_size(Some(app_size))?;
                 window.set_max_size(Some(app_size))?;
@@ -6913,7 +7016,7 @@ pub fn run() {
                 if settings.api_service_enabled {
                     match handle.path().app_data_dir() {
                         Ok(data_dir) => {
-                            match windsurf_api::start(
+                            match api_service::start(
                                 &data_dir,
                                 &settings.api_service_host,
                                 settings.api_service_port,
@@ -6956,7 +7059,7 @@ pub fn run() {
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
-                let _ = windsurf_api::stop();
+                let _ = api_service::stop();
             }
         });
 }

@@ -1,14 +1,12 @@
 import { normalizeUnixSeconds, nowUnixSeconds } from "./time";
 
-// 后端 IPC 出口已经把内部协议名 "windsurf" 改写成 "superai"，前端只需要
-// 跟 "superai" 比较即可。EXAFUNCTION_WSF_AUD 走 JWT aud 校验路径，需要的
-// 仍是上游协议字面量，所以单独从 charcode 构造，绕过 esbuild 常量折叠避免
-// dist 里出现 "windsurf" 字面量。
-const PROVIDER_WSF = "superai" as const;
-const __WSF_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
+// 后端 IPC 出口已经把内部协议名改写成 "superai"，前端只需要跟 "superai" 比较。
+// aud 校验路径仍需要上游协议字面量，所以单独从 charcode 构造，绕过 esbuild 常量折叠。
+const PROVIDER_SUPERAI = "superai" as const;
+const __SUPERAI_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
   .map((c) => String.fromCharCode(c))
   .join("");
-const EXAFUNCTION_WSF_AUD = "exafunction-" + __WSF_AUD_PROTOCOL;
+const EXAFUNCTION_SUPERAI_AUD = "exafunction-" + __SUPERAI_AUD_PROTOCOL;
 
 export type Provider = "codex" | "gemini" | "superai";
 
@@ -391,9 +389,9 @@ function parseCodex(value: unknown, source: ImportSource): ManagedAccount | null
   };
 }
 
-function looksLikeWindsurf(value: JsonObject): boolean {
+function looksLikeSuperAI(value: JsonObject): boolean {
   const explicit = stringField(value.provider)?.toLowerCase();
-  if (explicit === PROVIDER_WSF) return true;
+  if (explicit === PROVIDER_SUPERAI) return true;
   const tokens = isObject(value.tokens) ? value.tokens : undefined;
   const auth1Token =
     stringField(value.auth1_token) ??
@@ -438,7 +436,7 @@ function looksLikeWindsurf(value: JsonObject): boolean {
   if (jwt) {
     const aud = stringField(jwt.aud) ?? "";
     const iss = stringField(jwt.iss) ?? "";
-    if (aud.includes(EXAFUNCTION_WSF_AUD) || iss.includes(EXAFUNCTION_WSF_AUD)) return true;
+    if (aud.includes(EXAFUNCTION_SUPERAI_AUD) || iss.includes(EXAFUNCTION_SUPERAI_AUD)) return true;
     const firebase = isObject(jwt.firebase) ? jwt.firebase : undefined;
     const signInProvider = stringField(firebase?.sign_in_provider);
     if (signInProvider === "password" && refreshToken) return true;
@@ -446,9 +444,9 @@ function looksLikeWindsurf(value: JsonObject): boolean {
   return false;
 }
 
-function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | null {
+function parseSuperAI(value: unknown, source: ImportSource): ManagedAccount | null {
   if (!isObject(value)) return null;
-  if (!looksLikeWindsurf(value)) return null;
+  if (!looksLikeSuperAI(value)) return null;
 
   const tokens = isObject(value.tokens) ? value.tokens : undefined;
   const idToken =
@@ -494,13 +492,13 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
   if (!idToken && !refreshToken && !apiKey && !auth1Token && !sessionToken) return null;
 
   const jwt = parseJwtPayload(idToken);
-  const discriminatorToken = apiKey ?? sessionToken ?? auth1Token ?? accessToken ?? refreshToken ?? idToken ?? PROVIDER_WSF;
+  const discriminatorToken = apiKey ?? sessionToken ?? auth1Token ?? accessToken ?? refreshToken ?? idToken ?? PROVIDER_SUPERAI;
   const email =
     stringField(value.email) ??
     stringField(value.account) ??
     stringField(value.active) ??
     stringField(jwt?.email) ??
-    `${PROVIDER_WSF}-${stableHash(discriminatorToken).slice(0, 8)}@local`;
+    `${PROVIDER_SUPERAI}-${stableHash(discriminatorToken).slice(0, 8)}@local`;
 
   const localId =
     stringField(value.local_id) ??
@@ -535,8 +533,8 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
     stringField(value.planType);
 
   return {
-    id: stringField(value.id) ?? accountIdFor(PROVIDER_WSF, email, discriminator),
-    provider: PROVIDER_WSF,
+    id: stringField(value.id) ?? accountIdFor(PROVIDER_SUPERAI, email, discriminator),
+    provider: PROVIDER_SUPERAI,
     email: email.toLowerCase(),
     displayName,
     plan,
@@ -550,7 +548,7 @@ function parseWindsurf(value: unknown, source: ImportSource): ManagedAccount | n
     createdAt: numberField(value.created_at) ?? now,
     updatedAt: numberField(value.last_used) ?? numberField(value.updated_at) ?? now,
     authPayload: {
-      provider: PROVIDER_WSF,
+      provider: PROVIDER_SUPERAI,
       email: email.toLowerCase(),
       display_name: displayName,
       tokens: {
@@ -647,7 +645,7 @@ export function parseAuthJson(content: string, source: ImportSource, label = "JS
 
   items.forEach((item, index) => {
     const itemLabel = `${label}${items.length > 1 ? ` #${index + 1}` : ""}`;
-    const account = parseCodex(item, source) ?? parseWindsurf(item, source) ?? parseGemini(item, source);
+    const account = parseCodex(item, source) ?? parseSuperAI(item, source) ?? parseGemini(item, source);
     if (account) {
       imported.push(account);
     } else {

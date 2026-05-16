@@ -49,7 +49,7 @@ function resolveGeminiPlanBadge(account: ManagedAccount): PlanBadge {
   return { label: account.plan || account.planType || "未知", tone: "unknown" };
 }
 
-function resolveWindsurfPlanBadge(account: ManagedAccount): PlanBadge {
+function resolveSuperAIPlanBadge(account: ManagedAccount): PlanBadge {
   const official = (account.plan || account.planType || "").trim();
   const raw = normalizePlanKey(official);
   if (!raw) return { label: "SuperAI", tone: "unknown" };
@@ -64,7 +64,7 @@ function resolveWindsurfPlanBadge(account: ManagedAccount): PlanBadge {
 
 export function resolvePlanBadge(account: ManagedAccount): PlanBadge {
   if (account.provider === "gemini") return resolveGeminiPlanBadge(account);
-  if (account.provider === ([119,105,110,100,115,117,114,102].map((c)=>String.fromCharCode(c)).join(""))) return resolveWindsurfPlanBadge(account);
+  if (account.provider === "superai") return resolveSuperAIPlanBadge(account);
   return resolveCodexPlanBadge(account);
 }
 

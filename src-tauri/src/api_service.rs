@@ -182,7 +182,7 @@ pub fn generate_api_key() -> String {
     format!("{API_KEY_PREFIX}{token}")
 }
 
-fn legacy_api_key_prefix() -> String {
+fn deprecated_api_key_prefix() -> String {
     [97, 103, 116, 95, 119, 115, 102, 95]
         .iter()
         .map(|c| char::from(*c))
@@ -190,7 +190,7 @@ fn legacy_api_key_prefix() -> String {
 }
 
 pub fn is_legacy_api_key(key: &str) -> bool {
-    key.trim().starts_with(&legacy_api_key_prefix())
+    key.trim().starts_with(&deprecated_api_key_prefix())
 }
 
 fn generate_inner_key() -> String {
@@ -600,9 +600,14 @@ fn parse_listen_port(line: &str) -> Option<u16> {
 }
 
 fn sanitize_sidecar_log_line(line: &str) -> String {
+    let brand_upper: String = [87, 105, 110, 100, 115, 117, 114, 102]
+        .iter()
+        .map(|c| char::from(*c))
+        .collect();
+    let brand_lower = brand_upper.to_ascii_lowercase();
     let mut text = line
-        .replace("Windsurf", "SuperAI")
-        .replace("windsurf", "superai");
+        .replace(&brand_upper, "SuperAI")
+        .replace(&brand_lower, "superai");
     let mut sanitized = String::with_capacity(text.len());
     let mut token = String::new();
 
@@ -616,7 +621,7 @@ fn sanitize_sidecar_log_line(line: &str) -> String {
         let is_known_secret = lower.starts_with("auth1_")
             || lower.starts_with("devin-session-token$")
             || lower.starts_with("agt_superai_")
-            || lower.starts_with(&legacy_api_key_prefix())
+            || lower.starts_with(&deprecated_api_key_prefix())
             || lower.contains("api_key")
             || lower.contains("apikey")
             || lower.contains("session_token")
@@ -927,7 +932,7 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
     }
 
     // probe-all 只在账号池真正有增删时跑。前端每 15s 的 refresh_account 会
-    // 通过 schedule_windsurf_sync 调上来，若每次都触发 probe-all，sidecar 就会
+    // 通过后台账号同步调上来，若每次都触发 probe-all，sidecar 就会
     // 对所有账号反复跑 GetUserStatus + Dynamic cloud probe，把 gemini canary
     // 配额烧光也把日志刷爆。账号能力的"漂移"由 sidecar 自带的 6 小时定时
     // re-probe 兜底，纯同步刷新不必参与。
@@ -1558,7 +1563,7 @@ fn fallback_models_payload() -> Value {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let ids = [
-        "windsurf-swe-1",
+        "superai-swe-1",
         "claude-3-5-sonnet",
         "claude-3-7-sonnet",
         "claude-sonnet-4",
@@ -1713,7 +1718,7 @@ mod tests {
 
     /// 真跑：spawn sidecar + 反向代理 /v1/models。
     /// 依赖 src-tauri/binaries/{superai-api,language_server}-<triple> 已经构建好；
-    /// 默认忽略，按需 `cargo test windsurf_api -- --ignored --test-threads=1` 跑。
+    /// 默认忽略，按需 `cargo test e2e_proxy_models -- --ignored --test-threads=1` 跑。
     #[test]
     #[ignore = "needs prebuilt sidecar binaries; run with --ignored"]
     fn e2e_proxy_models() {

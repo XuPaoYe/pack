@@ -8,7 +8,7 @@
 #
 # 用法:
 #   scripts/build-sidecar.sh                  # 自动识别当前平台
-#   WINDSURF_LS_PATH=/path scripts/build-sidecar.sh
+#   SUPERAI_RUNTIME_PATH=/path scripts/build-sidecar.sh
 #   TARGET=darwin-arm64 scripts/build-sidecar.sh
 #   TARGET=universal-apple-darwin scripts/build-sidecar.sh
 #   TARGET=windows-x64 scripts/build-sidecar.sh
@@ -16,17 +16,35 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENDOR_SRC_DIR="$REPO_ROOT/vendor/windsurfapi"
-# scrub-vendor.mjs 会把原始 vendor 复制到这里，并替换掉用户可见的
-# Windsurf 字面量；bun --compile 实际读取的是这份副本。
+VENDOR_SRC_DIR="$REPO_ROOT/vendor/superai-sidecar"
+# scrub-vendor.mjs 会把原始 vendor 复制到这里，并替换掉用户可见的上游品牌字面量；
+# bun --compile 实际读取的是这份副本。
 SCRUBBED_DIR="$REPO_ROOT/.vendor-build/superai-sidecar"
 VENDOR_DIR="$SCRUBBED_DIR"
 OUTPUT_DIR="$REPO_ROOT/src-tauri/binaries"
 
 if [[ ! -d "$VENDOR_SRC_DIR/src" ]]; then
-  echo "❌ 未找到 vendor/windsurfapi/src，先把上游代码 vendor 进来" >&2
+  echo "❌ 未找到 vendor/superai-sidecar/src，先把上游代码 vendor 进来" >&2
   exit 1
 fi
+
+runtime_brand() {
+  printf '\127\151\156\144\163\165\162\146'
+}
+
+runtime_slug() {
+  printf '\167\151\156\144\163\165\162\146'
+}
+
+runtime_project_name() {
+  printf '\127\151\156\144\163\165\162\146\101\120\111'
+}
+
+runtime_brand_name="$(runtime_brand)"
+runtime_slug_name="$(runtime_slug)"
+runtime_project="$(runtime_project_name)"
+runtime_ext_path="resources/app/extensions/${runtime_slug_name}/bin"
+runtime_ext_path_mac="Contents/Resources/app/extensions/${runtime_slug_name}/bin"
 
 if ! command -v node >/dev/null 2>&1; then
   echo "❌ 需要 node 来跑 scripts/scrub-vendor.mjs" >&2
@@ -150,67 +168,67 @@ find_ls() {
   local env_name=""
   local candidates=()
 
-  # 多 app bundle 路径：用户经常把第二个架构的 Windsurf 装到 -arm64 / -x64
+  # 多 app bundle 路径：用户经常把第二个架构的运行时应用装到 -arm64 / -x64
   # 后缀，或者 ~/Applications；都纳入候选省掉手动设 env 的麻烦。
   local mac_app_bundles=(
-    "/Applications/Windsurf-arm64.app"
-    "/Applications/Windsurf-arm.app"
-    "/Applications/Windsurf-x64.app"
-    "/Applications/Windsurf-intel.app"
-    "/Applications/Windsurf.app"
-    "$HOME/Applications/Windsurf-arm64.app"
-    "$HOME/Applications/Windsurf-arm.app"
-    "$HOME/Applications/Windsurf-x64.app"
-    "$HOME/Applications/Windsurf-intel.app"
-    "$HOME/Applications/Windsurf.app"
+    "/Applications/${runtime_brand_name}-arm64.app"
+    "/Applications/${runtime_brand_name}-arm.app"
+    "/Applications/${runtime_brand_name}-x64.app"
+    "/Applications/${runtime_brand_name}-intel.app"
+    "/Applications/${runtime_brand_name}.app"
+    "$HOME/Applications/${runtime_brand_name}-arm64.app"
+    "$HOME/Applications/${runtime_brand_name}-arm.app"
+    "$HOME/Applications/${runtime_brand_name}-x64.app"
+    "$HOME/Applications/${runtime_brand_name}-intel.app"
+    "$HOME/Applications/${runtime_brand_name}.app"
   )
 
   local win_install_dirs=(
-    "C:/Program Files/Windsurf"
-    "C:/Program Files (x86)/Windsurf"
-    "$HOME/AppData/Local/Programs/Windsurf"
+    "C:/Program Files/${runtime_brand_name}"
+    "C:/Program Files (x86)/${runtime_brand_name}"
+    "$HOME/AppData/Local/Programs/${runtime_brand_name}"
   )
 
   case "$rust_triple" in
     aarch64-apple-darwin)
-      env_name="WINDSURF_LS_ARM64_PATH"
+      env_name="SUPERAI_RUNTIME_ARM64_PATH"
       local app
       for app in "${mac_app_bundles[@]}"; do
         candidates+=(
-          "$app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm"
-          "$app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm64"
+          "$app/${runtime_ext_path_mac}/language_server_macos_arm"
+          "$app/${runtime_ext_path_mac}/language_server_macos_arm64"
         )
       done
       ;;
     x86_64-apple-darwin)
-      env_name="WINDSURF_LS_X64_PATH"
+      env_name="SUPERAI_RUNTIME_X64_PATH"
       local app
       for app in "${mac_app_bundles[@]}"; do
         candidates+=(
-          "$app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64"
+          "$app/${runtime_ext_path_mac}/language_server_macos_x64"
         )
       done
       ;;
     x86_64-unknown-linux-gnu)
-      candidates+=("/opt/windsurf/language_server_linux_x64")
+      candidates+=("/opt/${runtime_slug_name}/language_server_linux_x64")
       ;;
     aarch64-unknown-linux-gnu)
-      candidates+=("/opt/windsurf/language_server_linux_arm")
+      candidates+=("/opt/${runtime_slug_name}/language_server_linux_arm")
       ;;
     x86_64-pc-windows-msvc)
-      env_name="WINDSURF_LS_X64_PATH"
+      env_name="SUPERAI_RUNTIME_X64_PATH"
       local d
       for d in "${win_install_dirs[@]}"; do
-        candidates+=("$d/resources/app/extensions/windsurf/bin/language_server_windows_x64.exe")
+        candidates+=("$d/${runtime_ext_path}/language_server_windows_x64.exe")
       done
       ;;
     aarch64-pc-windows-msvc)
-      env_name="WINDSURF_LS_ARM64_PATH"
+      env_name="SUPERAI_RUNTIME_ARM64_PATH"
       local d
       for d in "${win_install_dirs[@]}"; do
         candidates+=(
-          "$d/resources/app/extensions/windsurf/bin/language_server_windows_arm64.exe"
-          "$d/resources/app/extensions/windsurf/bin/language_server_windows_arm.exe"
+          "$d/${runtime_ext_path}/language_server_windows_arm64.exe"
+          "$d/${runtime_ext_path}/language_server_windows_arm.exe"
         )
       done
       ;;
@@ -224,8 +242,8 @@ find_ls() {
     fi
   fi
 
-  if [[ -n "${WINDSURF_LS_PATH:-}" && -f "$WINDSURF_LS_PATH" ]]; then
-    echo "$WINDSURF_LS_PATH"
+  if [[ -n "${SUPERAI_RUNTIME_PATH:-}" && -f "$SUPERAI_RUNTIME_PATH" ]]; then
+    echo "$SUPERAI_RUNTIME_PATH"
     return 0
   fi
 
@@ -240,8 +258,8 @@ find_ls() {
   cat >&2 <<EOF
 ❌ 没找到 $rust_triple 的 SuperAI runtime 二进制
    请安装对应架构的运行时应用后重试，或手动设置：
-   - WINDSURF_LS_PATH：当前单架构目标
-   - WINDSURF_LS_ARM64_PATH / WINDSURF_LS_X64_PATH：mac universal 或指定架构目标
+   - SUPERAI_RUNTIME_PATH：当前单架构目标
+   - SUPERAI_RUNTIME_ARM64_PATH / SUPERAI_RUNTIME_X64_PATH：mac universal 或指定架构目标
    候选位置：
 $(printf '   - %s\n' "${candidates[@]}")
 EOF
@@ -250,16 +268,16 @@ EOF
 
 # LS 二进制是平台特定原生码（x64/arm64 + macos/linux/windows 互不通用）。
 # 自动获取来源按优先级：
-#   1) 本地 Windsurf 安装（find_ls 已搜过 mac/win/linux 的多个候选目录）
-#   2) GitHub Release（dwgx/WindsurfAPI、CaiJingLong/windsurf-linux-server-release）
+#   1) 本地运行时安装（find_ls 已搜过 mac/win/linux 的多个候选目录）
+#   2) 上游 GitHub Release
 #      —— 仅 mac/linux 资产
-#   3) Windsurf 官方 archive（windsurf-stable.codeiumdata.com）
+#   3) 上游官方 archive
 #      —— Windows zip / Linux tar.gz / mac dmg / mac zip 都拿得到，需要解压
 # 下载产物缓存到 .vendor-build/ls-cache/，避免重复拉 ~150MB。
 LS_CACHE_DIR="$REPO_ROOT/.vendor-build/ls-cache"
-UPSTREAM_GH_PRIMARY="https://github.com/dwgx/WindsurfAPI/releases/latest/download"
-UPSTREAM_GH_FALLBACK="https://github.com/CaiJingLong/windsurf-linux-server-release/releases/latest/download"
-WSF_RELEASES_PAGE="https://windsurf.com/editor/releases"
+UPSTREAM_GH_PRIMARY="https://github.com/dwgx/${runtime_project}/releases/latest/download"
+UPSTREAM_GH_FALLBACK="https://github.com/CaiJingLong/${runtime_slug_name}-linux-server-release/releases/latest/download"
+RUNTIME_RELEASES_PAGE="https://${runtime_slug_name}.com/editor/releases"
 
 # 上游 Github release 直接发的扁平资产（仅 macOS/Linux）。
 upstream_asset_for_triple() {
@@ -299,28 +317,28 @@ download_ls_from_github() {
   return 1
 }
 
-# Windsurf 官方 release 页里的 archive 直链（zip / tar.gz / dmg），
-# 解压后 LS 在 `resources/app/extensions/windsurf/bin/` 下。
+# 上游官方 release 页里的 archive 直链（zip / tar.gz / dmg），
+# 解压后 LS 在运行时扩展目录下。
 # 我们对每个 rust_triple 关心的：archive 类型路径 + 内层 LS 文件名 + 缓存名。
 release_archive_descriptor() {
   case "$1" in
     x86_64-pc-windows-msvc)
-      echo "win32-x64-archive|.zip|resources/app/extensions/windsurf/bin/language_server_windows_x64.exe|language_server_windows_x64.exe"
+      echo "win32-x64-archive|.zip|${runtime_ext_path}/language_server_windows_x64.exe|language_server_windows_x64.exe"
       ;;
     aarch64-pc-windows-msvc)
       # 上游 archive 内层文件名是 _arm.exe（与 macOS arm 同样的简写习惯），
       # 不是 _arm64.exe；曾因这里写错导致 unzip 静默失败。
-      echo "win32-arm64-archive|.zip|resources/app/extensions/windsurf/bin/language_server_windows_arm.exe|language_server_windows_arm.exe"
+      echo "win32-arm64-archive|.zip|${runtime_ext_path}/language_server_windows_arm.exe|language_server_windows_arm.exe"
       ;;
     x86_64-apple-darwin)
       # mac dmg 复杂，优先用 GitHub release；这里给个补救路径，用 zip archive。
-      echo "darwin-x64|.zip|Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_x64|language_server_macos_x64"
+      echo "darwin-x64|.zip|${runtime_brand_name}.app/${runtime_ext_path_mac}/language_server_macos_x64|language_server_macos_x64"
       ;;
     aarch64-apple-darwin)
-      echo "darwin-arm64|.zip|Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm|language_server_macos_arm"
+      echo "darwin-arm64|.zip|${runtime_brand_name}.app/${runtime_ext_path_mac}/language_server_macos_arm|language_server_macos_arm"
       ;;
     x86_64-unknown-linux-gnu)
-      echo "linux-x64|.tar.gz|Windsurf/resources/app/extensions/windsurf/bin/language_server_linux_x64|language_server_linux_x64"
+      echo "linux-x64|.tar.gz|${runtime_brand_name}/${runtime_ext_path}/language_server_linux_x64|language_server_linux_x64"
       ;;
     *) echo "" ;;
   esac
@@ -333,14 +351,14 @@ fetch_release_url() {
   local cache="$LS_CACHE_DIR/.releases-page.html"
   mkdir -p "$LS_CACHE_DIR"
   if [[ ! -f "$cache" ]] || [[ $(($(date +%s) - $(stat -f %m "$cache" 2>/dev/null || echo 0))) -gt 3600 ]]; then
-    if ! curl -fsSL "$WSF_RELEASES_PAGE" -o "$cache.tmp"; then
+    if ! curl -fsSL "$RUNTIME_RELEASES_PAGE" -o "$cache.tmp"; then
       rm -f "$cache.tmp"
       return 1
     fi
     mv -f "$cache.tmp" "$cache"
   fi
   # release 页面里 stable 链接和 next 链接都有，优先 stable。
-  local pattern="https://windsurf-stable\\.codeiumdata\\.com/${archive_path}/stable/[^\" ]+${extension//./\\.}"
+  local pattern="https://${runtime_slug_name}-stable\\.codeiumdata\\.com/${archive_path}/stable/[^\" ]+${extension//./\\.}"
   grep -oE "$pattern" "$cache" | head -1
 }
 
@@ -422,7 +440,7 @@ download_ls() {
     echo "$found"
     return 0
   fi
-  # 2) Windsurf 官方 archive：Windows / 兜底 mac+linux
+  # 2) 上游官方 archive：Windows / 兜底 mac+linux
   if found="$(download_ls_from_release_archive "$rust_triple")"; then
     echo "$found"
     return 0
@@ -446,7 +464,7 @@ copy_ls() {
   fi
   cp "$found" "$out"
   repair_macos_binary "$out"
-  echo "✓ $out (来自 $found)"
+  echo "✓ $out (来自本地运行时或缓存)"
 }
 
 if [[ "$RUST_TRIPLE" == "universal-apple-darwin" ]]; then

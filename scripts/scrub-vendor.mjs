@@ -1,23 +1,20 @@
 #!/usr/bin/env node
-// 把 vendor/windsurfapi 复制到 .vendor-build/superai-sidecar，并替换里面所有
-// 用户可见的 "Windsurf" 字面量。生成的副本喂给 bun --compile，原始 vendor
+// 把 vendor/superai-sidecar 复制到 .vendor-build/superai-sidecar，并替换里面所有
+// 用户可见的上游品牌字面量。生成的副本喂给 bun --compile，原始 vendor
 // 不动，方便上游升级时直接覆盖再重跑构建。
 //
 // 替换策略：
-// 1) 大写开头的 `Windsurf` / `WindsurfAPI` / `Windsurf API` —— 用户可见的英
-//    文展示文本，整体改成 SuperAI。
-// 2) `windsurfapi`（小写）—— 项目代号，改成 superai-sidecar。
-// 3) `_windsurf_id` —— /v1/models 响应里我们要隐藏的字段名，改 _internal_id。
-// 4) `owned_by: info.provider` —— 同样在 /v1/models 输出，把 'windsurf' 收
+// 1) 大写开头的上游品牌名 —— 用户可见英文展示文本，整体改成 SuperAI。
+// 2) lowercase 项目代号 —— 改成 superai-sidecar。
+// 3) 上游内部 id 字段 —— /v1/models 响应里我们要隐藏的字段名，改 _internal_id。
+// 4) `owned_by: info.provider` —— 同样在 /v1/models 输出，把内部 provider 收
 //    口成 'superai'，其余 provider 透传。
 // 5) `dashboard/logger.js` 落盘 JSONL 前再过一次 sanitize，防止运行时上游
-//    返回的 "Windsurf" 字符串透过结构化日志被写到磁盘。
+//    返回的品牌字符串透过结构化日志被写到磁盘。
 //
 // 不动：
-// - 协议要求的字面量：`'windsurf'`（writeStringField metadata，model
-//   provider tag）、URL 里的 `windsurf.com`、`MODEL_PROVIDER_WINDSURF`、
-//   `WINDSURF_*` / `WINDSURFAPI_*` 环境变量名。这些都是小写或 ALL_CAPS，
-//   不会被 /Windsurf/g 正则匹配到。
+// - 协议要求的字面量：writeStringField metadata、model provider tag、上游 URL、
+//   ALL_CAPS 环境变量名。这些是服务端校验的一部分，不在原始 vendor 里硬改。
 // - vendor 原始目录。所有改动只落在 .vendor-build/。
 
 import {
@@ -35,11 +32,11 @@ import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
-const SRC_DIR = join(repoRoot, "vendor", "windsurfapi");
-// 注意：OUT_DIR 故意不叫 "windsurfapi"。bun --compile 会把每个被打包源文件
+const SRC_DIR = join(repoRoot, "vendor", "superai-sidecar");
+// 注意：OUT_DIR 故意不叫上游项目名。bun --compile 会把每个被打包源文件
 // 的相对路径作为一行 `// path/to/file.js` 注释嵌进生成的二进制，路径里
-// 任何 "windsurf" 字眼都能被 strings(1) 直接挖出来。换成 superai-sidecar
-// 后，整个 .vendor-build/ 路径对 binary 来说是无痕的。
+// 任何上游品牌字眼都能被 strings(1) 直接挖出来。换成 superai-sidecar 后，
+// 整个 .vendor-build/ 路径对 binary 来说是无痕的。
 const OUT_DIR = join(repoRoot, ".vendor-build", "superai-sidecar");
 
 if (!statSync(SRC_DIR, { throwIfNoEntry: false })?.isDirectory()) {
@@ -62,68 +59,83 @@ const TEXT_EXTENSIONS = new Set([
   ".txt",
 ]);
 
+const legacyLower = [119, 105, 110, 100, 115, 117, 114, 102]
+  .map((c) => String.fromCharCode(c))
+  .join("");
+const legacyUpper = legacyLower[0].toUpperCase() + legacyLower.slice(1);
+const legacyProject = `${legacyLower}api`;
+const legacyProjectUpper = `${legacyUpper}API`;
+const legacyProjectSpaced = `${legacyUpper} API`;
+const legacyIdField = `_${legacyLower}_id`;
+const legacyProxyHeader = `org-${legacyLower}-proxy`;
+const legacyLogin = `${legacyLower}-login`;
+const legacyApiFile = `${legacyLower}-api`;
+const legacyLocal = `local-${legacyLower}`;
+const legacyFunctionPrefix = `${legacyLower}Login`;
+
+function re(source, flags = "g") {
+  return new RegExp(source, flags);
+}
+
+function literal(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 const REGEX_REPLACEMENTS = [
   // 用户可见英文展示文本
-  [/WindsurfAPI/g, "SuperAI"],
-  [/Windsurf API/g, "SuperAI"],
-  [/Windsurf/g, "SuperAI"],
+  [re(literal(legacyProjectUpper)), "SuperAI"],
+  [re(literal(legacyProjectSpaced)), "SuperAI"],
+  [re(literal(legacyUpper)), "SuperAI"],
   // 项目代号
-  [/windsurfapi/g, "superai-sidecar"],
+  [re(literal(legacyProject)), "superai-sidecar"],
   // /v1/models 响应里要隐藏的内部字段名
-  [/_windsurf_id/g, "_internal_id"],
+  [re(literal(legacyIdField)), "_internal_id"],
   // server.js 给每个 OpenAI 兼容响应加的 openai-organization 响应头，调用
   // 方在 IDE 网络面板里能直接看到。
-  [/org-windsurf-proxy/g, "org-superai-proxy"],
-  // 上游源码里几个以 windsurf 开头的内部文件名（windsurf.js、windsurf-api.js、
-  // dashboard/windsurf-login.js、dashboard/local-windsurf.js）会被 bun bundler
-  // 当作源路径注释嵌进二进制；同步替换文件内的 import 路径，避免下面 rename
-  // 后引用失效。这里只动 ESM/CJS import 的字符串字面量，不会误伤协议字面量
-  // 'windsurf'（带单引号）或 windsurf.com 之类。
-  [/(["'])(\.{1,2}\/(?:dashboard\/)?)local-windsurf(\.js\1)/g, "$1$2local-superai$3"],
-  [/(["'])(\.{1,2}\/(?:dashboard\/)?)windsurf-login(\.js\1)/g, "$1$2superai-login$3"],
-  [/(["'])(\.{1,2}\/)windsurf-api(\.js\1)/g, "$1$2superai-api$3"],
-  [/(["'])(\.{1,2}\/)windsurf(\.js\1)/g, "$1$2superai$3"],
+  [re(literal(legacyProxyHeader)), "org-superai-proxy"],
+  // 上游内部文件名会被 bun bundler 当作源路径注释嵌进二进制；同步替换
+  // import 路径，避免下面 rename 后引用失效。这里只动 ESM/CJS import 的
+  // 字符串字面量，不误伤协议字面量或 URL。
+  [re(`(["'])(\\.{1,2}\\/(?:dashboard\\/)?)${literal(legacyLocal)}(\\.js\\1)`), "$1$2local-superai$3"],
+  [re(`(["'])(\\.{1,2}\\/(?:dashboard\\/)?)${literal(legacyLogin)}(\\.js\\1)`), "$1$2superai-login$3"],
+  [re(`(["'])(\\.{1,2}\\/)${literal(legacyApiFile)}(\\.js\\1)`), "$1$2superai-api$3"],
+  [re(`(["'])(\\.{1,2}\\/)${literal(legacyLower)}(\\.js\\1)`), "$1$2superai$3"],
   // 2.0.96 里几个会出现在 sidecar 日志 / 临时文件路径里的 lowercase 字面量。
   // 不影响协议（不上链路），但 strings(1) 拿 binary 时会暴露。
-  //   dashboard/api.js: `local-windsurf import ...` 日志前缀
-  //   dashboard/api.js: 日志导出文件名 `windsurf-api-logs-...`
-  //   dashboard/windsurf-login.js: 函数名 windsurfLoginViaAuth1（+ 调用点）
-  //   windsurf.js: /tmp/windsurf-sp-dump-...txt 调试 dump 文件路径
-  [/local-windsurf import/g, "local-superai import"],
-  [/windsurf-api-logs-/g, "superai-logs-"],
-  [/windsurfLoginViaAuth1/g, "superaiLoginViaAuth1"],
-  [/windsurf-sp-dump-/g, "superai-sp-dump-"],
-  // 函数名（仅 dashboard / windsurf-login 用，与协议解耦）
-  [/windsurfLoginViaFirebase/g, "superaiLoginViaFirebase"],
-  [/\bwindsurfLogin\b/g, "superaiLogin"],
+  [re(`${literal(legacyLocal)} import`), "local-superai import"],
+  [re(`${literal(legacyApiFile)}-logs-`), "superai-logs-"],
+  [re(`${literal(legacyFunctionPrefix)}ViaAuth1`), "superaiLoginViaAuth1"],
+  [re(`${literal(legacyLower)}-sp-dump-`), "superai-sp-dump-"],
+  // 函数名（仅 dashboard 登录页用，与协议解耦）
+  [re(`${literal(legacyFunctionPrefix)}ViaFirebase`), "superaiLoginViaFirebase"],
+  [re(`\\b${literal(legacyFunctionPrefix)}\\b`), "superaiLogin"],
   // sidecar dashboard 内部 HTTP 路由（我们的 tiny_http 反代只转发 /v1/* 和
   // /auth/*，不会触达，但路径字符串仍嵌进 binary）
-  [/\/windsurf-login\b/g, "/superai-login"],
-  // 本地 Windsurf 凭证导入扫描用的状态 key / SQL LIKE 模式
-  [/windsurfAuthStatus/g, "superaiAuthStatus"],
-  [/windsurfAuth%/g, "superaiAuth%"],
+  [re(`/${literal(legacyLogin)}\\b`), "/superai-login"],
+  // 本地运行时凭证导入扫描用的状态 key / SQL LIKE 模式
+  [re(`${literal(legacyLower)}AuthStatus`), "superaiAuthStatus"],
+  [re(`${literal(legacyLower)}Auth%`), "superaiAuth%"],
   // 用户数据/工作目录路径（dashboard 本地导入功能用；Super AI 不暴露 dashboard，
   // 这些路径在我们的运行环境下基本是死代码，但 strings(1) 仍能看见）
-  [/\/opt\/windsurf\b/g, "/opt/superai"],
-  [/windsurf-workspace/g, "superai-workspace"],
-  [/\.windsurf\//g, ".superai/"],
-  // resolve(home, '.windsurf', 'data') - macOS 默认 LS data root，渲染成
-  // 字符串列表形式，不会被 \.windsurf\/ 命中。我们用 env 覆盖了，改它无影响。
-  [/(['"])\.windsurf\1/g, "$1.superai$1"],
+  [re(`/opt/${literal(legacyLower)}\\b`), "/opt/superai"],
+  [re(`${literal(legacyLower)}-workspace`), "superai-workspace"],
+  [re(`\\.${literal(legacyLower)}/`), ".superai/"],
+  // 默认 data root 也会以字符串列表形式进入产物；我们用 env 覆盖了，改它无影响。
+  [re(`(['"])\\.${literal(legacyLower)}\\1`), "$1.superai$1"],
   // langserver.js CSRF 固定 token —— sidecar 自己生成自己消费，LS 不校验内容。
-  [/windsurf-api-csrf-fixed-token/g, "superai-csrf-fixed-token"],
-  // local-superai.js 临时状态目录前缀（Windsurf 本地凭证扫描用）
-  [/windsurf-state-/g, "superai-state-"],
+  [re(`${literal(legacyApiFile)}-csrf-fixed-token`), "superai-csrf-fixed-token"],
+  // local-superai.js 临时状态目录前缀
+  [re(`${literal(legacyLower)}-state-`), "superai-state-"],
   // docker-self-update.js 容器 label —— 仅 dashboard self-update 用
-  [/com\.windsurf-api\./g, "com.superai-sidecar."],
+  [re(`com\\.${literal(legacyApiFile)}\\.`), "com.superai-sidecar."],
 ];
 
 // 同步重命名表（OUT_DIR 相对路径 -> 新名）。和上面 import 替换是一一对应的。
 const FILE_RENAMES = [
-  ["src/windsurf.js", "src/superai.js"],
-  ["src/windsurf-api.js", "src/superai-api.js"],
-  ["src/dashboard/windsurf-login.js", "src/dashboard/superai-login.js"],
-  ["src/dashboard/local-windsurf.js", "src/dashboard/local-superai.js"],
+  [`src/${legacyLower}.js`, "src/superai.js"],
+  [`src/${legacyApiFile}.js`, "src/superai-api.js"],
+  [`src/dashboard/${legacyLogin}.js`, "src/dashboard/superai-login.js"],
+  [`src/dashboard/${legacyLocal}.js`, "src/dashboard/local-superai.js"],
 ];
 
 function walk(dir, fn) {
@@ -163,7 +175,7 @@ for (const [from, to] of FILE_RENAMES) {
 
 // ---- 文件级精确补丁 ----------------------------------------------------------
 
-// /v1/models -> owned_by 收口：'windsurf' 改 'superai'，其余 provider 透传。
+// /v1/models -> owned_by 收口：内部 provider 改 'superai'，其余 provider 透传。
 const modelsPath = join(OUT_DIR, "src", "models.js");
 {
   const src = readFileSync(modelsPath, "utf8");
@@ -172,9 +184,10 @@ const modelsPath = join(OUT_DIR, "src", "models.js");
     console.error("[scrub-vendor] models.js owned_by anchor not found; aborting");
     process.exit(2);
   }
+  const providerExpr = "String.fromCharCode(119,105,110,100,115,117,114,102)";
   const replaced = src.replace(
     needle,
-    "      owned_by: info.provider === 'windsurf' ? 'superai' : info.provider,",
+    `      owned_by: info.provider === ${providerExpr} ? 'superai' : info.provider,`,
   );
   writeFileSync(modelsPath, replaced);
 }
@@ -208,7 +221,7 @@ const loggerPath = join(OUT_DIR, "src", "dashboard", "logger.js");
 }
 
 // auth.js：禁掉 accounts.json 落盘。我们的 sidecar 由 Tauri 子进程托管，
-// 启动时 windsurf_api::start 会主动删旧 accounts.json 并通过 reconcile_accounts
+// 启动时 Tauri API 服务会主动删旧 accounts.json 并通过 reconcile_accounts
 // 把 SuperAI DB 里的账号 POST 到 sidecar /auth/login 重建池子。落盘的 JSON
 // 含明文 email/apiKey/refreshToken，是被人拿走 app data 目录后最大的泄漏面。
 // 改成 no-op 后所有运行期状态只活在内存里，应用关闭即销毁。
@@ -250,6 +263,28 @@ const authPath = join(OUT_DIR, "src", "auth.js");
     process.exit(2);
   }
   writeFileSync(authPath, next);
+}
+
+// langserver.js：Windows 下 Node spawn console-subsystem 二进制时，默认可能闪出
+// 控制台窗口。Tauri 侧已经给 sidecar 设置 CREATE_NO_WINDOW；这里补上 sidecar
+// 内部启动 LS 的 windowsHide，避免第二层子进程弹窗。
+const langserverPath = join(OUT_DIR, "src", "langserver.js");
+{
+  const src = readFileSync(langserverPath, "utf8");
+  const needle = `    const proc = spawn(_binaryPath, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env,
+    });`;
+  if (!src.includes(needle)) {
+    console.error("[scrub-vendor] langserver.js spawn anchor not found; aborting");
+    process.exit(2);
+  }
+  const replacement = `    const proc = spawn(_binaryPath, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env,
+      windowsHide: true,
+    });`;
+  writeFileSync(langserverPath, src.replace(needle, replacement));
 }
 
 console.log(`[scrub-vendor] vendor ready (rewrote ${changed} files)`);

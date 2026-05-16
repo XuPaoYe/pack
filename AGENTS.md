@@ -16,8 +16,8 @@ The app should feel like a polished native desktop utility, not a web dashboard.
 - React + TypeScript + Vite frontend
 - `lucide-react` icons
 - Plain CSS with system fonts and native-feeling layout
-- Tauri 2 + Rust desktop shell（业务命令在 `src-tauri/src/lib.rs`，sidecar 反代在 `src-tauri/src/windsurf_api.rs`）
-- Bun-compiled sidecar from vendored `WindsurfPoolAPI`，详见后面 "Windsurf 本地 API 服务" 一节
+- Tauri 2 + Rust desktop shell（业务命令在 `src-tauri/src/lib.rs`，sidecar 反代在 `src-tauri/src/api_service.rs`）
+- Bun-compiled sidecar from vendored upstream runtime code，详见后面 "SuperAI 本地 API 服务" 一节
 
 Current frontend entry points:
 
@@ -37,7 +37,7 @@ This repo was started after reviewing two reference projects in the parent direc
   - Zig CLI for Codex auth switching
   - Strong reference for Codex `auth.json` parsing, account identity, registry logic
 
-Do not copy huge unrelated parts from either project. Extract ideas and narrow implementation to Codex + Gemini + Windsurf。
+Do not copy huge unrelated parts from either project. Extract ideas and narrow implementation to Codex + Gemini + SuperAI。
 
 ## Product Scope
 
@@ -45,14 +45,14 @@ Do not copy huge unrelated parts from either project. Extract ideas and narrow i
 
 - **codex**：本地 `~/.codex/auth.json`、JSON 粘贴、OAuth
 - **gemini**：本地 `~/.gemini/oauth_creds.json` / `google_accounts.json` / `settings.json`、JSON 粘贴、OAuth
-- **windsurf**（公开版核心）：批量密钥导入；完全版还支持邮箱密码 / token / OAuth 等导入路径
+- **superai**（公开版核心；内部兼容历史 provider 值）：批量密钥导入；完全版还支持邮箱密码 / token / OAuth 等导入路径
 
 核心账号操作（已实现）：
 
 - 列表 / 搜索 / 过滤
 - 导入 / 更新 / 导出（公开版只导出 batch_key，完全版导出原始凭证）
-- 切换：写回 codex/gemini 本地配置；windsurf 通过 sidecar 池调度
-- 刷新 token / 配额，含 windsurf 公开版本地累计用量（详见后节）
+- 切换：写回 codex/gemini 本地配置；SuperAI 通过 sidecar 池调度
+- 刷新 token / 配额，含 SuperAI 公开版本地累计用量（详见后节）
 
 Avoid expanding into more providers. This app is intentionally not a full clone of Cockpit Tools.
 
@@ -113,7 +113,7 @@ When adding screens, prefer:
 - If packaging is triggered from a branch instead of a tag, mention the source branch/ref in the final status and confirm the commit SHA that was built.
 - When fixing release workflow failures, keep changes scoped to CI/build scripts and do not remove target platforms as a workaround unless the user approves it.
 
-## Windsurf 本地 API 服务
+## SuperAI 本地 API 服务
 
 Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authorization: Bearer agt_superai_*` 调用本机推理。架构：
 
@@ -121,26 +121,26 @@ Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authoriz
 [外部 IDE]
     | Bearer agt_superai_*
     v
-[tiny_http 反向代理 @ src-tauri/src/windsurf_api.rs]
+[tiny_http 反向代理 @ src-tauri/src/api_service.rs]
     | Bearer <inner_key>
     v
-[superai-api sidecar (bun --compile vendor/windsurfapi)]
+[superai-api sidecar (bun --compile vendor/superai-sidecar)]
     | spawns
     v
-[language_server 二进制 (Windsurf 闭源 LS)]
+[language_server 二进制 (上游闭源 LS)]
 ```
 
-- `vendor/windsurfapi/` 镜像了上游 [WindsurfPoolAPI](https://github.com/guanxiaol/WindsurfPoolAPI)（MIT），版本写在 `VERSION.txt`。不要直接改 vendor 里的 JS，要升级请 bump version 后重新拷贝。
-- `scripts/scrub-vendor.mjs` 把 vendor 复制到 `.vendor-build/windsurfapi/` 并替换掉用户可见的 `Windsurf` / `WindsurfAPI` / `windsurfapi` / `_windsurf_id` / `org-windsurf-proxy` 字面量，同时给 `models.js` 的 `owned_by`、`dashboard/logger.js` 的落盘 JSONL 打补丁。协议字面量（`'windsurf'` 在 protobuf metadata、URL 里的 `windsurf.com`、`MODEL_PROVIDER_WINDSURF`、`WINDSURF_*`/`WINDSURFAPI_*` 环境变量、`User-Agent`）保留不动。
-- `scripts/build-sidecar.sh` 先跑 scrub-vendor，再用 `bun build --compile` 编 `.vendor-build/windsurfapi/src/index.js` 为当前平台的 sidecar，并从 `/Applications/Windsurf.app/...`（或 `WINDSURF_LS_PATH`）抽 LS 二进制，统一放到 `src-tauri/binaries/<name>-<rust-target-triple>(.exe)`。
+- `vendor/superai-sidecar/` 镜像了上游 MIT sidecar 代码，版本写在 `VERSION.txt`。不要直接改 vendor 里的 JS，要升级请 bump version 后重新拷贝。
+- `scripts/scrub-vendor.mjs` 把 vendor 复制到 `.vendor-build/superai-sidecar/` 并替换掉用户可见的旧上游品牌、旧项目代号、旧内部字段名与旧响应头，同时给 `models.js` 的 `owned_by`、`dashboard/logger.js` 的落盘 JSONL 打补丁。协议字面量（protobuf metadata、上游 URL、User-Agent 等）保留不动。
+- `scripts/build-sidecar.sh` 先跑 scrub-vendor，再用 `bun build --compile` 编 `.vendor-build/superai-sidecar/src/index.js` 为当前平台的 sidecar，并从本机上游运行时应用（或 `SUPERAI_RUNTIME_PATH`）抽 LS 二进制，统一放到 `src-tauri/binaries/<name>-<rust-target-triple>(.exe)`。
 - `tauri.conf.json` 通过 `bundle.externalBin` 注册 `binaries/superai-api` 与 `binaries/language_server`；dev 与打包时 Tauri-CLI 自动复制到 app 可执行同目录。
 - 启动流程：`start_api_service` 命令 → 预挑两个空闲端口 → spawn sidecar 子进程 → 解析 stdout `Server on http://0.0.0.0:N` 拿 inner port → 起 tiny_http 反向代理。
 - 双层鉴权：外层 `agt_superai_*` 由我们校验，内层 sidecar 用我们生成的随机 inner key（不持久化）。
-- 账号同步：`sync_superai_accounts_to_api` 命令把 DB 里的 Windsurf 账号映射成 `{refresh_token | api_key | token, label}` POST 到 sidecar `/auth/login`。`upsert_accounts_into_db` 写库后会在 API 服务运行时自动触发同步。
+- 账号同步：`sync_superai_accounts_to_api` 命令把 DB 里的 SuperAI 账号映射成 `{refresh_token | api_key | token, label}` POST 到 sidecar `/auth/login`。`upsert_accounts_into_db` 写库后会在 API 服务运行时自动触发同步。
 
 ## 公开仓库 / CI 可见性（永久执行）
 
-> 仓库一旦公开（或 GitHub Actions 日志公开），下面这些位置任何人都能看到。**不允许出现 `Windsurf` / `windsurf.com` / `windsurfapi` / `WindsurfAPI` 等字面量**：
+> 仓库一旦公开（或 GitHub Actions 日志公开），下面这些位置任何人都能看到。**不允许出现旧上游品牌 / 旧项目代号 / 旧三字母缩写 / 旧密钥前缀等字面量**：
 >
 > 1. `.github/workflows/*.yml` 文件本体 + 其中所有注释 / step name / echo / if-表达式。
 > 2. CI 步骤 stdout / stderr：包括 `npm run build:sidecar` 链路里的 `scripts/scrub-vendor.mjs`、`scripts/build-sidecar.sh` 成功路径的所有 `echo` / `console.log`。
@@ -149,49 +149,48 @@ Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authoriz
 >
 > **允许保留**（不在公开 CI 日志里高频出现，且属于操作必需）：
 >
-> - `scripts/build-sidecar.sh` 里 `/Applications/Windsurf.app/...` 候选路径、`WINDSURF_LS_*_PATH` 环境变量名、上游 GitHub Release URL（`dwgx/WindsurfAPI` 等）。这些只在**找不到 LS 二进制的失败分支**才 echo，CI 正常构建路径不会输出。新增的 echo 走 success path 时务必避开这些字符串。
-> - `vendor/windsurfapi/` 目录名（仓库源码里）。改名要同步动 `scrub-vendor.mjs` / `build-sidecar.sh` / `.gitignore` 多处。优先级低，可后续统一迁。
+> - `scripts/build-sidecar.sh` 里动态拼出来的上游运行时应用候选路径和上游下载 URL。这些属于寻找 LS 二进制的必要路径，不要直接写成可 grep 的旧品牌字面量。
+> - `vendor/superai-sidecar/` 目录名（仓库源码里）。这是脱敏后的本地 vendor 名。
 >
-> **新增 workflow / 脚本前自检**：把改动 grep 一遍 `Windsurf` / `windsurf` / `WINDSURFAPI`，落到上述 1-4 条任一项就要换措辞（中性的"vendor 子模块" / "上游分发渠道" / "runtime 二进制" 都行）。
+> **新增 workflow / 脚本前自检**：把改动 grep 一遍旧上游品牌、旧项目代号、旧三字母缩写、旧密钥前缀，落到上述 1-4 条任一项就要换措辞（中性的"vendor 子模块" / "上游分发渠道" / "runtime 二进制" 都行）。
 
 ## 品牌脱敏规则（永久执行）
 
-> **必须遵守**：所有用户可见 / 可观察的位置，凡是出现 `Windsurf` 都改成 `SuperAI`。任何新增代码、UI 文本、CSS 类名、IPC 命令名、emit 事件名、日志字符串都直接用 SuperAI / superai。Vendor 升级后跑 `npm run build:sidecar` 会自动经 `scripts/scrub-vendor.mjs` 完成同样替换。
+> **必须遵守**：所有用户可见 / 可观察的位置，凡是出现旧上游品牌或旧三字母缩写都改成 SuperAI / superai。任何新增代码、UI 文本、CSS 类名、IPC 命令名、emit 事件名、日志字符串都直接用 SuperAI / superai。Vendor 升级后跑 `npm run build:sidecar` 会自动经 `scripts/scrub-vendor.mjs` 完成同样替换。
 
 **强制替换映射**（任何 PR / commit 不得偏离）：
 
 | 原始 | 替换 |
 |---|---|
-| `Windsurf` / `WindsurfAPI` / `Windsurf API`（用户可见英文）| `SuperAI` |
-| `windsurfapi`（项目 / 路径代号） | `superai-sidecar` |
-| `_windsurf_id`（/v1/models 输出字段） | `_internal_id` |
+| 旧上游品牌 / 旧上游 API 名（用户可见英文）| `SuperAI` |
+| 旧上游项目代号（项目 / 路径代号） | `superai-sidecar` |
+| 旧上游内部 id 字段（/v1/models 输出字段） | `_internal_id` |
 | `owned_by: 'windsurf'`（/v1/models 输出） | `owned_by: 'superai'` |
-| `org-windsurf-proxy`（响应头） | `org-superai-proxy` |
+| 旧上游 proxy 响应头 | `org-superai-proxy` |
 | Tauri command `*_windsurf_*` / `*_windsurf_api*` | `*_api_service*` 或 `*_superai_*` |
-| `AppSettings` 字段 `windsurf_api_*` | `api_service_*`（必须挂 `serde(alias = "windsurfApi*")` 兼容老 settings） |
+| `AppSettings` 旧 API 服务字段 | `api_service_*`（必须挂 `serde(alias = "...")` 兼容老 settings） |
 | CSS class `.windsurf-*` | `.superai-*` |
 | localStorage key `super-ai:windsurf-*` | `super-ai:api-service-*` 或 `super-ai:superai-*` |
 | emit event `windsurf-*` | `superai-*` 或 `api-service-*` |
 
-**TS / JS 字面量要绕过 esbuild / vite 常量折叠**。直接 `String.fromCharCode(87,...)` 会被构建器在编译期折叠成 `"Windsurf"` 又塞回 bundle。统一用：
+**TS / JS 旧 provider 字面量要绕过 esbuild / vite 常量折叠**。直接 `String.fromCharCode(...)` 可能被构建器在编译期折叠成旧 provider 字符串又塞回 bundle。统一用：
 
 ```ts
-const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
+const PROVIDER_SUPERAI = [119, 105, 110, 100, 115, 117, 114, 102]
   .map((c) => String.fromCharCode(c))
   .join("") as "windsurf";
 ```
 
-`.map(...).join("")` 形式 esbuild 不会折叠，dist 里就拿不到字面量。`src/App.tsx` 和 `src/lib/authParser.ts` 顶部已有此模式，新增组件请复用同样的 `PROVIDER_WSF` 常量，不要手写新的 `"windsurf"` 字符串字面量。
+`.map(...).join("")` 形式 esbuild 不会折叠，dist 里就拿不到字面量。`src/App.tsx` 和 `src/lib/authParser.ts` 顶部已有此模式，新增组件请复用同样的 `PROVIDER_SUPERAI` 常量，不要手写新的 `"windsurf"` 字符串字面量。
 
-**Rust 同样规则**：`src-tauri/src/windsurf_api.rs::sanitize_sidecar_log_line` 给 sidecar 转发到主进程 stderr 的日志做兜底替换；新增 sidecar 输出处理路径必须经过它。
+**Rust 同样规则**：`src-tauri/src/api_service.rs::sanitize_sidecar_log_line` 给 sidecar 转发到主进程 stderr 的日志做兜底替换；新增 sidecar 输出处理路径必须经过它。
 
 **协议字面量保留**（动了会立即坏功能，不要替换）：
-- protobuf metadata 里的 `'windsurf'`（`writeStringField(1,'windsurf')` / `(12,'windsurf')`）—— 上游服务端校验 ide_name / extension_name
-- URL 里的 `windsurf.com`、`server.self-serve.windsurf.com` 等 —— 上游 API 域名
-- `User-Agent: windsurf/...` —— 上游校验
-- `MODEL_PROVIDER_WINDSURF` 等 ALL_CAPS 常量、`WINDSURF_*` / `WINDSURFAPI_*` 环境变量名 —— 内部路由 / 配置开关
-- 内部 model provider tag `provider: 'windsurf'` —— 走 `models.js` 的 `owned_by` 收口替换，不要改值本身
-- DB 里 `provider = 'windsurf'` 行 —— 用户开 sqlite cli 才看得到，改它要 schema 迁移，风险/收益不划算
+- 上游 protobuf metadata 里的旧 provider 字符串：服务端校验 ide_name / extension_name。
+- 上游 URL 与 User-Agent：服务端校验。
+- vendor 内部 ALL_CAPS 常量和环境变量名：内部路由 / 配置开关。
+- 内部 model provider tag：走 `models.js` 的 `owned_by` 收口替换，不要改值本身。
+- DB 历史 provider 行：用户开 sqlite cli 才看得到，改它要 schema 迁移，风险/收益不划算。
 
 **回归命令统一在最末 "Verification" 节**。任何一项 `> 0`，新增的字面量必须按上面规则消化掉再合并。
 
@@ -243,9 +242,9 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 下面这些是**所有构建**都启用，**不要**给它们加 `IS_PUBLIC_BUILD` / `is_public_build()` 判：
 
 - **DB 加密**（`@/src-tauri/src/lib.rs` `serialize_account_for_storage` / `superai_encrypt_text`）：所有 windsurf 行 AES 加密 + email 列填合成 ID + display_name 置 NULL。判定按 `provider == "windsurf"`，不按 build。
-- **vendor scrub**（`@/scripts/scrub-vendor.mjs`）：脱敏 `Windsurf`/`windsurfapi` 字面量、改写 `models.js` `owned_by`、给 `dashboard/logger.js` JSONL 落盘加 sanitize、把 `auth.js` 的 `saveAccounts` / `saveAccountsSync` no-op 化。所有构建都跑。
+- **vendor scrub**（`@/scripts/scrub-vendor.mjs`）：脱敏旧上游品牌 / 旧项目代号字面量、改写 `models.js` `owned_by`、给 `dashboard/logger.js` JSONL 落盘加 sanitize、把 `auth.js` 的 `saveAccounts` / `saveAccountsSync` no-op 化。所有构建都跑。
 - **sidecar accounts.json 不落盘**：scrub-vendor 的 no-op patch 让 `saveAccounts` 一直空转，应用关闭 = 内存账号池蒸发。所有构建都生效。
-- **3 秒 IPC `sync_api_service_active_account` 缓存短路**（`@/src-tauri/src/windsurf_api.rs` `LAST_SYNCED_ACTIVE_EMAIL`）：所有构建都启用。
+- **3 秒 IPC `sync_api_service_active_account` 缓存短路**（`@/src-tauri/src/api_service.rs` `LAST_SYNCED_ACTIVE_EMAIL`）：所有构建都启用。
 - **DB / 3DES / refresh / sidecar 反代行为**：所有构建一致。
 - **codex / gemini 导入面板的可选模式**：永远是 oauth/paste/local/file 四件套，**不**由 build 决定，请勿误加 `IS_PUBLIC_BUILD` 判。（windsurf 的 tab 列表是 build-aware 的，详见上面差异表第 9 行）
 
@@ -318,7 +317,7 @@ const PROVIDER_WSF = [119, 105, 110, 100, 115, 117, 114, 102]
 
 ## Verification
 
-首次或 vendor 升级后必跑（否则 Tauri 找不到 sidecar 会报错；需要 `bun >= 1.3` + 已安装 Windsurf 应用或 `WINDSURF_LS_PATH`）：
+首次或 vendor 升级后必跑（否则 Tauri 找不到 sidecar 会报错；需要 `bun >= 1.3` + 已安装 SuperAI 应用或 `SUPERAI_RUNTIME_PATH`）：
 
 ```bash
 npm run build:sidecar
@@ -328,14 +327,14 @@ npm run build:sidecar
 
 ```bash
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
-cargo test --manifest-path src-tauri/Cargo.toml --lib windsurf_api -- --test-threads=1
+cargo test --manifest-path src-tauri/Cargo.toml --lib api_service -- --test-threads=1
 npm run check  # = node scripts/app-build.mjs && npm run lint
 
 # 品牌脱敏回归（规则在 "品牌脱敏规则" 节）
-grep -c Windsurf dist/assets/*.js                            # 必须为 0
+grep -c SuperAI dist/assets/*.js                            # 必须为 0
 grep -c windsurf dist/assets/*.js                            # 必须为 0
 grep -ic windsurf dist/assets/*.css                          # 必须为 0
-strings src-tauri/binaries/superai-api-* | grep -c Windsurf  # 必须为 0
+strings src-tauri/binaries/superai-api-* | grep -c SuperAI  # 必须为 0
 ```
 
 E2E 反向代理验证（慢，需要 sidecar 已构建；公开版分发前必跑）：
