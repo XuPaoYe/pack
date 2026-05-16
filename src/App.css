@@ -427,13 +427,16 @@ h2 {
   gap: 12px;
   justify-content: flex-end;
   min-width: 0;
+  flex: 1 1 720px;
+  flex-wrap: wrap;
 }
 
 .search {
   display: flex;
   align-items: center;
   gap: 10px;
-  width: min(260px, 24vw);
+  width: min(320px, 26vw);
+  min-width: 220px;
   height: 38px;
   padding: 0 12px;
   border: 1px solid var(--line);
@@ -514,6 +517,7 @@ h2 {
   gap: 8px;
   padding: 0 14px;
   font-size: 13px;
+  white-space: nowrap;
 }
 
 .content-grid {
@@ -556,7 +560,8 @@ h2 {
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 0 14px;
+  flex-wrap: wrap;
+  padding: 8px 14px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background:

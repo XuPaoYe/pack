@@ -1887,6 +1887,21 @@ function App() {
     };
   }, [showNotice]);
 
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    void listen<ApiServiceStatus>("api-service-status-changed", (event) => {
+      if (event.payload) {
+        setApiService(event.payload);
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
   // 公开版账号本地累计达到 100% 时由 Rust 主动 emit；前端弹 toast 并重读账号列表，
   // 让"已耗尽"红字立刻显示出来。
   useEffect(() => {

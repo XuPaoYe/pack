@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{Emitter, LogicalSize, Manager};
+use tauri::menu::{Menu, MenuItemBuilder};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{ActivationPolicy, Emitter, LogicalSize, Manager};
 #[cfg(desktop)]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tiny_http::{Header, Response, Server, StatusCode};
@@ -74,9 +76,29 @@ const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.5";
 const SUPERAI_AES_KEY_HEX: &str =
     "b9c1e79783adb25cdb3667ae62c168e18868438d62a47428abeb7b41491ff2ee";
 const SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
+const TRAY_MENU_SHOW: &str = "tray-show-main";
+const TRAY_MENU_QUIT: &str = "tray-quit-app";
 
 fn is_public_build() -> bool {
     option_env!("VITE_SUPERAI_PUBLIC_BUILD") == Some("1")
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+        #[cfg(target_os = "macos")]
+        let _ = app.show();
+    }
+}
+
+fn hide_main_window(window: &tauri::Window) {
+    let _ = window.hide();
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window.app_handle().hide();
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6357,6 +6379,13 @@ fn start_api_service_impl(
     Ok(status)
 }
 
+fn emit_api_service_status_changed(
+    app: &tauri::AppHandle,
+    status: &api_service::ApiServiceStatus,
+) {
+    let _ = app.emit("api-service-status-changed", status);
+}
+
 #[tauri::command]
 fn list_api_service_models() -> Result<Vec<serde_json::Value>, String> {
     api_service::list_models()
@@ -6868,15 +6897,69 @@ pub fn run() {
             configure_codex_app,
             restore_codex_app,
         ])
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                hide_main_window(window);
+            }
+        })
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(ActivationPolicy::Accessory);
+
+            let tray_menu = Menu::with_items(
+                app,
+                &[
+                    &MenuItemBuilder::with_id(TRAY_MENU_SHOW, "显示主窗口").build(app)?,
+                    &MenuItemBuilder::with_id(TRAY_MENU_QUIT, "退出 SuperAI").build(app)?,
+                ],
+            )?;
+            let tray_builder = TrayIconBuilder::with_id("superai-tray")
+                .menu(&tray_menu)
+                .show_menu_on_left_click(false)
+                .tooltip("Super AI");
+            let tray_builder = if let Some(icon) = app.default_window_icon().cloned() {
+                tray_builder.icon(icon)
+            } else {
+                tray_builder
+            };
+            let _tray = tray_builder.build(app)?;
+
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                TRAY_MENU_SHOW => show_main_window(app),
+                TRAY_MENU_QUIT => app.exit(0),
+                _ => {}
+            });
+
+            app.on_tray_icon_event(|app, event| {
+                if matches!(
+                    event,
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } | TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    }
+                ) {
+                    show_main_window(app);
+                }
+            });
+
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "windows")]
-                let app_size = LogicalSize::new(1040.0, 660.0);
+                let app_size = LogicalSize::new(1320.0, 740.0);
                 #[cfg(not(target_os = "windows"))]
-                let app_size = LogicalSize::new(1180.0, 720.0);
+                let app_size = LogicalSize::new(1320.0, 760.0);
+                #[cfg(target_os = "windows")]
+                window.set_resizable(true)?;
+                #[cfg(not(target_os = "windows"))]
                 window.set_resizable(false)?;
                 window.set_min_size(Some(app_size))?;
-                window.set_max_size(Some(app_size))?;
                 window.set_size(app_size)?;
             }
 
@@ -6926,39 +7009,18 @@ pub fn run() {
             if let Ok(mut settings) = read_settings_record(&handle) {
                 let _ = ensure_api_service_key(&handle, &mut settings);
                 if settings.api_service_enabled {
-                    match handle.path().app_data_dir() {
-                        Ok(data_dir) => {
-                            match api_service::start(
-                                &data_dir,
-                                &settings.api_service_host,
-                                settings.api_service_port,
-                                &settings.api_service_key,
-                                &effective_api_service_model(
-                                    &settings.api_service_default_model,
-                                ),
-                            ) {
-                                Ok(status) => {
-                                    if let Some(actual) = status.actual_port {
-                                        if settings.api_service_port != actual {
-                                            settings.api_service_port = actual;
-                                            let _ = write_settings_record(&handle, &settings);
-                                        }
-                                    }
-                                    schedule_windsurf_sync(handle.clone());
-                                }
-                                Err(error) => {
-                                    eprintln!("[SuperAI API] 自启失败: {error}");
-                                    let _ = handle.emit(
-                                        "api-service-error",
-                                        serde_json::json!({"phase": "auto_start", "message": error}),
-                                    );
-                                }
+                    tauri::async_runtime::spawn_blocking(move || {
+                        match start_api_service_impl(handle.clone()) {
+                            Ok(status) => emit_api_service_status_changed(&handle, &status),
+                            Err(error) => {
+                                eprintln!("[SuperAI API] 自启失败: {error}");
+                                let _ = handle.emit(
+                                    "api-service-error",
+                                    serde_json::json!({"phase": "auto_start", "message": error}),
+                                );
                             }
                         }
-                        Err(error) => {
-                            eprintln!("[SuperAI API] 读取数据目录失败: {error}");
-                        }
-                    }
+                    });
                 }
             }
 
@@ -6966,13 +7028,15 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_handle, event| {
-            if matches!(
-                event,
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-            ) {
+        .run(|handle, event| match event {
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => {
+                show_main_window(handle);
+            }
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 let _ = api_service::stop();
             }
+            _ => {}
         });
 }
 
