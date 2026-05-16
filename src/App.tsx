@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getName, getTauriVersion, getVersion } from "@tauri-apps/api/app";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -1030,6 +1031,8 @@ function App() {
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
+  const [isAboutOpen, setIsAboutOpen] = useState(false);
+  const [aboutInfo, setAboutInfo] = useState<{ name: string; version: string; tauri: string } | null>(null);
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
@@ -1651,6 +1654,22 @@ function App() {
     setAppLogs((current) => pruneAppLogs(current));
     setIsLogsOpen(true);
   };
+  const handleAbout = async () => {
+    if (!aboutInfo) {
+      try {
+        const [name, version, tauri] = await Promise.all([
+          getName(),
+          getVersion(),
+          getTauriVersion(),
+        ]);
+        setAboutInfo({ name, version, tauri });
+      } catch (error) {
+        setAboutInfo({ name: "Super AI", version: "unknown", tauri: "unknown" });
+        showNotice("error", `读取版本信息失败：${String(error)}`);
+      }
+    }
+    setIsAboutOpen(true);
+  };
   const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
     setSettings((current) => ({ ...current, [key]: value }));
   };
@@ -2069,7 +2088,7 @@ function App() {
       className={clsx(
         "shell",
         settings.maskSensitive && "privacy-mask",
-        (isImportModalOpen || isSettingsOpen || isLogsOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
+        (isImportModalOpen || isSettingsOpen || isLogsOpen || isAboutOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
       )}
       onMouseDownCapture={handleShellTopDrag}
     >
@@ -2121,6 +2140,10 @@ function App() {
           <button onClick={handleSettings}>
             <Settings size={18} />
             设置
+          </button>
+          <button onClick={handleAbout}>
+            <Info size={18} />
+            关于
           </button>
         </div>
       </aside>
@@ -2585,6 +2608,50 @@ function App() {
                 </button>
               </section>
             </div>
+        </AppModal>
+      )}
+
+      {isAboutOpen && (
+        <AppModal
+          title="关于"
+          description="构建与运行环境信息"
+          closeLabel="关闭关于"
+          className="about-panel"
+          onClose={() => setIsAboutOpen(false)}
+        >
+          <div className="about-body">
+            <div className="about-brand">
+              <img src={logoUrl} alt="" />
+              <div>
+                <strong>{aboutInfo?.name ?? "Super AI"}</strong>
+                <span>本地 Codex / Gemini / SuperAI 账号管理</span>
+              </div>
+            </div>
+            <dl className="about-grid">
+              <div>
+                <dt>应用版本</dt>
+                <dd>{aboutInfo?.version ?? "加载中…"}</dd>
+              </div>
+              <div>
+                <dt>构建模式</dt>
+                <dd>{IS_PUBLIC_BUILD ? "正式版" : "完全版"}</dd>
+              </div>
+              <div>
+                <dt>Tauri 版本</dt>
+                <dd>{aboutInfo?.tauri ?? "加载中…"}</dd>
+              </div>
+              <div>
+                <dt>运行平台</dt>
+                <dd>{typeof navigator !== "undefined" ? navigator.platform || "—" : "—"}</dd>
+              </div>
+            </dl>
+            <p className="about-note">
+              更多说明见
+              {" "}
+              <a href="https://ai.talentisan.cn/" onClick={handleOpenStore}>ai.talentisan.cn</a>
+              。所有账号凭证仅保存在本机。
+            </p>
+          </div>
         </AppModal>
       )}
 
