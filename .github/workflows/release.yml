@@ -18,7 +18,7 @@ on:
         required: true
         type: string
 
-run-name: Release ${{ inputs.release_version || github.ref_name }}${{ inputs.release_note && format(': {0}', inputs.release_note) || '' }}
+run-name: "Release ${{ inputs.release_version || github.ref_name }}: ${{ inputs.release_note }}"
 
 permissions:
   contents: write  # 让 tauri-action 能创建 release 并上传产物
