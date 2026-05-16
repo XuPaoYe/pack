@@ -6858,7 +6858,10 @@ pub fn run() {
         ])
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "windows")]
                 let app_size = LogicalSize::new(1040.0, 660.0);
+                #[cfg(not(target_os = "windows"))]
+                let app_size = LogicalSize::new(1180.0, 720.0);
                 window.set_resizable(false)?;
                 window.set_min_size(Some(app_size))?;
                 window.set_max_size(Some(app_size))?;

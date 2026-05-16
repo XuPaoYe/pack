@@ -13,10 +13,10 @@
     "windows": [
       {
         "title": "Super AI",
-        "width": 1040,
-        "height": 660,
-        "minWidth": 1040,
-        "minHeight": 660,
+        "width": 1180,
+        "height": 720,
+        "minWidth": 1180,
+        "minHeight": 720,
         "center": true,
         "decorations": true,
         "titleBarStyle": "Overlay",
