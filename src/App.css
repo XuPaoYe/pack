@@ -2127,76 +2127,70 @@ h2 {
   padding: 16px;
 }
 
-.about-hero {
+.about-brand {
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   padding: 14px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--modal-line);
   border-radius: 12px;
-  background: color-mix(in srgb, var(--surface) 76%, var(--control));
+  background: var(--modal-soft, rgba(0, 0, 0, 0.02));
 }
 
-.about-logo {
-  flex: 0 0 auto;
-  width: 44px;
-  height: 44px;
-  overflow: hidden;
-  border-radius: 11px;
-  background: #059669;
+.about-brand img {
+  width: 40px;
+  height: 40px;
+  border-radius: 9px;
 }
 
-.about-logo img {
+.about-brand strong {
   display: block;
-  width: 100%;
-  height: 100%;
+  font-size: 14px;
+  margin-bottom: 2px;
 }
 
-.about-hero strong,
-.about-hero span {
-  display: block;
-}
-
-.about-hero strong {
-  color: var(--text-strong);
-  font-size: 15px;
-  font-weight: 750;
-}
-
-.about-hero span {
-  margin-top: 3px;
+.about-brand span {
   color: var(--text-soft);
   font-size: 12px;
 }
 
-.about-meta {
+.about-grid {
   display: grid;
-  gap: 8px;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 16px;
+  margin: 0;
+  padding: 4px 2px;
 }
 
-.about-meta div {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
-  min-height: 42px;
-  padding: 0 14px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--surface) 80%, transparent);
+.about-grid > div {
+  display: grid;
+  gap: 2px;
 }
 
-.about-meta dt {
+.about-grid dt {
+  font-size: 11px;
+  color: var(--text-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.about-grid dd {
+  margin: 0;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.about-note {
+  margin: 0 2px;
   color: var(--text-soft);
   font-size: 12px;
+  line-height: 1.55;
 }
 
-.about-meta dd {
-  margin: 0;
-  color: var(--text-strong);
-  font-size: 13px;
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
+.about-note a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .export-body {

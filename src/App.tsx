@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getVersion } from "@tauri-apps/api/app";
+import { getName, getVersion } from "@tauri-apps/api/app";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -61,8 +61,6 @@ import {
 } from "./lib/appLogs";
 import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
-
-declare const __APP_BUILD_TIME__: string;
 
 type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey" | "password";
 type OAuthProvider = "codex" | "gemini";
@@ -1008,6 +1006,7 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
   const [isAboutOpen, setIsAboutOpen] = useState(false);
+  const [aboutInfo, setAboutInfo] = useState<{ name: string; version: string } | null>(null);
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
@@ -1035,7 +1034,6 @@ function App() {
     apiServiceDefaultModel: "gpt-5.5",
   });
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
-  const [appVersion, setAppVersion] = useState(() => (isTauri() ? "读取中" : "开发模式"));
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
   const [isConfiguringCodex, setIsConfiguringCodex] = useState(false);
   const [isRestoringCodex, setIsRestoringCodex] = useState(false);
@@ -1058,15 +1056,6 @@ function App() {
   }, []);
   const apiServiceRunning = Boolean(apiService?.running);
   const apiServiceActualPort = apiService?.actualPort ?? null;
-  const appBuildTime = useMemo(() => formatDateTime(__APP_BUILD_TIME__) ?? __APP_BUILD_TIME__, []);
-
-  useEffect(() => {
-    if (!isTauri()) return;
-    void getVersion()
-      .then((version) => setAppVersion(version))
-      .catch(() => setAppVersion("未知"));
-  }, []);
-
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return sortAccountsForView(accounts.filter((account) => {
@@ -1565,7 +1554,16 @@ function App() {
     setAppLogs((current) => pruneAppLogs(current));
     setIsLogsOpen(true);
   };
-  const handleAbout = () => {
+  const handleAbout = async () => {
+    if (!aboutInfo) {
+      try {
+        const [name, version] = await Promise.all([getName(), getVersion()]);
+        setAboutInfo({ name, version });
+      } catch (error) {
+        setAboutInfo({ name: "Super AI", version: "unknown" });
+        showNotice("error", `读取版本信息失败：${String(error)}`);
+      }
+    }
     setIsAboutOpen(true);
   };
   const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
@@ -2646,31 +2644,42 @@ function App() {
       {isAboutOpen && (
         <AppModal
           title="关于"
-          description="当前安装的 Super AI 版本信息"
+          description="构建与运行环境信息"
           closeLabel="关闭关于"
           className="about-panel"
           onClose={() => setIsAboutOpen(false)}
         >
           <div className="about-body">
-            <div className="about-hero">
-              <div className="about-logo">
-                <img src={logoUrl} alt="" />
-              </div>
+            <div className="about-brand">
+              <img src={logoUrl} alt="" />
               <div>
-                <strong>Super AI</strong>
-                <span>安静可靠的本地账号管理工具</span>
+                <strong>{aboutInfo?.name ?? "Super AI"}</strong>
+                <span>本地 Codex / Gemini / SuperAI 账号管理</span>
               </div>
             </div>
-            <dl className="about-meta">
+            <dl className="about-grid">
               <div>
-                <dt>当前版本</dt>
-                <dd>{appVersion}</dd>
+                <dt>应用版本</dt>
+                <dd>{aboutInfo?.version ?? "加载中…"}</dd>
               </div>
               <div>
-                <dt>更新时间</dt>
-                <dd>{appBuildTime}</dd>
+                <dt>构建模式</dt>
+                <dd>{IS_PUBLIC_BUILD ? "正式版" : "完全版"}</dd>
+              </div>
+              <div>
+                <dt>运行平台</dt>
+                <dd>{typeof navigator !== "undefined" ? navigator.platform || "—" : "—"}</dd>
+              </div>
+              <div>
+                <dt>应用标识</dt>
+                <dd>cn.talentisan.super-ai</dd>
               </div>
             </dl>
+            <p className="about-note">
+              更多说明见{" "}
+              <a href="https://ai.talentisan.cn/" onClick={handleOpenStore}>ai.talentisan.cn</a>
+              。所有账号凭证仅保存在本机。
+            </p>
           </div>
         </AppModal>
       )}
