@@ -6,9 +6,12 @@
  *   - Account health tracking (error count, auto-disable)
  *   - Dynamic add/remove via API
  *   - Token-based registration via api.codeium.com
+ *   - Optional sticky sessions (STICKY_SESSION_ENABLED=1) for multi-turn
+ *     conversation continuity (#93, #133)
  */
 
 import { createHash, randomUUID, timingSafeEqual } from 'crypto';
+import { isStickyEnabled, getStickyBinding, setStickyBinding, clearStickyBinding } from './account/sticky-session.js';
 import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync, readdirSync } from 'fs';
 import { config, log } from './config.js';
 import { getEffectiveProxy } from './dashboard/proxy-config.js';
@@ -613,8 +616,43 @@ export function removeAccount(id) {
  * Returns null when every account is temporarily full — callers should
  * wait a moment and retry (see handlers/chat.js queue loop).
  */
-export function getApiKey(excludeKeys = [], modelKey = null) {
+export function getApiKey(excludeKeys = [], modelKey = null, callerKey = null) {
   const now = Date.now();
+
+  // ── Sticky session: prefer the account from the last turn ────────
+  // When enabled, this keeps multi-turn conversations on the same upstream
+  // account so the cascade_id from the previous turn is still valid.
+  // Falls through to normal selection if the bound account is unavailable.
+  if (callerKey && isStickyEnabled()) {
+    const bound = getStickyBinding(callerKey, modelKey);
+    if (bound) {
+      const acct = accounts.find(a => a.id === bound.accountId && a.status === 'active' && a.apiKey === bound.apiKey);
+      if (acct) {
+        const limit = rpmLimitFor(acct);
+        const used = pruneRpmHistory(acct, now);
+        if (limit > 0 && used < limit && !isRateLimitedForModel(acct, modelKey, now)) {
+          if (!modelKey || isModelAllowedForAccount(acct, modelKey)) {
+            const reservationTimestamp = nextReservationToken(now);
+            acct._rpmHistory.push(reservationTimestamp);
+            acct.lastUsed = now;
+            acct._inflight = (acct._inflight || 0) + 1;
+            acct._inflightAt = Date.now();
+            return {
+              id: acct.id, email: acct.email, apiKey: acct.apiKey,
+              apiServerUrl: acct.apiServerUrl || '',
+              proxy: getEffectiveProxy(acct.id) || null,
+              reservationTimestamp,
+              _sticky: true,
+            };
+          }
+        }
+      }
+      // Bound account is no longer usable — clear it so the next call
+      // falls through to normal selection instead of looping.
+      clearStickyBinding(callerKey, modelKey);
+    }
+  }
+
   const candidates = [];
   for (const a of accounts) {
     if (a.status !== 'active') continue;
@@ -660,6 +698,7 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
   account._rpmHistory.push(reservationTimestamp);
   account.lastUsed = now;
   account._inflight = (account._inflight || 0) + 1;
+  account._inflightAt = now;
   // v2.0.57 Fix 4 — predictive pre-warming. When the chosen account is
   // running out of quota, fire-and-forget warm up the next-best
   // candidate so its LS / cascade pool is ready when the chosen one
@@ -703,6 +742,26 @@ export function releaseAccount(apiKey) {
   a._inflight = Math.max(0, (a._inflight || 0) - 1);
 }
 
+// v2.0.96: safety net — auto-reset stale inflight counters that weren't
+// decremented due to connection drops, crashes, or missed finally blocks.
+// Without this a single leaked inflight permanently deprioritises an
+// account in getApiKey's sort order (fixes #165).
+const INFLIGHT_STALE_MS = 120_000;
+let _inflightCleanupTimer = null;
+function startInflightCleanup() {
+  if (_inflightCleanupTimer) return;
+  _inflightCleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const a of accounts) {
+      if ((a._inflight || 0) > 0 && a._inflightAt && (now - a._inflightAt) > INFLIGHT_STALE_MS) {
+        log.warn(`Account ${a.id} (${a.email}) inflight=${a._inflight} stale >${Math.round((now - a._inflightAt) / 1000)}s, auto-resetting`);
+        a._inflight = 0;
+        a._inflightAt = 0;
+      }
+    }
+  }, 60_000).unref();
+}
+
 /**
  * Try to re-check-out a specific account by apiKey, applying the same
  * rate-limit / status guards as getApiKey(). Used by the conversation pool
@@ -725,6 +784,7 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
   a._rpmHistory.push(reservationTimestamp);
   a.lastUsed = now;
   a._inflight = (a._inflight || 0) + 1;
+  a._inflightAt = now;
   return {
     id: a.id, email: a.email, apiKey: a.apiKey,
     apiServerUrl: a.apiServerUrl || '',
@@ -1656,6 +1716,9 @@ async function refreshAllFirebaseTokens() {
 export async function initAuth() {
   // Load persisted accounts first
   loadAccounts();
+
+  // Safety net: auto-reset stale inflight counters (fixes #165)
+  startInflightCleanup();
 
   const promises = [];
 

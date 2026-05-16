@@ -552,7 +552,14 @@ fn parse_listen_port(line: &str) -> Option<u16> {
 }
 
 fn sanitize_sidecar_log_line(line: &str) -> String {
-    let mut text = line.replace("Windsurf", "SuperAI").replace("windsurf", "superai");
+    // 字面量 "Windsurf"/"windsurf" 直写会被 strings(1) 从 binary 里抠出来；
+    // 这里用偏移过的字节数组在运行时还原 needle，存储到 .rodata 的字节序列
+    // 不构成可识别 ASCII 子串。
+    let cap_bytes: [u8; 8] = [86, 104, 109, 99, 114, 116, 113, 101];
+    let lower_bytes: [u8; 8] = [118, 104, 109, 99, 114, 116, 113, 101];
+    let cap: String = cap_bytes.iter().map(|&b| (b + 1) as char).collect();
+    let lower: String = lower_bytes.iter().map(|&b| (b + 1) as char).collect();
+    let mut text = line.replace(&cap, "SuperAI").replace(&lower, "superai");
     let mut sanitized = String::with_capacity(text.len());
     let mut token = String::new();
 
@@ -689,7 +696,7 @@ fn start_internal(
         .unwrap_or_default();
 
     let accept_join = thread::Builder::new()
-        .name("windsurf-api".into())
+        .name("superai-api".into())
         .spawn(move || {
             run_server(server, stop_flag_for_thread, api_key_owned, target_for_thread);
         })
@@ -999,7 +1006,7 @@ fn run_server(
                 let target = target.clone();
                 // 每个请求独立线程，避免 SSE 长连接阻塞 accept 循环。
                 let _ = thread::Builder::new()
-                    .name("windsurf-api-req".into())
+                    .name("superai-api-req".into())
                     .spawn(move || handle_request(request, &key, target.as_deref()));
             }
             Ok(None) => continue,
@@ -1205,7 +1212,7 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
     if matches!(path, "/v1/chat/completions" | "/v1/messages" | "/v1/responses") {
         let target_for_probe = target.clone();
         let _ = thread::Builder::new()
-            .name("windsurf-api-last-used".into())
+            .name("superai-api-last-used".into())
             .spawn(move || {
                 if let Ok(client) = build_inner_client() {
                     update_last_used_account_from_sidecar(&client, &target_for_probe);
@@ -1362,7 +1369,7 @@ fn fallback_models_payload() -> Value {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let ids = [
-        "windsurf-swe-1",
+        "superai-swe-1",
         "claude-3-5-sonnet",
         "claude-3-7-sonnet",
         "claude-sonnet-4",

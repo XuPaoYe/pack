@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR_SRC_DIR="$REPO_ROOT/vendor/windsurfapi"
 # scrub-vendor.mjs 会把原始 vendor 复制到这里，并替换掉用户可见的
 # Windsurf 字面量；bun --compile 实际读取的是这份副本。
-SCRUBBED_DIR="$REPO_ROOT/.vendor-build/windsurfapi"
+SCRUBBED_DIR="$REPO_ROOT/.vendor-build/superai-sidecar"
 VENDOR_DIR="$SCRUBBED_DIR"
 OUTPUT_DIR="$REPO_ROOT/src-tauri/binaries"
 

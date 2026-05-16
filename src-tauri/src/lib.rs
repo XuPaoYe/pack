@@ -1695,7 +1695,7 @@ fn parse_windsurf_account(value: &Value, source: &str) -> Option<ManagedAccount>
         .or_else(|| string_field(obj.get("account")))
         .or_else(|| string_field(obj.get("active")))
         .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("email"))))
-        .unwrap_or_else(|| format!("windsurf-{}@local", stable_hash(&discriminator_token)));
+        .unwrap_or_else(|| format!("superai-{}@local", stable_hash(&discriminator_token)));
     let local_id = string_field(obj.get("local_id"))
         .or_else(|| string_field(obj.get("localId")))
         .or_else(|| tokens.and_then(|t| string_field(t.get("local_id"))))
@@ -1730,7 +1730,7 @@ fn parse_windsurf_account(value: &Value, source: &str) -> Option<ManagedAccount>
         .unwrap_or_else(|| email.clone());
     let id = string_field(obj.get("id")).unwrap_or_else(|| {
         format!(
-            "windsurf_{}",
+            "superai_{}",
             stable_hash(&format!("{}::{}", email.to_lowercase(), discriminator))
         )
     });
@@ -2608,7 +2608,7 @@ fn apply_windsurf_user_info(account: &mut ManagedAccount, user_info: &Value) {
                 let remaining =
                     (((total - used).max(0) as f64 / total as f64) * 100.0).round() as i64;
                 metrics.push(QuotaMetric {
-                    key: "windsurf-credits".to_string(),
+                    key: "superai-credits".to_string(),
                     label: "CREDITS".to_string(),
                     remaining_percent: Some(remaining.clamp(0, 100)),
                     reset_at: account.subscription_active_until.clone(),
@@ -2717,7 +2717,7 @@ fn apply_windsurf_plan_status(account: &mut ManagedAccount, plan_status: &Value)
             .clamp(0, 100);
         let remaining = remaining.clamp(0, 100);
         metrics.push(QuotaMetric {
-            key: "windsurf-daily".to_string(),
+            key: "superai-daily".to_string(),
             label: "日限".to_string(),
             remaining_percent: Some(remaining),
             reset_at: plan_status
@@ -2731,7 +2731,7 @@ fn apply_windsurf_plan_status(account: &mut ManagedAccount, plan_status: &Value)
             .unwrap_or(0)
             .clamp(0, 100);
         metrics.push(QuotaMetric {
-            key: "windsurf-weekly".to_string(),
+            key: "superai-weekly".to_string(),
             label: "周限".to_string(),
             remaining_percent: Some(remaining),
             reset_at: plan_status
@@ -2753,7 +2753,7 @@ fn apply_windsurf_plan_status(account: &mut ManagedAccount, plan_status: &Value)
         if total > 0 {
             let remaining = (((total - used).max(0) as f64 / total as f64) * 100.0).round() as i64;
             metrics.push(QuotaMetric {
-                key: "windsurf-credits".to_string(),
+                key: "superai-credits".to_string(),
                 label: "CREDITS".to_string(),
                 remaining_percent: Some(remaining.clamp(0, 100)),
                 reset_at: account.subscription_active_until.clone(),
@@ -3433,7 +3433,7 @@ fn windsurf_payload_remove_value(account: &mut ManagedAccount, key: &str) {
 
 fn has_public_usage_tracking(account: &ManagedAccount) -> bool {
     // 完全版（full build）即便账号 auth_payload 残留 batch_key（例如公开版导入后切到完全版）
-    // 也不应把 quota 改写成单一 superai-public 额度条 —— 完全版需要保留 windsurf-daily / windsurf-weekly。
+    // 也不应把 quota 改写成单一 superai-public 额度条 —— 完全版需要保留 superai-daily / superai-weekly。
     is_public_build()
         && account.provider == "windsurf"
         && account
@@ -3481,7 +3481,7 @@ fn current_daily_remaining_from_account(account: &ManagedAccount) -> Option<i64>
         .as_ref()?
         .metrics
         .iter()
-        .find(|m| m.key == "windsurf-daily")
+        .find(|m| m.key == "superai-daily")
         .and_then(|m| m.remaining_percent)
 }
 
@@ -3671,7 +3671,7 @@ async fn add_superai_account_by_token(
         .or_else(|| label.clone())
         .unwrap_or_else(|| {
             format!(
-                "windsurf-token-{}@local",
+                "superai-token-{}@local",
                 &stable_hash(&register.api_key)[..6]
             )
         });
@@ -3713,7 +3713,7 @@ async fn add_superai_account_by_token(
     }
     payload.insert("tokens".to_string(), Value::Object(tokens_map));
 
-    let account = parse_windsurf_account(&Value::Object(payload), "windsurf_token")
+    let account = parse_windsurf_account(&Value::Object(payload), "superai_token")
         .ok_or_else(|| "构建 SuperAI 账号记录失败".to_string())?;
     upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
     Ok(account_for_frontend(&account))
