@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getName, getTauriVersion, getVersion } from "@tauri-apps/api/app";
+import { getName, getVersion } from "@tauri-apps/api/app";
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -1032,7 +1032,7 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
   const [isAboutOpen, setIsAboutOpen] = useState(false);
-  const [aboutInfo, setAboutInfo] = useState<{ name: string; version: string; tauri: string } | null>(null);
+  const [aboutInfo, setAboutInfo] = useState<{ name: string; version: string } | null>(null);
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
@@ -1657,14 +1657,10 @@ function App() {
   const handleAbout = async () => {
     if (!aboutInfo) {
       try {
-        const [name, version, tauri] = await Promise.all([
-          getName(),
-          getVersion(),
-          getTauriVersion(),
-        ]);
-        setAboutInfo({ name, version, tauri });
+        const [name, version] = await Promise.all([getName(), getVersion()]);
+        setAboutInfo({ name, version });
       } catch (error) {
-        setAboutInfo({ name: "Super AI", version: "unknown", tauri: "unknown" });
+        setAboutInfo({ name: "Super AI", version: "unknown" });
         showNotice("error", `读取版本信息失败：${String(error)}`);
       }
     }
@@ -2637,12 +2633,12 @@ function App() {
                 <dd>{IS_PUBLIC_BUILD ? "正式版" : "完全版"}</dd>
               </div>
               <div>
-                <dt>Tauri 版本</dt>
-                <dd>{aboutInfo?.tauri ?? "加载中…"}</dd>
-              </div>
-              <div>
                 <dt>运行平台</dt>
                 <dd>{typeof navigator !== "undefined" ? navigator.platform || "—" : "—"}</dd>
+              </div>
+              <div>
+                <dt>应用标识</dt>
+                <dd>cn.talentisan.super-ai</dd>
               </div>
             </dl>
             <p className="about-note">
