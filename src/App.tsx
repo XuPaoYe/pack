@@ -1008,11 +1008,9 @@ function App() {
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
   const [pendingBatchDelete, setPendingBatchDelete] = useState<ManagedAccount[] | null>(null);
-  const [isClearDatabaseConfirmOpen, setIsClearDatabaseConfirmOpen] = useState(false);
   const [isAccountBusy, setIsAccountBusy] = useState(false);
   const [isExportBusy, setIsExportBusy] = useState(false);
   const [isImportBusy, setIsImportBusy] = useState(false);
-  const [isClearingDatabase, setIsClearingDatabase] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
   const [switchingAccountId, setSwitchingAccountId] = useState<string | null>(null);
   const [refreshingActionAccountId, setRefreshingActionAccountId] = useState<string | null>(null);
@@ -1725,28 +1723,6 @@ function App() {
       setIsAccountBusy(false);
     }
   };
-  const confirmClearLocalDatabase = async () => {
-    if (isClearingDatabase) return;
-    setIsClearingDatabase(true);
-    try {
-      if (apiServiceRunning) {
-        const status = await invoke<ApiServiceStatus>("stop_api_service");
-        setApiService(status);
-      }
-      await invoke("clear_local_database");
-      setAccounts([]);
-      setSelectedExportIds(new Set());
-      setPendingDeleteAccount(null);
-      setPendingBatchDelete(null);
-      setIsClearDatabaseConfirmOpen(false);
-      showNotice("success", "本地账号数据库已清空");
-      appendAppLog("info", "已清空本地账号数据库和公开版用量历史。");
-    } catch (error) {
-      showNotice("error", `清空数据库失败：${String(error)}`);
-    } finally {
-      setIsClearingDatabase(false);
-    }
-  };
   const downloadExportPreview = (preview: ExportPreview) => {
     const isKey = preview.kind === "key";
     const blob = new Blob([preview.payload], { type: isKey ? "text/plain;charset=utf-8" : "application/json;charset=utf-8" });
@@ -2085,7 +2061,8 @@ function App() {
       className={clsx(
         "shell",
         settings.maskSensitive && "privacy-mask",
-        (isImportModalOpen || isSettingsOpen || isLogsOpen || isAboutOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || isClearDatabaseConfirmOpen || forceUpdate) && "modal-active",
+        (isImportModalOpen || isSettingsOpen || isLogsOpen || isAboutOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
+        (isImportModalOpen || isSettingsOpen || isLogsOpen || isAboutOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
       )}
       onMouseDownCapture={handleShellTopDrag}
     >
@@ -2636,23 +2613,6 @@ function App() {
                   <i />
                 </button>
               </section>
-
-              <section className="setting-row danger-setting-row">
-                <div className="setting-copy">
-                  <Trash2 size={18} />
-                  <div>
-                    <strong>清空本地数据库</strong>
-                    <p>删除本机保存的账号和公开版用量历史，用于清理旧版本脏数据；设置会保留。</p>
-                  </div>
-                </div>
-                <button
-                  className="secondary danger-action"
-                  onClick={() => setIsClearDatabaseConfirmOpen(true)}
-                  disabled={isClearingDatabase}
-                >
-                  {isClearingDatabase ? "清理中..." : "清空"}
-                </button>
-              </section>
             </div>
         </AppModal>
       )}
@@ -2837,33 +2797,6 @@ function App() {
               </button>
               <button className="danger-button" onClick={() => void confirmBatchDelete()} disabled={isAccountBusy}>
                 {isAccountBusy ? "删除中..." : `删除 ${pendingBatchDelete.length} 个`}
-              </button>
-            </div>
-          </aside>
-        </div>
-      )}
-
-      {isClearDatabaseConfirmOpen && (
-        <div
-          className="modal-overlay"
-          onMouseDown={(event) => handleModalBackdropMouseDown(event, () => {
-            if (!isClearingDatabase) setIsClearDatabaseConfirmOpen(false);
-          })}
-        >
-          <aside className="confirm-panel modal-content" onMouseDown={(e) => e.stopPropagation()}>
-            <div className="confirm-icon danger">
-              <Trash2 size={22} />
-            </div>
-            <div className="confirm-copy">
-              <h2>清空本地数据库</h2>
-              <p>将删除本机保存的全部账号和公开版用量历史，设置、端口和 API 密钥会保留。</p>
-            </div>
-            <div className="confirm-actions">
-              <button className="secondary" onClick={() => setIsClearDatabaseConfirmOpen(false)} disabled={isClearingDatabase}>
-                取消
-              </button>
-              <button className="danger-button" onClick={() => void confirmClearLocalDatabase()} disabled={isClearingDatabase}>
-                {isClearingDatabase ? "清理中..." : "确认清空"}
               </button>
             </div>
           </aside>

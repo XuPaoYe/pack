@@ -18,7 +18,9 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{ActivationPolicy, Emitter, LogicalSize, Manager};
+use tauri::{Emitter, LogicalSize, Manager};
+#[cfg(target_os = "macos")]
+use tauri::ActivationPolicy;
 #[cfg(desktop)]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tiny_http::{Header, Response, Server, StatusCode};
@@ -5613,17 +5615,6 @@ fn list_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
 }
 
 #[tauri::command]
-fn clear_local_database(app: tauri::AppHandle) -> Result<(), String> {
-    let conn = open_app_db(&app)?;
-    conn.execute("DELETE FROM accounts", [])
-        .map_err(|error| format!("清空账号数据库失败: {error}"))?;
-    conn.execute("DELETE FROM public_usage_history", [])
-        .map_err(|error| format!("清空用量历史失败: {error}"))?;
-    schedule_windsurf_sync(app);
-    Ok(())
-}
-
-#[tauri::command]
 fn upsert_accounts(app: tauri::AppHandle, accounts: Vec<ManagedAccount>) -> Result<(), String> {
     // 前端拿到的账号 provider 是 "superai"（由 account_for_frontend 改写），
     // 这里翻译回内部协议字面量，否则 upsert_account 里 `provider == "windsurf"`
@@ -6866,7 +6857,6 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             start_window_drag,
             list_accounts,
-            clear_local_database,
             upsert_accounts,
             refresh_account,
             refresh_provider_accounts,
@@ -7028,10 +7018,10 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|handle, event| match event {
+        .run(|_handle, event| match event {
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
-                show_main_window(handle);
+                show_main_window(_handle);
             }
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 let _ = api_service::stop();

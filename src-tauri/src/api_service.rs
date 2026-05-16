@@ -529,7 +529,9 @@ fn spawn_sidecar(
                         }
                     }
                 }
-                eprintln!("[SuperAI sidecar] {}", sanitize_sidecar_log_line(&line));
+                if !should_suppress_sidecar_log_line(&line) {
+                    eprintln!("[SuperAI sidecar] {}", sanitize_sidecar_log_line(&line));
+                }
             }
         })
         .map_err(|error| format!("无法启动 stdout 读线程: {error}"))?;
@@ -540,7 +542,9 @@ fn spawn_sidecar(
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
-                eprintln!("[SuperAI sidecar:err] {}", sanitize_sidecar_log_line(&line));
+                if !should_suppress_sidecar_log_line(&line) {
+                    eprintln!("[SuperAI sidecar:err] {}", sanitize_sidecar_log_line(&line));
+                }
             }
         })
         .map_err(|error| format!("无法启动 stderr 读线程: {error}"))?;
@@ -650,6 +654,35 @@ fn sanitize_sidecar_log_line(line: &str) -> String {
     }
     flush_token(&mut token, &mut sanitized);
     sanitized
+}
+
+fn should_suppress_sidecar_log_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+
+    // 上游 LS 管理器在固定端口 42100 上做 child handoff / 自恢复时会打印一大串
+    // "address already in use"、lock file、Exit RPC refused、堆栈等噪音。
+    // 这些日志经常成片出现，但通常会在几百毫秒后自愈并重新连上，不代表
+    // SuperAI API 启动失败。这里仅压掉这组高频已知噪音，真正的 sidecar
+    // 启动失败仍由 stdout 超时 / 进程退出路径上抛给 UI。
+    lower.contains("language server listening on fixed port at 42100")
+        || lower.contains("child process attempting to acquire lock file")
+        || lower.contains("child process acquired lock file")
+        || lower.contains("manager process acquired child process lock")
+        || lower.contains("failed exit rpc on language server")
+        || lower.contains("listen tcp 127.0.0.1:42100: bind: address already in use")
+        || lower.contains("language server failed - listen tcp 127.0.0.1:42100")
+        || lower.contains("starting language server process with pid")
+        || lower.contains("language server will attempt to listen on host 127.0.0.1")
+        || lower.contains("successfully connected to new language server at 127.0.0.1:42100")
+        || lower.contains("exit requested on language server process")
+        || lower.contains("language server shutting down")
+        || lower.contains("attempting to connect to language server at 127.0.0.1:42100")
+        || lower.contains("attached stack trace")
+        || lower.contains("-- stack trace:")
+        || lower.contains("error types:")
+        || lower.starts_with("| github.com/")
+        || lower.starts_with("|       ")
+        || lower.starts_with("wraps: ")
 }
 
 // ---------- 启停 ----------
