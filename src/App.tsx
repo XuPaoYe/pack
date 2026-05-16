@@ -2689,7 +2689,7 @@ function App() {
           <div className="settings-body about-body">
             <section className="setting-row about-app-row">
               <div className="setting-copy">
-                <img className="about-icon" src={logoUrl} alt="" />
+                <img className="about-icon" src={logoUrl} alt="" draggable={false} />
                 <div>
                   <strong>{aboutInfo?.name ?? "Super AI"}</strong>
                   <p>本地 Codex / Gemini / SuperAI 账号管理</p>
@@ -2697,45 +2697,47 @@ function App() {
               </div>
             </section>
 
-            <section className="setting-row">
-              <div className="setting-copy">
-                <BadgeCheck size={18} />
-                <div>
-                  <strong>应用版本</strong>
-                  <p>{aboutInfo?.version ?? "加载中…"}</p>
+            <div className="about-info-grid">
+              <section className="about-info-card">
+                <div className="setting-copy">
+                  <BadgeCheck size={18} />
+                  <div>
+                    <strong>应用版本</strong>
+                    <p>{aboutInfo?.version ?? "加载中…"}</p>
+                  </div>
                 </div>
-              </div>
-            </section>
+              </section>
 
-            <section className="setting-row">
-              <div className="setting-copy">
-                <LockKeyhole size={18} />
-                <div>
-                  <strong>构建模式</strong>
-                  <p>{IS_PUBLIC_BUILD ? "公开版" : "完全版"}</p>
+              <section className="about-info-card">
+                <div className="setting-copy">
+                  <LockKeyhole size={18} />
+                  <div>
+                    <strong>构建模式</strong>
+                    <p>{IS_PUBLIC_BUILD ? "公开版" : "完全版"}</p>
+                  </div>
                 </div>
-              </div>
-            </section>
+              </section>
 
-            <section className="setting-row">
-              <div className="setting-copy">
-                <Monitor size={18} />
-                <div>
-                  <strong>运行平台</strong>
-                  <p>{typeof navigator !== "undefined" ? navigator.platform || "—" : "—"}</p>
+              <section className="about-info-card">
+                <div className="setting-copy">
+                  <Monitor size={18} />
+                  <div>
+                    <strong>运行平台</strong>
+                    <p>{typeof navigator !== "undefined" ? navigator.platform || "—" : "—"}</p>
+                  </div>
                 </div>
-              </div>
-            </section>
+              </section>
 
-            <section className="setting-row">
-              <div className="setting-copy">
-                <Info size={18} />
-                <div>
-                  <strong>应用标识</strong>
-                  <p>cn.talentisan.super-ai</p>
+              <section className="about-info-card">
+                <div className="setting-copy">
+                  <Info size={18} />
+                  <div>
+                    <strong>应用标识</strong>
+                    <p>cn.talentisan.super-ai</p>
+                  </div>
                 </div>
-              </div>
-            </section>
+              </section>
+            </div>
 
             <p className="about-note">
               更多说明见{" "}
