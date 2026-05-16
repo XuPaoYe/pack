@@ -1662,7 +1662,6 @@ h2 {
 .settings-panel.modal-content,
 .api-config-panel.modal-content,
 .logs-panel.modal-content,
-.about-panel.modal-content,
 .export-panel.modal-content {
   width: 100%;
   max-width: 540px;
@@ -1681,7 +1680,6 @@ h2 {
 .settings-panel,
 .api-config-panel,
 .logs-panel,
-.about-panel,
 .export-panel {
   display: grid;
   align-content: start;
@@ -2129,7 +2127,6 @@ h2 {
   padding: 16px;
 }
 
-<<<<<<< HEAD
 .about-hero {
   display: flex;
   align-items: center;
@@ -2168,36 +2165,10 @@ h2 {
 
 .about-hero span {
   margin-top: 3px;
-=======
-.about-brand {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px;
-  border: 1px solid var(--modal-line);
-  border-radius: 12px;
-  background: var(--modal-soft, rgba(0, 0, 0, 0.02));
-}
-
-.about-brand img {
-  width: 40px;
-  height: 40px;
-  border-radius: 9px;
-}
-
-.about-brand strong {
-  display: block;
-  font-size: 14px;
-  margin-bottom: 2px;
-}
-
-.about-brand span {
->>>>>>> dev
   color: var(--text-soft);
   font-size: 12px;
 }
 
-<<<<<<< HEAD
 .about-meta {
   display: grid;
   gap: 8px;
@@ -2228,47 +2199,6 @@ h2 {
   font-variant-numeric: tabular-nums;
 }
 
-=======
-.about-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px 16px;
-  margin: 0;
-  padding: 4px 2px;
-}
-
-.about-grid > div {
-  display: grid;
-  gap: 2px;
-}
-
-.about-grid dt {
-  font-size: 11px;
-  color: var(--text-soft);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-}
-
-.about-grid dd {
-  margin: 0;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
-}
-
-.about-note {
-  margin: 0 2px;
-  color: var(--text-soft);
-  font-size: 12px;
-  line-height: 1.55;
-}
-
-.about-note a {
-  color: inherit;
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
->>>>>>> dev
 .export-body {
   display: grid;
   gap: 12px;

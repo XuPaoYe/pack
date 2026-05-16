@@ -1,11 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Super AI",
-<<<<<<< HEAD
   "version": "1.0.9",
-=======
-  "version": "1.1.6",
->>>>>>> dev
   "identifier": "cn.talentisan.super-ai",
   "build": {
     "frontendDist": "../dist",
@@ -62,14 +58,7 @@
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJGNEIzOUI2OTdCMUEzQ0MKUldUTW83R1h0amxMdjMrOGVkeGlzRS9Pc1F4NkhVekVPSjc3V0swUjlGcFpaWkRsWTAvRk5ZRWwK",
       "endpoints": [
         "https://ai.talentisan.cn/SuperAI/latest.json"
-<<<<<<< HEAD
       ]
-=======
-      ],
-      "windows": {
-        "installMode": "passive"
-      }
->>>>>>> dev
     }
   }
 }
