@@ -113,6 +113,55 @@ When adding screens, prefer:
 - If packaging is triggered from a branch instead of a tag, mention the source branch/ref in the final status and confirm the commit SHA that was built.
 - When fixing release workflow failures, keep changes scoped to CI/build scripts and do not remove target platforms as a workaround unless the user approves it.
 
+### 发版踩坑清单（必读，避免重复犯错）
+
+**1. release_version 输入必须真正贯穿整个 workflow**
+
+`@/.github/workflows/release.yml` 里 `tagName` / `releaseName` / `rewrite-latest-json` 三处都要用 `${{ inputs.release_version || github.ref_name }}`，**不能**只写 `github.ref_name`。否则从 `dev` 分支手动 dispatch 时，release 会错挂在 `dev` tag 上（产物文件名是 `Super.AI_1.1.6_*` 但 release title 显示 `Super AI dev`）。改 workflow 后**自己 grep 一遍** `github.ref_name` 确认没漏。
+
+**2. `run-name` 写复杂表达式会破坏 workflow YAML 解析**
+
+不要在 `run-name` 里塞 `format(...)`、嵌套三元、跨行字符串。GitHub 一旦无法解析 run-name，`workflow_dispatch` 触发器会被识别为"不存在"，dispatch 返回 `HTTP 422: Workflow does not have 'workflow_dispatch' trigger`。安全写法：
+
+```yaml
+run-name: "Release ${{ inputs.release_version || github.ref_name }}: ${{ inputs.release_note }}"
+```
+
+整行用双引号包，里面只用 `${{ }}` 插值，不调函数。
+
+**3. 4 个并行 build job 会撞车产生重复 draft release**
+
+`tauri-apps/tauri-action@v0` 在 `releaseDraft: true` 模式下，每个 matrix job 独立检查 release 是否存在；4 个 runner 几乎同时启动时，常出现两个先后撞进"不存在"分支各自创建 draft 的情况。表现：`gh release list` 看到两条相同 tag 的 Draft，每条只有部分 asset（如各 6 个，总和才是完整 11 个）。
+
+**修复方法（不要再让我猜，照做）**：
+
+```bash
+# 1. 列出重复
+gh api repos/XuPaoYe/pack/releases --jq '.[] | select(.tag_name=="v1.1.X") | {id, asset_count: (.assets|length), assets: [.assets[].name]}'
+
+# 2. 选 asset 数较多的为主（PRIMARY_ID），另一个为次（SECONDARY_ID）。
+# 3. 从次 release 下载主缺的 asset → 上传到主 release id → 删次 release。
+# 完整脚本模板：见 /tmp/merge_v116.sh 的实现方式（gh api 下载 + curl 上传 upload_url）。
+# 关键点：上传要用 release id 拼 upload_url，不能用 `gh release upload <tag>`
+# 因为 tag 重复时它选哪一个是未定义行为。
+```
+
+**根治方案（下次有空再做）**：把 workflow 拆成 prep + build 两段——单独一个 `create-release` job 先用 `gh release create v1.1.X --draft` 建好，4 个 build job `needs: create-release` 后只 upload 不 create。在那之前，每次发版后**主动 `gh release list` 检查是否撞车**，撞了就用上面流程合并。
+
+**4. git remote 名是 `github`，不是 `origin`**
+
+`git push origin dev` 会失败。统一用 `git push github dev`。
+
+**5. 发版后必查清单**
+
+```bash
+gh run view <runId> -R XuPaoYe/pack         # 4 个 job 都 ✓
+gh release list -R XuPaoYe/pack -L 3        # v1.1.X 只能有一个 Draft
+gh api repos/XuPaoYe/pack/releases/<id> --jq '.assets|length'  # 必须 = 11
+```
+
+11 个 asset 清单：`latest.json` + macOS arm64 dmg/.app.tar.gz/.sig + macOS x64 同三件 + Windows arm64 setup.exe/.sig + Windows x64 setup.exe/.sig。少一个都要补齐再发用户。
+
 ## Windsurf 本地 API 服务
 
 Super AI 暴露 OpenAI / Anthropic 兼容入口，外部 IDE 可通过 `Authorization: Bearer agt_wsf_*` 调用本机推理。架构：
