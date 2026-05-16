@@ -18,7 +18,7 @@ on:
         required: true
         type: string
 
-run-name: Release ${{ github.ref_name }}
+run-name: Release ${{ inputs.release_version || github.ref_name }}${{ inputs.release_note && format(': {0}', inputs.release_note) || '' }}
 
 permissions:
   contents: write  # 让 tauri-action 能创建 release 并上传产物
@@ -144,8 +144,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Super AI ${{ github.ref_name }}"
+          tagName: ${{ inputs.release_version || github.ref_name }}
+          releaseName: "Super AI ${{ inputs.release_version || github.ref_name }}"
           releaseBody: |
             See AGENTS.md / README for what's in this build.
 
@@ -172,8 +172,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Super AI ${{ github.ref_name }}"
+          tagName: ${{ inputs.release_version || github.ref_name }}
+          releaseName: "Super AI ${{ inputs.release_version || github.ref_name }}"
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
@@ -199,8 +199,9 @@ jobs:
           PUBLIC_BASE_URL: https://ai.talentisan.cn/SuperAI
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"        # 例如 v1.0.1
-          VERSION="${TAG#v}"              # 1.0.1
+          # workflow_dispatch 走 inputs；推 tag 触发走 GITHUB_REF_NAME
+          TAG="${{ inputs.release_version || github.ref_name }}"
+          VERSION="${TAG#v}"              # v1.0.1 -> 1.0.1
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern latest.json -O latest.json --clobber
           node scripts/rewrite-updater-json.mjs latest.json "$VERSION" "$PUBLIC_BASE_URL"
