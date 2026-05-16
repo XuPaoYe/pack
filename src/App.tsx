@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+<<<<<<< HEAD
 import { getVersion } from "@tauri-apps/api/app";
+=======
+import { getName, getVersion } from "@tauri-apps/api/app";
+>>>>>>> dev
 import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -928,10 +932,55 @@ function ApiServiceConfigPanel({
         )}
       </section>
 
+<<<<<<< HEAD
       <section className="api-config-row">
         <div className="api-config-copy">
           <strong>Codex 配置</strong>
           <p>把当前地址、密钥写入 ~/.codex/，或回滚到接管前的备份</p>
+=======
+    </div>
+  );
+}
+
+function NoticeToast({ notice, onClose }: { notice: Notice; onClose: () => void }) {
+  const config = noticeToneConfig[notice.tone];
+  const Icon = config.icon;
+
+  return (
+    <div className="toast" data-tone={notice.tone} role="status" aria-live="polite">
+      <Icon className="toast-icon" size={16} aria-hidden="true" />
+      <span className="toast-text">
+        <b>{config.label}</b>
+        {sanitizeUserFacingText(notice.text)}
+      </span>
+      <button onClick={onClose} aria-label="关闭提示">×</button>
+    </div>
+  );
+}
+
+function formatBytes(bytes: number) {
+  if (bytes <= 0) return "0 KB";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / 1024 ** index;
+  return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
+function clampApiServicePort(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(65535, Math.max(0, Math.trunc(value)));
+}
+
+function ForceUpdateModal({ state, onInstall }: { state: ForceUpdateState; onInstall: () => void }) {
+  const progressPercent = state.totalBytes ? Math.min(100, Math.round((state.downloadedBytes / state.totalBytes) * 100)) : 0;
+  const isWorking = state.phase === "downloading" || state.phase === "installing";
+
+  return (
+    <div className="modal-overlay force-update-overlay">
+      <aside className="force-update-panel modal-content" role="alertdialog" aria-modal="true" aria-labelledby="force-update-title">
+        <div className="force-update-icon">
+          <Download size={24} strokeWidth={2.1} />
+>>>>>>> dev
         </div>
         <div className="api-config-actions">
           <button
@@ -1008,6 +1057,10 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isLogsOpen, setIsLogsOpen] = useState(false);
   const [isAboutOpen, setIsAboutOpen] = useState(false);
+<<<<<<< HEAD
+=======
+  const [aboutInfo, setAboutInfo] = useState<{ name: string; version: string } | null>(null);
+>>>>>>> dev
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
@@ -1565,7 +1618,20 @@ function App() {
     setAppLogs((current) => pruneAppLogs(current));
     setIsLogsOpen(true);
   };
+<<<<<<< HEAD
   const handleAbout = () => {
+=======
+  const handleAbout = async () => {
+    if (!aboutInfo) {
+      try {
+        const [name, version] = await Promise.all([getName(), getVersion()]);
+        setAboutInfo({ name, version });
+      } catch (error) {
+        setAboutInfo({ name: "Super AI", version: "unknown" });
+        showNotice("error", `读取版本信息失败：${String(error)}`);
+      }
+    }
+>>>>>>> dev
     setIsAboutOpen(true);
   };
   const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
@@ -2579,7 +2645,7 @@ function App() {
                       value={settings.apiServicePort}
                       onChange={(event) => {
                         const next = Number(event.target.value);
-                        updateSetting("apiServicePort", Number.isFinite(next) ? next : 0);
+                        updateSetting("apiServicePort", clampApiServicePort(next));
                       }}
                     />
                   </label>
@@ -2604,6 +2670,50 @@ function App() {
                 </button>
               </section>
             </div>
+        </AppModal>
+      )}
+
+      {isAboutOpen && (
+        <AppModal
+          title="关于"
+          description="构建与运行环境信息"
+          closeLabel="关闭关于"
+          className="about-panel"
+          onClose={() => setIsAboutOpen(false)}
+        >
+          <div className="about-body">
+            <div className="about-brand">
+              <img src={logoUrl} alt="" />
+              <div>
+                <strong>{aboutInfo?.name ?? "Super AI"}</strong>
+                <span>本地 Codex / Gemini / SuperAI 账号管理</span>
+              </div>
+            </div>
+            <dl className="about-grid">
+              <div>
+                <dt>应用版本</dt>
+                <dd>{aboutInfo?.version ?? "加载中…"}</dd>
+              </div>
+              <div>
+                <dt>构建模式</dt>
+                <dd>{IS_PUBLIC_BUILD ? "正式版" : "完全版"}</dd>
+              </div>
+              <div>
+                <dt>运行平台</dt>
+                <dd>{typeof navigator !== "undefined" ? navigator.platform || "—" : "—"}</dd>
+              </div>
+              <div>
+                <dt>应用标识</dt>
+                <dd>cn.talentisan.super-ai</dd>
+              </div>
+            </dl>
+            <p className="about-note">
+              更多说明见
+              {" "}
+              <a href="https://ai.talentisan.cn/" onClick={handleOpenStore}>ai.talentisan.cn</a>
+              。所有账号凭证仅保存在本机。
+            </p>
+          </div>
         </AppModal>
       )}
 

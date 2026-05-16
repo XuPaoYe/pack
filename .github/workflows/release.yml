@@ -18,7 +18,11 @@ on:
         required: true
         type: string
 
+<<<<<<< HEAD
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('Release {0}: {1}', inputs.release_version, inputs.release_note) || format('Release {0}', github.ref_name) }}
+=======
+run-name: "Release ${{ inputs.release_version || github.ref_name }}: ${{ inputs.release_note }}"
+>>>>>>> dev
 
 permissions:
   contents: write  # 让 tauri-action 能创建 release 并上传产物
@@ -52,8 +56,11 @@ jobs:
             sidecar_target: windows-x64
             rust_targets: x86_64-pc-windows-msvc
             bundles: nsis
+<<<<<<< HEAD
           # bun 1.2.x 不支持 windows-arm64 交叉编译，1.3.x cross-compile runtime 又损坏。
           # 用 windows-11-arm 原生 ARM64 runner，bun 直接当原生编译，零交叉问题。
+=======
+>>>>>>> dev
           - name: Windows arm64
             os: windows-11-arm
             tauri_target: aarch64-pc-windows-msvc
@@ -146,8 +153,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Super AI ${{ github.ref_name }}"
+          tagName: ${{ inputs.release_version || github.ref_name }}
+          releaseName: "Super AI ${{ inputs.release_version || github.ref_name }}"
           releaseBody: |
             See AGENTS.md / README for what's in this build.
 
@@ -174,8 +181,13 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
+<<<<<<< HEAD
           tagName: ${{ github.ref_name }}
           releaseName: "Super AI ${{ github.ref_name }}"
+=======
+          tagName: ${{ inputs.release_version || github.ref_name }}
+          releaseName: "Super AI ${{ inputs.release_version || github.ref_name }}"
+>>>>>>> dev
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
@@ -201,8 +213,14 @@ jobs:
           PUBLIC_BASE_URL: https://ai.talentisan.cn/SuperAI
         run: |
           set -euo pipefail
+<<<<<<< HEAD
           TAG="${GITHUB_REF_NAME}"        # 例如 v1.0.1
           VERSION="${TAG#v}"              # 1.0.1
+=======
+          # workflow_dispatch 走 inputs；推 tag 触发走 GITHUB_REF_NAME
+          TAG="${{ inputs.release_version || github.ref_name }}"
+          VERSION="${TAG#v}"              # v1.0.1 -> 1.0.1
+>>>>>>> dev
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern latest.json -O latest.json --clobber
           node scripts/rewrite-updater-json.mjs latest.json "$VERSION" "$PUBLIC_BASE_URL"
