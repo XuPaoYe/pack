@@ -71,11 +71,9 @@ const WINDSURF_USER_STATUS_PATH: &str =
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
 const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.5";
-const LEGACY_SUPERAI_AES_KEY_HEX: &str =
+const SUPERAI_AES_KEY_HEX: &str =
     "b9c1e79783adb25cdb3667ae62c168e18868438d62a47428abeb7b41491ff2ee";
-const LEGACY_SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
-const SUPERAI_DATA_KEY_FILE: &str = "super_ai.key";
-static SUPERAI_DATA_KEY: LazyLock<Mutex<Option<[u8; 32]>>> = LazyLock::new(|| Mutex::new(None));
+const SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
 
 fn is_public_build() -> bool {
     option_env!("VITE_SUPERAI_PUBLIC_BUILD") == Some("1")
@@ -381,60 +379,7 @@ fn app_db_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(data_dir.join("super_ai.sqlite"))
 }
 
-fn superai_data_key_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("读取应用数据目录失败: {error}"))?;
-    fs::create_dir_all(&data_dir)
-        .map_err(|error| format!("创建应用数据目录失败 {}: {error}", data_dir.display()))?;
-    Ok(data_dir.join(SUPERAI_DATA_KEY_FILE))
-}
-
-fn ensure_superai_data_key(app: &tauri::AppHandle) -> Result<(), String> {
-    if SUPERAI_DATA_KEY
-        .lock()
-        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    let path = superai_data_key_path(app)?;
-    let key = if path.exists() {
-        let raw = read_to_string(&path)?;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(raw.trim())
-            .or_else(|_| hex::decode(raw.trim()))
-            .map_err(|error| format!("读取 SuperAI 数据密钥失败 {}: {error}", path.display()))?;
-        decoded
-            .try_into()
-            .map_err(|_| "SuperAI 数据密钥长度必须为 32 字节".to_string())?
-    } else {
-        let key: [u8; 32] = rand::random();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(key);
-        write_string_atomic(&path, &encoded)?;
-        key
-    };
-
-    let mut cache = SUPERAI_DATA_KEY
-        .lock()
-        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?;
-    *cache = Some(key);
-    Ok(())
-}
-
-fn superai_data_key() -> Result<[u8; 32], String> {
-    SUPERAI_DATA_KEY
-        .lock()
-        .map_err(|_| "SuperAI 数据密钥锁失败".to_string())?
-        .as_ref()
-        .copied()
-        .ok_or_else(|| "SuperAI 数据密钥尚未初始化".to_string())
-}
-
 fn open_app_db(app: &tauri::AppHandle) -> Result<Connection, String> {
-    ensure_superai_data_key(app)?;
     let path = app_db_path(app)?;
     let conn = Connection::open(&path)
         .map_err(|error| format!("打开 SQLite 数据库失败 {}: {error}", path.display()))?;
@@ -721,12 +666,7 @@ fn parse_stored_account_json(account_json: &str) -> Result<ManagedAccount, Strin
             .get("payload")
             .and_then(Value::as_str)
             .ok_or_else(|| "SuperAI 加密账号记录缺少 payload".to_string())?;
-        let decrypted = value
-            .get("iv")
-            .and_then(Value::as_str)
-            .map(|iv| superai_decrypt_text(payload, iv))
-            .unwrap_or_else(|| Err("SuperAI 加密账号记录缺少 iv".to_string()))
-            .or_else(|_| superai_decrypt_text_legacy(payload))?;
+        let decrypted = superai_decrypt_text(payload)?;
         serde_json::from_str::<ManagedAccount>(&decrypted)
             .map_err(|error| format!("解析 SuperAI 加密账号记录失败: {error}"))
     } else {
@@ -984,14 +924,12 @@ fn serialize_account_for_storage(account: &ManagedAccount) -> Result<String, Str
     if account.provider != "windsurf" {
         return Ok(account_json);
     }
-    let (encrypted, iv) = superai_encrypt_text(&account_json)?;
+    let encrypted = superai_encrypt_text(&account_json)?;
     // wrapper 里只是个路由标识，跟解密后的内部 provider 解耦。用 "superai"
     // 让用户即使绕过外层 AES 看到 wrapper JSON，也不会看到协议代号。
     let wrapper = serde_json::json!({
         "encrypted": true,
         "provider": "superai",
-        "keyVersion": 2,
-        "iv": iv,
         "payload": encrypted,
     });
     serde_json::to_string(&wrapper).map_err(|error| format!("序列化 SuperAI 加密账号失败: {error}"))
@@ -1162,11 +1100,11 @@ fn apply_windsurf_license_expiry(account: &mut ManagedAccount) {
     }
 }
 
-fn legacy_superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
-    let key = hex::decode(LEGACY_SUPERAI_AES_KEY_HEX)
-        .map_err(|error| format!("解析旧版 SuperAI AES key 失败: {error}"))?;
-    let iv = hex::decode(LEGACY_SUPERAI_AES_IV_HEX)
-        .map_err(|error| format!("解析旧版 SuperAI AES iv 失败: {error}"))?;
+fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
+    let key = hex::decode(SUPERAI_AES_KEY_HEX)
+        .map_err(|error| format!("解析 SuperAI AES key 失败: {error}"))?;
+    let iv = hex::decode(SUPERAI_AES_IV_HEX)
+        .map_err(|error| format!("解析 SuperAI AES iv 失败: {error}"))?;
     let key: [u8; 32] = key
         .try_into()
         .map_err(|_| "SuperAI AES key 长度必须为 32 字节".to_string())?;
@@ -1176,28 +1114,17 @@ fn legacy_superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
     Ok((key, iv))
 }
 
-fn superai_encrypt_text(plain: &str) -> Result<(String, String), String> {
+fn superai_encrypt_text(plain: &str) -> Result<String, String> {
     type Aes256CbcEnc = cbc::Encryptor<Aes256>;
-    let key = superai_data_key()?;
-    let iv: [u8; 16] = rand::random();
+    let (key, iv) = superai_aes_key_iv()?;
     let encrypted = Aes256CbcEnc::new(&key.into(), &iv.into())
         .encrypt_padded_vec_mut::<Pkcs7>(plain.as_bytes());
-    Ok((
-        base64::engine::general_purpose::STANDARD.encode(encrypted),
-        base64::engine::general_purpose::STANDARD.encode(iv),
-    ))
+    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
 }
 
-fn superai_decrypt_text(cipher_text: &str, iv_text: &str) -> Result<String, String> {
+fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
     type Aes256CbcDec = cbc::Decryptor<Aes256>;
-    let key = superai_data_key()?;
-    let iv = base64::engine::general_purpose::STANDARD
-        .decode(iv_text.trim())
-        .or_else(|_| URL_SAFE_NO_PAD.decode(iv_text.trim()))
-        .map_err(|_| "SuperAI AES IV 不是有效 base64".to_string())?;
-    let iv: [u8; 16] = iv
-        .try_into()
-        .map_err(|_| "SuperAI AES IV 长度必须为 16 字节".to_string())?;
+    let (key, iv) = superai_aes_key_iv()?;
     let raw = cipher_text.trim();
     let encrypted = base64::engine::general_purpose::STANDARD
         .decode(raw)
@@ -1207,36 +1134,6 @@ fn superai_decrypt_text(cipher_text: &str, iv_text: &str) -> Result<String, Stri
         .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
         .map_err(|_| "AES 解密失败或 PKCS#7 填充无效".to_string())?;
     String::from_utf8(decrypted).map_err(|_| "AES 明文不是有效 UTF-8".to_string())
-}
-
-fn superai_decrypt_text_legacy(cipher_text: &str) -> Result<String, String> {
-    type Aes256CbcDec = cbc::Decryptor<Aes256>;
-    let (key, iv) = legacy_superai_aes_key_iv()?;
-    let raw = cipher_text.trim();
-    let encrypted = base64::engine::general_purpose::STANDARD
-        .decode(raw)
-        .or_else(|_| URL_SAFE_NO_PAD.decode(raw))
-        .map_err(|_| "AES 密文不是有效 base64".to_string())?;
-    let decrypted = Aes256CbcDec::new(&key.into(), &iv.into())
-        .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
-        .map_err(|_| "旧版 AES 解密失败或 PKCS#7 填充无效".to_string())?;
-    String::from_utf8(decrypted).map_err(|_| "AES 明文不是有效 UTF-8".to_string())
-}
-
-fn encode_portable_superai_cipher(plain: &str) -> Result<String, String> {
-    let (cipher, iv) = superai_encrypt_text(plain)?;
-    Ok(format!("sa2.{iv}.{cipher}"))
-}
-
-fn decode_portable_superai_cipher(text: &str) -> Result<String, String> {
-    let trimmed = text.trim();
-    if let Some(rest) = trimmed.strip_prefix("sa2.") {
-        let (iv, cipher) = rest
-            .split_once('.')
-            .ok_or_else(|| "SuperAI 密钥缺少 iv 或 payload".to_string())?;
-        return superai_decrypt_text(cipher, iv);
-    }
-    superai_decrypt_text_legacy(trimmed)
 }
 
 fn bool_field(value: Option<&Value>) -> Option<bool> {
@@ -3471,7 +3368,7 @@ fn parse_windsurf_batch_key_line(line: &str) -> Result<WindsurfBatchCredential, 
     let candidates = [
         trimmed.to_string(),
         decode_batch_key_text(trimmed).unwrap_or_default(),
-        decode_portable_superai_cipher(trimmed).unwrap_or_default(),
+        superai_decrypt_text(trimmed).unwrap_or_default(),
     ];
     for candidate in candidates.iter().filter(|value| !value.trim().is_empty()) {
         if let Ok(value) = serde_json::from_str::<Value>(candidate) {
@@ -3943,7 +3840,7 @@ fn stash_public_usage_history(app: &tauri::AppHandle, account: &ManagedAccount) 
     };
     // 用与 windsurf 账号正文同一把 AES key 加密落库。明文 snapshot 含 baseline /
     // consumed / last_remote 等本地用量信息，不希望用户直接打开 sqlite 就能改。
-    let cipher_text = match encode_portable_superai_cipher(&snapshot_json) {
+    let cipher_text = match superai_encrypt_text(&snapshot_json) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("[usage-history] 加密失败: {error}");
@@ -4010,7 +3907,7 @@ fn restore_public_usage_history(
         return false;
     }
     // snapshot 在 stash 时用 AES 加密；解密失败视为脏数据丢弃。
-    let snapshot_json = match decode_portable_superai_cipher(&cipher_text) {
+    let snapshot_json = match superai_decrypt_text(&cipher_text) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("[usage-history] 解密失败: {error}");
@@ -4077,7 +3974,7 @@ fn public_windsurf_export_key(account: &ManagedAccount) -> Result<String, String
         "password": credential.password,
         "expires_at": expires_at,
     });
-    encode_portable_superai_cipher(&payload.to_string())
+    superai_encrypt_text(&payload.to_string())
 }
 
 #[tauri::command]
