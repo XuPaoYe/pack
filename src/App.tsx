@@ -250,6 +250,17 @@ function accountDisplayLabel(account: ManagedAccount) {
   return shouldHideAccountDetails(account) ? publicAccountCode(account, "SUPERAI") : account.email;
 }
 
+function activationSuccessMessage(account: ManagedAccount) {
+  const label = accountDisplayLabel(account);
+  if (account.provider === "codex") {
+    return `已启用 ${label}，请重启 Codex 相关产品`;
+  }
+  if (account.provider === "gemini") {
+    return `已启用 ${label}，请重启 Gemini 相关产品`;
+  }
+  return `已启用 ${label}`;
+}
+
 function sortAccountsForView(items: ManagedAccount[]) {
   return [...items].sort((a, b) => {
     const currentDelta = Number(isCurrentAccount(b)) - Number(isCurrentAccount(a));
@@ -1576,7 +1587,7 @@ function App() {
         sortAccountsForView(current.map((item) => providerAccounts.find((changed) => changed.id === item.id) ?? item)),
       );
       setAccountPage(1);
-      showNotice("success", `已启用 ${accountDisplayLabel(account)}`);
+      showNotice("success", activationSuccessMessage(account));
     } catch (error) {
       showNotice("error", `启用账号失败：${String(error)}`);
     } finally {

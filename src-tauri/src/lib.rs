@@ -493,7 +493,7 @@ fn set_account_current_state(
     }
 
     for account in &accounts {
-        upsert_account(conn, account)?;
+        persist_existing_account_exact(conn, account)?;
     }
 
     Ok(accounts
@@ -516,6 +516,46 @@ fn read_accounts_from_conn(conn: &Connection) -> Result<Vec<ManagedAccount>, Str
         accounts.push(account);
     }
     Ok(accounts)
+}
+
+fn persist_existing_account_exact(conn: &Connection, account: &ManagedAccount) -> Result<(), String> {
+    let account_json = serialize_account_for_storage(account)?;
+    let stored_email = if account.provider == "windsurf" {
+        account.id.clone()
+    } else {
+        account.email.clone()
+    };
+    let stored_display_name = if account.provider == "windsurf" {
+        None
+    } else {
+        account.display_name.clone()
+    };
+    let stored_provider = redact_provider_to_storage(&account.provider);
+    let updated = conn
+        .execute(
+            r#"
+            UPDATE accounts
+            SET provider = ?1,
+                email = ?2,
+                display_name = ?3,
+                account_json = ?4,
+                updated_at = ?5
+            WHERE id = ?6
+            "#,
+            params![
+                stored_provider,
+                stored_email,
+                stored_display_name,
+                account_json,
+                account.updated_at,
+                account.id
+            ],
+        )
+        .map_err(|error| format!("写入账号 SQLite 失败: {error}"))?;
+    if updated == 0 {
+        return Err(format!("账号不存在或写回失败: {}", account.id));
+    }
+    Ok(())
 }
 
 /// 扫一遍 DB，把所有 license_expires_at 已过期的 SuperAI 账号 DELETE 掉。
@@ -5859,6 +5899,18 @@ fn activate_windsurf_account_for_api(
     }
 }
 
+fn sync_windsurf_current_account_by_email(
+    conn: &Connection,
+    email: &str,
+) -> Result<Vec<ManagedAccount>, String> {
+    let Some(account) = read_accounts_from_conn(conn)?.into_iter().find(|account| {
+        account.provider == "windsurf" && account.email.eq_ignore_ascii_case(email)
+    }) else {
+        return Ok(Vec::new());
+    };
+    set_account_current_state(conn, "windsurf", &account.id)
+}
+
 #[tauri::command]
 fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
     let Some(email) = api_service::last_used_account_email() else {
@@ -5874,13 +5926,7 @@ fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedA
         return Ok(Vec::new());
     }
     let conn = open_app_db(&app)?;
-    let Some(account) = read_accounts_from_conn(&conn)?.into_iter().find(|account| {
-        account.provider == "windsurf" && account.email.eq_ignore_ascii_case(&email)
-    }) else {
-        return Ok(Vec::new());
-    };
-    let result =
-        set_account_current_state(&conn, "windsurf", &account.id).map(accounts_for_frontend)?;
+    let result = sync_windsurf_current_account_by_email(&conn, &email).map(accounts_for_frontend)?;
     api_service::record_synced_active_email(email.to_ascii_lowercase());
     Ok(result)
 }
@@ -7034,6 +7080,43 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    fn test_account(id: &str, provider: &str, email: &str, updated_at: i64) -> ManagedAccount {
+        ManagedAccount {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            email: email.to_string(),
+            display_name: None,
+            account_name: None,
+            organization_id: None,
+            plan: None,
+            plan_type: None,
+            auth_file_plan_type: None,
+            subscription_active_until: None,
+            account_id: None,
+            user_id: None,
+            source: "test".to_string(),
+            token_meta: TokenMeta {
+                has_access_token: true,
+                has_refresh_token: true,
+                has_id_token: false,
+                expires_at: None,
+            },
+            status: Some(AccountStatus {
+                state: "available".to_string(),
+                label: "当前".to_string(),
+                reason: None,
+                updated_at: Some(updated_at),
+            }),
+            quota: None,
+            created_at: updated_at,
+            updated_at,
+            auth_payload: Some(serde_json::json!({
+                "access_token": format!("token-{id}"),
+                "refresh_token": format!("refresh-{id}")
+            })),
+        }
+    }
+
     #[test]
     fn plan_status_proto_quota_tags_keep_daily_and_weekly_distinct() {
         let field_map: HashMap<&str, &str> =
@@ -7049,5 +7132,101 @@ mod tests {
         );
         assert_eq!(field_map.get("daily_quota_reset_at_unix"), Some(&"int_18"));
         assert_eq!(field_map.get("weekly_quota_reset_at_unix"), Some(&"int_17"));
+    }
+
+    #[test]
+    fn set_account_current_state_keeps_only_one_current_account_per_provider() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        init_app_db(&conn).expect("init db");
+
+        let older = test_account("gemini-a", "gemini", "a@example.com", 10);
+        let newer = test_account("gemini-b", "gemini", "b@example.com", 20);
+        upsert_account(&conn, &older).expect("insert older");
+        upsert_account(&conn, &newer).expect("insert newer");
+
+        let changed =
+            set_account_current_state(&conn, "gemini", "gemini-a").expect("switch current account");
+        let current_ids = changed
+            .iter()
+            .filter(|account| is_current_status(&account.status))
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(current_ids, vec!["gemini-a"]);
+
+        let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");
+        let persisted_current_ids = all_accounts
+            .iter()
+            .filter(|account| account.provider == "gemini" && is_current_status(&account.status))
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_current_ids, vec!["gemini-a"]);
+
+        let available_ids = all_accounts
+            .iter()
+            .filter(|account| account.provider == "gemini")
+            .filter(|account| account.status.as_ref().is_some_and(|status| status.label == "可用"))
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(available_ids, vec!["gemini-b"]);
+    }
+
+    #[test]
+    fn sync_windsurf_current_account_by_email_keeps_only_one_current_account() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        init_app_db(&conn).expect("init db");
+
+        let older = test_account("superai-a", "windsurf", "a@example.com", 10);
+        let newer = test_account("superai-b", "windsurf", "b@example.com", 20);
+        upsert_account(&conn, &older).expect("insert older");
+        upsert_account(&conn, &newer).expect("insert newer");
+
+        let changed = sync_windsurf_current_account_by_email(&conn, "a@example.com")
+            .expect("sync active account by email");
+        let current_ids = changed
+            .iter()
+            .filter(|account| is_current_status(&account.status))
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(current_ids, vec!["superai-a"]);
+
+        let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");
+        let persisted_current_ids = all_accounts
+            .iter()
+            .filter(|account| account.provider == "windsurf" && is_current_status(&account.status))
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_current_ids, vec!["superai-a"]);
+    }
+
+    #[test]
+    fn sync_windsurf_current_account_by_email_noops_for_unknown_email() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        init_app_db(&conn).expect("init db");
+
+        let current = test_account("superai-a", "windsurf", "a@example.com", 10);
+        let available = ManagedAccount {
+            status: Some(AccountStatus {
+                state: "available".to_string(),
+                label: "可用".to_string(),
+                reason: None,
+                updated_at: Some(20),
+            }),
+            updated_at: 20,
+            ..test_account("superai-b", "windsurf", "b@example.com", 20)
+        };
+        upsert_account(&conn, &current).expect("insert current");
+        upsert_account(&conn, &available).expect("insert available");
+
+        let changed = sync_windsurf_current_account_by_email(&conn, "missing@example.com")
+            .expect("sync unknown email");
+        assert!(changed.is_empty());
+
+        let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");
+        let persisted_current_ids = all_accounts
+            .iter()
+            .filter(|account| account.provider == "windsurf" && is_current_status(&account.status))
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_current_ids, vec!["superai-a"]);
     }
 }
