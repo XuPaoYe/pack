@@ -15,6 +15,7 @@
         "title": "Super AI",
         "width": 1320,
         "height": 740,
+        "visible": false,
         "minWidth": 1320,
         "minHeight": 740,
         "center": true,

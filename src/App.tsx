@@ -219,7 +219,13 @@ function loadAppLogs() {
 
 function stateLabel(state: AccountState) {
   if (state === "available") return "可用";
+  if (state === "warning") return "告警";
+  if (state === "unknown") return "未知";
   return "不可用";
+}
+
+function isUsageExhausted(account: ManagedAccount) {
+  return account.status?.label === "已耗尽" || account.status?.reason === "本地累计额度已用满";
 }
 
 function isCurrentAccount(account: ManagedAccount) {
@@ -283,9 +289,10 @@ function sortAccountsForView(items: ManagedAccount[]) {
 function AccountStateCorner({ account }: { account: ManagedAccount }) {
   const status = account.status ?? fallbackStatus(account);
   const isCurrent = isCurrentAccount(account);
+  const exhausted = isUsageExhausted(account);
   return (
-    <span className={clsx("state-corner", status.state, isCurrent && "current")} title={shouldHideAccountDetails(account) ? undefined : isCurrent ? "当前启用账号" : (status.reason ?? stateLabel(status.state))}>
-      {isCurrent ? "启用" : stateLabel(status.state)}
+    <span className={clsx("state-corner", exhausted ? "unavailable" : status.state, isCurrent && "current")} title={shouldHideAccountDetails(account) ? undefined : isCurrent ? "当前启用账号" : (status.reason ?? stateLabel(status.state))}>
+      {isCurrent ? "启用" : status.label || stateLabel(status.state)}
     </span>
   );
 }
@@ -309,6 +316,7 @@ function localizeQuotaLabel(label: string): string {
 
 function QuotaMeters({ account }: { account: ManagedAccount }) {
   const isUnavailable = account.status?.state === "unavailable";
+  const exhausted = isUsageExhausted(account);
   const rawMetrics =
     account.quota?.metrics?.length
       ? account.quota.metrics
@@ -335,9 +343,9 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
     <div className="quota-meters">
       {metrics.slice(0, 3).map((metric) => {
         const remaining = metric.remainingPercent;
-        const state = isUnavailable ? "unavailable" : (metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available"));
+        const state = isUnavailable || exhausted ? "unavailable" : (metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available"));
         const shouldHideReset = shouldHideAccountDetails(account);
-        const resetText = shouldHideReset ? "" : isUnavailable ? "--" : (formatResetTime(metric.resetAt) ?? "--");
+        const resetText = shouldHideReset ? "" : isUnavailable || exhausted ? "--" : (formatResetTime(metric.resetAt) ?? "--");
         const meterTitle = shouldHideAccountDetails(account) ? localizeQuotaLabel(metric.label) : metric.detail ?? account.quota?.error ?? metric.label;
         return (
           <div className={clsx("quota-meter", state)} key={metric.key} title={meterTitle}>
@@ -1587,7 +1595,7 @@ function App() {
   };
   const handleToggleAccount = async (account: ManagedAccount) => {
     if (isCurrentAccount(account)) return;
-    if ((account.status ?? fallbackStatus(account)).state === "unavailable") return;
+    if ((account.status ?? fallbackStatus(account)).state === "unavailable" || isUsageExhausted(account)) return;
     if (switchingAccountId) return;
     setSwitchingAccountId(account.id);
     try {
@@ -2293,7 +2301,8 @@ function App() {
                           disabled={
                             isCurrentAccount(account) ||
                             switchingAccountId !== null ||
-                            (account.status ?? fallbackStatus(account)).state === "unavailable"
+                            (account.status ?? fallbackStatus(account)).state === "unavailable" ||
+                            isUsageExhausted(account)
                           }
                         >
                           <BadgeCheck

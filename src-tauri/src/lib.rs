@@ -3785,9 +3785,10 @@ fn bump_public_usage(account: &mut ManagedAccount) -> (bool, i64) {
                 Value::Number(now.into()),
             );
         }
-        // 每次 refresh 都覆盖 status，避免被后续 apply_windsurf_plan_status 改回"可用"。
+        // 每次 refresh 都覆盖 status，但“已耗尽”不是账号坏掉：账号本身仍有效，
+        // 这里只把状态语义改成“可用但额度耗尽”，避免前端把它误渲染成“不可用”。
         account.status = Some(AccountStatus {
-            state: "unavailable".to_string(),
+            state: "available".to_string(),
             label: "已耗尽".to_string(),
             reason: Some("本地累计额度已用满".to_string()),
             updated_at: Some(now),
@@ -7122,7 +7123,10 @@ pub fn run() {
         })
         .setup(|app| {
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(ActivationPolicy::Accessory);
+            {
+                app.set_activation_policy(ActivationPolicy::Accessory);
+                let _ = app.set_dock_visibility(false);
+            }
 
             let tray_menu = Menu::with_items(
                 app,
@@ -7175,6 +7179,8 @@ pub fn run() {
                 window.set_resizable(false)?;
                 window.set_min_size(Some(app_size))?;
                 window.set_size(app_size)?;
+                #[cfg(target_os = "macos")]
+                window.hide()?;
             }
 
             if cfg!(debug_assertions) {
