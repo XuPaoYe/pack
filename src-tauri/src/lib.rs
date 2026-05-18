@@ -86,12 +86,15 @@ fn is_public_build() -> bool {
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = app.set_activation_policy(ActivationPolicy::Accessory);
+        let _ = app.set_dock_visibility(false);
+    }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
-        #[cfg(target_os = "macos")]
-        let _ = app.show();
     }
 }
 
