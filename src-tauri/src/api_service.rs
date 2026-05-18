@@ -132,6 +132,8 @@ static LAST_USED_ACCOUNT_EMAIL: LazyLock<Mutex<Option<String>>> =
 /// 调到 3s 也几乎零开销。start/stop 时清空，避免跨服务生命周期串号。
 static LAST_SYNCED_ACTIVE_EMAIL: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
+static LAST_USED_ACCOUNT_PROBE_AT: LazyLock<Mutex<Option<Instant>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Runtime>> {
     RUNTIME.lock().expect("SuperAI API 运行态锁失败")
@@ -173,6 +175,23 @@ pub fn clear_synced_active_email() {
     if let Ok(mut current) = LAST_USED_ACCOUNT_EMAIL.lock() {
         *current = None;
     }
+    if let Ok(mut current) = LAST_USED_ACCOUNT_PROBE_AT.lock() {
+        *current = None;
+    }
+}
+
+fn should_probe_last_used_account() -> bool {
+    let Ok(mut last_probe) = LAST_USED_ACCOUNT_PROBE_AT.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    if last_probe
+        .is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(10))
+    {
+        return false;
+    }
+    *last_probe = Some(now);
+    true
 }
 
 /// 生成形如 `agt_superai_xxxxxxxxxxxxxxxx` 的密钥。
@@ -929,13 +948,30 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
 
     // 2) 删除 sidecar 多出来的
     let mut removed = 0usize;
+    let mut failed_to_remove: Vec<Value> = Vec::new();
     for (email, id) in &existing {
         if !desired_emails.contains(email) {
-            let _ = client
+            match client
                 .delete(format!("{}/auth/accounts/{}", target.base_url, id))
                 .header("Authorization", format!("Bearer {}", target.inner_key))
-                .send();
-            removed += 1;
+                .send()
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    removed += 1;
+                }
+                Ok(resp) => {
+                    failed_to_remove.push(json!({
+                        "email": email,
+                        "status": resp.status().as_u16(),
+                    }));
+                }
+                Err(error) => {
+                    failed_to_remove.push(json!({
+                        "email": email,
+                        "error": error.to_string(),
+                    }));
+                }
+            }
         }
     }
 
@@ -978,6 +1014,7 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
     Ok(json!({
         "added": add_count,
         "removed": removed,
+        "failedToRemove": failed_to_remove,
         "kept": existing.len().saturating_sub(removed),
         "refresh": refresh,
     }))
@@ -1361,7 +1398,26 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
                 &passthrough_headers,
                 body.clone(),
             ) {
-                Ok(retried) => upstream_resp = retried,
+                Ok(retried) => {
+                    if retried.status().as_u16() == first_status {
+                        let retried_headers = response_headers(&retried, forced_model.as_deref());
+                        let retried_body = retried
+                            .bytes()
+                            .map(|bytes| bytes.to_vec())
+                            .unwrap_or_default();
+                        let response = Response::new(
+                            StatusCode(first_status),
+                            retried_headers,
+                            Cursor::new(retried_body),
+                            None,
+                            None,
+                        );
+                        let _ = request.respond(response);
+                        return;
+                    } else {
+                        upstream_resp = retried;
+                    }
+                }
                 Err(error) => {
                     let _ = request.respond(json_response(
                         502,
@@ -1389,7 +1445,8 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
     if matches!(
         path,
         "/v1/chat/completions" | "/v1/messages" | "/v1/responses"
-    ) {
+    ) && should_probe_last_used_account()
+    {
         let target_for_probe = target.clone();
         let _ = thread::Builder::new()
             .name("superai-api-last-used".into())

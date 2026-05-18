@@ -4117,6 +4117,44 @@ fn codex_access_token(account: &ManagedAccount) -> Option<String> {
     )
 }
 
+fn codex_refresh_token(account: &ManagedAccount) -> Option<String> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    let tokens = payload.get("tokens").and_then(Value::as_object);
+    string_field(
+        tokens
+            .and_then(|t| t.get("refresh_token"))
+            .or_else(|| payload.get("refresh_token")),
+    )
+}
+
+fn codex_set_token_field(account: &mut ManagedAccount, key: &str, value: Value) {
+    let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    if let Some(tokens) = payload.get_mut("tokens").and_then(Value::as_object_mut) {
+        tokens.insert(key.to_string(), value);
+    } else {
+        payload.insert(key.to_string(), value);
+    }
+}
+
+fn codex_api_headers(access_token: &str, account_id: &str) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {access_token}"))
+            .map_err(|error| format!("构建 Authorization 头失败: {error}"))?,
+    );
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(USER_AGENT, HeaderValue::from_static(CODEX_API_USER_AGENT));
+    headers.insert(
+        "ChatGPT-Account-Id",
+        HeaderValue::from_str(account_id)
+            .map_err(|error| format!("构建 ChatGPT-Account-Id 头失败: {error}"))?,
+    );
+    Ok(headers)
+}
+
 fn codex_subscription_until_from_payload(account: &ManagedAccount) -> Option<Value> {
     let payload = account.auth_payload.as_ref()?.as_object()?;
     payload
@@ -4136,6 +4174,66 @@ fn codex_subscription_until_from_payload(account: &ManagedAccount) -> Option<Val
                 .and_then(|auth| auth.get("chatgpt_subscription_active_until"))
                 .cloned()
         })
+}
+
+async fn refresh_codex_access_token(account: &mut ManagedAccount) -> Result<String, String> {
+    let refresh_token =
+        codex_refresh_token(account).ok_or_else(|| "缺少 Codex refresh_token".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Codex OAuth 客户端失败: {error}"))?;
+    let response = client
+        .post(CODEX_OAUTH_TOKEN_URL)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token.as_str()),
+            ("client_id", CODEX_OAUTH_CLIENT_ID),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("Codex token 刷新请求失败: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("读取 Codex token 刷新响应失败: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "Codex token 刷新失败: status={status}, body_len={}",
+            body.len()
+        ));
+    }
+    let token_response: OAuthTokenResponse = serde_json::from_str(&body)
+        .map_err(|error| format!("解析 Codex token 刷新响应失败: {error}"))?;
+    if let Some(error) = token_response.error {
+        return Err(format!(
+            "Codex token 刷新失败: {}",
+            token_response.error_description.unwrap_or(error)
+        ));
+    }
+    let access_token = token_response
+        .access_token
+        .ok_or_else(|| "Codex token 刷新响应缺少 access_token".to_string())?;
+    codex_set_token_field(account, "access_token", Value::String(access_token.clone()));
+    let refreshed_has_id_token = token_response.id_token.is_some();
+    if let Some(id_token) = token_response.id_token {
+        codex_set_token_field(account, "id_token", Value::String(id_token.clone()));
+        if let Some(jwt) = parse_jwt_payload(&id_token) {
+            if let Some(exp) = number_field(jwt.get("exp")) {
+                account.token_meta.expires_at = Some(exp);
+            }
+        }
+    }
+    if let Some(refresh_token) = token_response.refresh_token {
+        codex_set_token_field(account, "refresh_token", Value::String(refresh_token));
+    }
+    account.token_meta.has_access_token = true;
+    account.token_meta.has_refresh_token = true;
+    if refreshed_has_id_token {
+        account.token_meta.has_id_token = true;
+    }
+    Ok(access_token)
 }
 
 fn parse_codex_account_profile(
@@ -4242,7 +4340,7 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
     if account.provider != "codex" || !account.token_meta.has_access_token {
         return Ok(());
     }
-    let access_token =
+    let mut access_token =
         codex_access_token(account).ok_or_else(|| "缺少 access token".to_string())?;
     if account.subscription_active_until.is_none() {
         account.subscription_active_until = codex_subscription_until_from_payload(account);
@@ -4252,30 +4350,30 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
         .clone()
         .ok_or_else(|| "缺少 ChatGPT account_id".to_string())?;
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {access_token}"))
-            .map_err(|error| format!("构建 Authorization 头失败: {error}"))?,
-    );
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(USER_AGENT, HeaderValue::from_static(CODEX_API_USER_AGENT));
-    headers.insert(
-        "ChatGPT-Account-Id",
-        HeaderValue::from_str(&account_id)
-            .map_err(|error| format!("构建 ChatGPT-Account-Id 头失败: {error}"))?,
-    );
+    let mut headers = codex_api_headers(&access_token, &account_id)?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| format!("创建 Codex API 客户端失败: {error}"))?;
-    let profile_response = client
+    let mut profile_response = client
         .get(CODEX_ACCOUNT_CHECK_URL)
         .headers(headers.clone())
         .send()
         .await
         .map_err(|error| format!("请求账号信息失败: {error}"))?;
+    if matches!(profile_response.status().as_u16(), 401 | 403)
+        && codex_refresh_token(account).is_some()
+    {
+        access_token = refresh_codex_access_token(account).await?;
+        headers = codex_api_headers(&access_token, &account_id)?;
+        profile_response = client
+            .get(CODEX_ACCOUNT_CHECK_URL)
+            .headers(headers.clone())
+            .send()
+            .await
+            .map_err(|error| format!("请求账号信息失败: {error}"))?;
+    }
     if profile_response.status().is_success() {
         let payload = profile_response
             .json::<Value>()
@@ -4290,12 +4388,24 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
         }
     }
 
-    let usage_response = client
+    let mut usage_response = client
         .get(CODEX_USAGE_URL)
-        .headers(headers)
+        .headers(headers.clone())
         .send()
         .await
         .map_err(|error| format!("请求配额信息失败: {error}"))?;
+    if matches!(usage_response.status().as_u16(), 401 | 403)
+        && codex_refresh_token(account).is_some()
+    {
+        access_token = refresh_codex_access_token(account).await?;
+        headers = codex_api_headers(&access_token, &account_id)?;
+        usage_response = client
+            .get(CODEX_USAGE_URL)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|error| format!("请求配额信息失败: {error}"))?;
+    }
     let status = usage_response.status();
     let usage_body = usage_response
         .text()
@@ -4414,7 +4524,7 @@ async fn refresh_gemini_account_remote(account: &mut ManagedAccount) -> Result<(
     let refresh_token = gemini_payload_string(account, "refresh_token", "refreshToken");
 
     if gemini_payload_expiry(account)
-        .map(|expiry| expiry <= now_ts_ms() + 60_000)
+        .map(|expiry| expiry <= now_ts_ms() + 300_000)
         .unwrap_or(false)
     {
         let refresh_token = refresh_token
@@ -4464,7 +4574,12 @@ async fn refresh_gemini_account_remote(account: &mut ManagedAccount) -> Result<(
 
     let mut status = load_gemini_code_assist_status(&access_token).await;
     if let Err(error) = &status {
-        if error.contains("UNAUTHORIZED") {
+        let error_lower = error.to_ascii_lowercase();
+        if error.contains("UNAUTHORIZED")
+            || error_lower.contains("http 401")
+            || error_lower.contains("401")
+            || error_lower.contains("unauthorized")
+        {
             if let Some(refresh_token) = refresh_token {
                 let refreshed = refresh_gemini_access_token(&refresh_token).await?;
                 access_token = refreshed
@@ -4542,8 +4657,71 @@ fn fallback_status_refreshed(account: &ManagedAccount) -> AccountStatus {
     derive_status(obj, &account.token_meta, account.quota.as_ref())
 }
 
+fn user_facing_refresh_error(reason: &str) -> String {
+    if is_refresh_network_error(reason) {
+        return "网络异常，无法连接服务，请检查网络或代理后重试。".to_string();
+    }
+    let lower = reason.to_ascii_lowercase();
+    let is_auth = [
+        "invalid_grant",
+        "invalid token",
+        "unauthorized",
+        "forbidden",
+        "http 401",
+        "http 403",
+        "401",
+        "403",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+    if is_auth {
+        return "凭证可能已失效或无权限，请重新登录或重新导入账号。".to_string();
+    }
+    reason.to_string()
+}
+
+fn is_refresh_network_error(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    [
+        "error sending request",
+        "error trying to connect",
+        "dns error",
+        "failed to lookup address",
+        "timed out",
+        "timeout",
+        "connection refused",
+        "connection reset",
+        "connection closed",
+        "network is unreachable",
+        "nodename nor servname provided",
+        "operation timed out",
+        "os error 50",
+        "os error 51",
+        "os error 60",
+        "os error 65",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 fn mark_account_unavailable(account: &mut ManagedAccount, reason: String) {
     let now = now_ts();
+    let is_network = is_refresh_network_error(&reason);
+    let reason = user_facing_refresh_error(&reason);
+    if is_network {
+        account.quota = Some(AccountQuota {
+            metrics: account
+                .quota
+                .as_ref()
+                .map(|quota| quota.metrics.clone())
+                .unwrap_or_default(),
+            last_updated: Some(now),
+            error: Some(reason),
+            is_forbidden: Some(false),
+        });
+        account.updated_at = now;
+        return;
+    }
     account.quota = Some(AccountQuota {
         metrics: vec![],
         last_updated: Some(now),

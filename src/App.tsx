@@ -261,6 +261,15 @@ function activationSuccessMessage(account: ManagedAccount) {
   return `已启用 ${label}`;
 }
 
+function refreshFailureMessage(account: ManagedAccount) {
+  const reason = account.status?.reason ?? account.quota?.error;
+  return reason ? `刷新 ${accountDisplayLabel(account)} 失败：${reason}` : `刷新 ${accountDisplayLabel(account)} 失败`;
+}
+
+function isRefreshUnavailable(account: ManagedAccount) {
+  return account.status?.state === "unavailable" || Boolean(account.quota?.error);
+}
+
 function sortAccountsForView(items: ManagedAccount[]) {
   return [...items].sort((a, b) => {
     const currentDelta = Number(isCurrentAccount(b)) - Number(isCurrentAccount(a));
@@ -1602,7 +1611,11 @@ function App() {
     try {
       const refreshed = await invoke<ManagedAccount>("refresh_account", { accountId: account.id });
       setAccounts((current) => sortAccountsForView(current.map((item) => (item.id === refreshed.id ? refreshed : item))));
-      showNotice("success", `已刷新 ${accountDisplayLabel(refreshed)}`);
+      if (isRefreshUnavailable(refreshed)) {
+        showNotice("error", refreshFailureMessage(refreshed));
+      } else {
+        showNotice("success", `已刷新 ${accountDisplayLabel(refreshed)}`);
+      }
     } catch (error) {
       showNotice("error", `刷新账号失败：${String(error)}`);
     } finally {
@@ -1627,7 +1640,19 @@ function App() {
       setAccounts((current) =>
         sortAccountsForView(current.map((item) => refreshedAccounts.find((changed) => changed.id === item.id) ?? item)),
       );
-      showNotice("success", `已刷新 ${providerLabel(provider)} 账号`);
+      const failedAccounts = refreshedAccounts.filter(isRefreshUnavailable);
+      if (failedAccounts.length > 0) {
+        showNotice(
+          "error",
+          failedAccounts.length === 1
+            ? refreshFailureMessage(failedAccounts[0])
+            : `已刷新 ${providerLabel(provider)} 账号，其中 ${failedAccounts.length} 个失败。首个原因：${
+                failedAccounts[0].status?.reason ?? failedAccounts[0].quota?.error ?? "未知错误"
+              }`,
+        );
+      } else {
+        showNotice("success", `已刷新 ${providerLabel(provider)} 账号`);
+      }
     } catch (error) {
       showNotice("error", `刷新 ${providerLabel(provider)} 失败：${String(error)}`);
     } finally {
