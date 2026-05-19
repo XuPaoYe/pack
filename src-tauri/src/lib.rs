@@ -7292,6 +7292,12 @@ pub fn run() {
                 }
             }
 
+            let startup_window_handle = app.handle().clone();
+            let startup_window_for_show = startup_window_handle.clone();
+            startup_window_handle.run_on_main_thread(move || {
+                show_main_window(&startup_window_for_show);
+            })?;
+
             Ok(())
         })
         .build(tauri::generate_context!())
