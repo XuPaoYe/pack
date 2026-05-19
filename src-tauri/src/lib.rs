@@ -7116,7 +7116,7 @@ fn stop_api_service_impl(app: tauri::AppHandle) -> Result<api_service::ApiServic
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut app = tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -7292,8 +7292,15 @@ pub fn run() {
             Ok(())
         })
         .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|_handle, event| match event {
+        .expect("error while building tauri application");
+
+    #[cfg(target_os = "macos")]
+    {
+        app.set_activation_policy(ActivationPolicy::Accessory);
+        app.set_dock_visibility(false);
+    }
+
+    app.run(|_handle, event| match event {
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen { .. } => {
                 show_main_window(_handle);
