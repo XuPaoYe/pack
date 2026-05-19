@@ -45,16 +45,19 @@ jobs:
             BODY="See AGENTS.md / README for what's in this build."
           fi
 
-          RELEASE_ID="$(gh api \
-            -X POST \
-            -H 'Accept: application/vnd.github+json' \
-            "repos/$GITHUB_REPOSITORY/releases" \
-            -f tag_name="$TAG" \
-            -f name="Super AI $TAG" \
-            -f body="$BODY" \
-            -f draft=true \
-            -f prerelease=false \
-            --jq '.id')"
+          RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n1 || true)"
+          if [ -z "$RELEASE_ID" ]; then
+            RELEASE_ID="$(gh api \
+              -X POST \
+              -H 'Accept: application/vnd.github+json' \
+              "repos/$GITHUB_REPOSITORY/releases" \
+              -F tag_name="$TAG" \
+              -F name="Super AI $TAG" \
+              -F body="$BODY" \
+              -F draft=true \
+              -F prerelease=false \
+              --jq '.id')"
+          fi
 
           echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
