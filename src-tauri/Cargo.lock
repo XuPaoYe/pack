@@ -4066,6 +4066,8 @@ dependencies = [
  "hex",
  "libc",
  "log",
+ "objc2",
+ "objc2-app-kit",
  "rand 0.8.6",
  "reqwest 0.12.28",
  "rusqlite",
