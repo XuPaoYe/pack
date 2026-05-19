@@ -24,7 +24,42 @@ permissions:
   contents: write  # 让 tauri-action 能创建 release 并上传产物
 
 jobs:
+  prepare-release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create_release.outputs.release_id }}
+    steps:
+      - name: Create or reuse draft release
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.release_version }}"
+            BODY="${{ inputs.release_note }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            BODY="See AGENTS.md / README for what's in this build."
+          fi
+
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
+            RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --title "Super AI $TAG" \
+              --notes "$BODY" >/dev/null
+            RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
+          fi
+
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare-release
     strategy:
       fail-fast: false
       # 四个目标平台并行：Mac 拆成 M 系列 (arm64) 与 Intel (x64) 两个独立 dmg；
@@ -146,16 +181,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
+          releaseId: ${{ needs.prepare-release.outputs.release_id }}
           tagName: ${{ inputs.release_version || github.ref_name }}
-          releaseName: "Super AI ${{ inputs.release_version || github.ref_name }}"
-          releaseBody: |
-            See AGENTS.md / README for what's in this build.
-
-            Artifacts:
-            - macOS arm64 dmg (M-series)
-            - macOS x64 dmg (Intel)
-            - Windows x64 NSIS installer (.exe)
-            - Windows arm64 NSIS installer (.exe)
           releaseDraft: true
           prerelease: false
           # --bundles 显式列出：dmg/nsis 给用户首次安装；updater 给老版本
@@ -174,8 +201,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD != '' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
         with:
+          releaseId: ${{ needs.prepare-release.outputs.release_id }}
           tagName: ${{ inputs.release_version || github.ref_name }}
-          releaseName: "Super AI ${{ inputs.release_version || github.ref_name }}"
           releaseDraft: true
           prerelease: false
           args: --target ${{ matrix.tauri_target }} --bundles ${{ matrix.bundles }}
