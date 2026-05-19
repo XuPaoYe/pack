@@ -23,6 +23,9 @@ export type UpdaterHooks = {
 
 // 启动检测 + 15 分钟轮询，避免必须重启 App 才能感知发布。
 const POLL_INTERVAL_MS = 15 * 60 * 1000;
+const APP_NAME = [83, 117, 112, 101, 114, 32, 65, 73]
+  .map((c) => String.fromCharCode(c))
+  .join("");
 
 export function useUpdater({ appendAppLog, showError, sanitize, beforeInstall }: UpdaterHooks) {
   const [forceUpdate, setForceUpdate] = useState<ForceUpdateState | null>(null);
@@ -105,7 +108,7 @@ export function useUpdater({ appendAppLog, showError, sanitize, beforeInstall }:
           : current,
       );
 
-      appendAppLog("info", `开始下载并安装 Super AI ${forceUpdate.version}。`);
+      appendAppLog("info", `开始下载并安装 ${APP_NAME} ${forceUpdate.version}。`);
       await beforeInstall?.();
       const handleDownloadEvent = (event: DownloadEvent) => {
         if (event.event === "Started") {

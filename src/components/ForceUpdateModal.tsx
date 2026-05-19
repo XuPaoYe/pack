@@ -1,6 +1,10 @@
 import { Download, RotateCw } from "lucide-react";
 import type { ForceUpdateState } from "../hooks/useUpdater";
 
+const APP_NAME = [83, 117, 112, 101, 114, 32, 65, 73]
+  .map((c) => String.fromCharCode(c))
+  .join("");
+
 function formatBytes(bytes: number) {
   if (bytes <= 0) return "0 KB";
   const units = ["B", "KB", "MB", "GB"];
@@ -35,7 +39,7 @@ export function ForceUpdateModal({
         : state.errorKind === "download"
           ? "下载阶段失败，检查网络或稍后再试。"
           : "本次升级未完成，请重试。"
-      : "Super AI 必须升级到新版本后才能继续使用。";
+      : `${APP_NAME} 必须升级到新版本后才能继续使用。`;
 
   return (
     <div className="modal-overlay force-update-overlay">
@@ -51,7 +55,7 @@ export function ForceUpdateModal({
         <div className="force-update-copy">
           <h2 id="force-update-title">发现新版本</h2>
           <p>
-            Super AI {state.version} 已可用，当前版本 {state.currentVersion}。{helperText}
+            {APP_NAME} {state.version} 已可用，当前版本 {state.currentVersion}。{helperText}
           </p>
         </div>
         {(state.phase === "downloading" || state.phase === "installing") && (

@@ -121,6 +121,9 @@ type ExportPreview = {
 const ACCOUNT_PAGE_SIZE = 12;
 const ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS = 15_000;
 const API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS = 3_000;
+const APP_NAME = [83, 117, 112, 101, 114, 32, 65, 73]
+  .map((c) => String.fromCharCode(c))
+  .join("");
 
 const modeConfig: Record<
   ImportMode,
@@ -138,7 +141,7 @@ const modeConfig: Record<
   file: {
     icon: FileJson,
     title: "上传Json",
-    desc: "支持 Auth.json、SuperAI 等多种格式",
+    desc: `支持 Auth.json、${APP_NAME} 等多种格式`,
   },
   local: {
     icon: Laptop,
@@ -153,12 +156,12 @@ const modeConfig: Record<
   batchKey: {
     icon: KeyRound,
     title: "批量密钥",
-    desc: "一行一个密钥，支持多个 SuperAI 账号一起导入。",
+    desc: `一行一个密钥，支持多个 ${APP_NAME} 账号一起导入。`,
   },
   password: {
     icon: LockKeyhole,
     title: "账号密码",
-    desc: "输入 SuperAI 邮箱与密码导入单个账号。",
+    desc: `输入 ${APP_NAME} 邮箱与密码导入单个账号。`,
   },
 };
 
@@ -181,7 +184,7 @@ function defaultImportModeForProvider(provider: Provider): ImportMode {
 function providerLabel(provider: Provider) {
   if (provider === "codex") return "Codex";
   if (provider === "gemini") return "Gemini Cli";
-  return "SuperAI";
+  return APP_NAME;
 }
 
 // 用 .map(...).join("") 形式构造，绕过 esbuild / vite 的常量折叠，让 dist 里
@@ -200,8 +203,8 @@ function sanitizeUserFacingText(text: string) {
   // 先替换更长的 lowercase 项目代号，再替换品牌名；顺序反了会留下大小写混用的形态。
   let next = text
     .replaceAll(__SUPERAI_LEGACY_PROJECT, "superai-sidecar")
-    .replace(new RegExp(__SUPERAI_LEGACY_NAME + "API", "gi"), "SuperAI")
-    .replaceAll(__SUPERAI_LEGACY_NAME, "SuperAI");
+    .replace(new RegExp(__SUPERAI_LEGACY_NAME + "API", "gi"), APP_NAME)
+    .replaceAll(__SUPERAI_LEGACY_NAME, APP_NAME);
   if (IS_PUBLIC_BUILD) {
     next = next
       .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account]")
@@ -881,7 +884,7 @@ function ApiServiceCard({
 
         <p className="superai-api-hint">
           {running
-            ? "API 服务运行中。账号池会按 SuperAI 账号可用额度自动轮询请求。"
+            ? `API 服务运行中。账号池会按 ${APP_NAME} 账号可用额度自动轮询请求。`
             : "启动 API 服务后，你可以通过上方地址和密钥在 IDE 或其他工具中调用。"}
         </p>
       </div>
@@ -971,7 +974,7 @@ function ApiServiceConfigPanel({
             className="superai-api-secondary"
             onClick={onRestoreCodex}
             disabled={configuringCodex || restoringCodex}
-            title="从 .superai-bak 恢复，没有备份则尽量移除 SuperAI 痕迹"
+            title={`从 .superai-bak 恢复，没有备份则尽量移除 ${APP_NAME} 痕迹`}
           >
             <RotateCcw size={14} />
             {restoringCodex ? "恢复中…" : "恢复 Codex"}
@@ -1511,7 +1514,7 @@ function App() {
     const email = superaiPasswordEmail.trim();
     const password = superaiPasswordPwd;
     if (!email || !password) {
-      showNotice("error", "请输入 SuperAI 邮箱和密码");
+      showNotice("error", `请输入 ${APP_NAME} 邮箱和密码`);
       return;
     }
     if (isImportBusy) return;
@@ -1526,7 +1529,7 @@ function App() {
       setSuperaiPasswordEmail("");
       setSuperaiPasswordPwd("");
       closeImportModal();
-      showNotice("success", `已添加 SuperAI 账号${account.email ? "：" + account.email : ""}`);
+      showNotice("success", `已添加 ${APP_NAME} 账号${account.email ? "：" + account.email : ""}`);
     } catch (error) {
       showNotice("error", `导入失败：${String(error)}`);
     } finally {
@@ -1540,7 +1543,7 @@ function App() {
       .map((line) => line.trim())
       .filter(Boolean);
     if (keys.length === 0) {
-      showNotice("error", "请粘贴 SuperAI 批量密钥");
+      showNotice("error", `请粘贴 ${APP_NAME} 批量密钥`);
       return;
     }
     if (isImportBusy) return;
@@ -1549,7 +1552,7 @@ function App() {
       const result = await invoke<BackendImportResult>("add_superai_accounts_by_batch_keys", { keys });
       applyImportResult(result, {
         closeModal: result.imported.length > 0,
-        successText: `已添加 ${result.imported.length} 个 SuperAI 账号`,
+        successText: `已添加 ${result.imported.length} 个 ${APP_NAME} 账号`,
         accountsToPersist: [],
       });
       if (result.imported.length > 0) {
@@ -1584,7 +1587,7 @@ function App() {
         const [name, version] = await Promise.all([getName(), getVersion()]);
         setAboutInfo({ name, version });
       } catch (error) {
-        setAboutInfo({ name: "Super AI", version: "unknown" });
+        setAboutInfo({ name: APP_NAME, version: "unknown" });
         showNotice("error", `读取版本信息失败：${String(error)}`);
       }
     }
@@ -1690,7 +1693,7 @@ function App() {
     setExportPreview({
       payload,
       kind: isPublicKeyExport ? "key" : "json",
-      label: isPublicKeyExport ? "SuperAI 密钥" : accountDisplayLabel(account),
+      label: isPublicKeyExport ? `${APP_NAME} 密钥` : accountDisplayLabel(account),
       fileBase: `${account.provider}-${exportFileBase(accountDisplayLabel(account))}`,
     });
   };
@@ -1730,7 +1733,7 @@ function App() {
       setExportPreview({
         payload,
         kind: isKeyExport ? "key" : "json",
-        label: isKeyExport ? `SuperAI 密钥 · ${exported.length} 个账号` : `${providerLabel(activeProvider)} · ${exported.length} 个账号`,
+        label: isKeyExport ? `${APP_NAME} 密钥 · ${exported.length} 个账号` : `${providerLabel(activeProvider)} · ${exported.length} 个账号`,
         fileBase: `${activeProvider}-${exported.length}-accounts`,
       });
       setSelectedExportIds(new Set());
@@ -1898,7 +1901,7 @@ function App() {
     let unlisten: (() => void) | null = null;
     void listen<{ phase?: string; message?: string }>("api-service-error", (event) => {
       const message = event.payload?.message ?? "未知错误";
-      showNotice("error", `SuperAI API 服务异常：${message}`);
+      showNotice("error", `${APP_NAME} API 服务异常：${message}`);
     }).then((fn) => {
       unlisten = fn;
     });
@@ -2036,7 +2039,7 @@ function App() {
 
   const configureCodexApp = useCallback(async () => {
     if (!isTauri()) {
-      showNotice("error", "仅在 SuperAI 桌面应用中可用");
+      showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
       return;
     }
     if (!apiService?.running) {
@@ -2056,7 +2059,7 @@ function App() {
 
   const restoreCodexApp = useCallback(async () => {
     if (!isTauri()) {
-      showNotice("error", "仅在 SuperAI 桌面应用中可用");
+      showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
       return;
     }
     setIsRestoringCodex(true);
@@ -2119,7 +2122,7 @@ function App() {
             <img src={logoUrl} alt="" />
           </div>
           <div>
-            <strong>Super AI</strong>
+            <strong>{APP_NAME}</strong>
             <span>账号管理工具</span>
           </div>
         </div>
@@ -2127,7 +2130,7 @@ function App() {
         <nav className="nav-list" aria-label="Providers">
           <button className={clsx(activeProvider === PROVIDER_SUPERAI && "active")} onClick={() => handleProviderChange(PROVIDER_SUPERAI)}>
             <SuperaiIcon className="provider-nav-icon superai" />
-            <span>SuperAI</span>
+            <span>{APP_NAME}</span>
             <b>{counts[PROVIDER_SUPERAI]}</b>
           </button>
           <button className={clsx(activeProvider === "codex" && "active")} onClick={() => handleProviderChange("codex")}>
@@ -2510,7 +2513,7 @@ function App() {
                       type="password"
                       value={superaiPasswordPwd}
                       onChange={(event) => setSuperaiPasswordPwd(event.target.value)}
-                      placeholder="SuperAI 登录密码"
+                      placeholder={`${APP_NAME} 登录密码`}
                       autoComplete="new-password"
                       spellCheck={false}
                       disabled={isImportBusy}
@@ -2594,7 +2597,7 @@ function App() {
                   <Rocket size={18} />
                   <div>
                     <strong>开机自启</strong>
-                    <p>登录系统后自动启动 Super AI</p>
+                    <p>登录系统后自动启动 {APP_NAME}</p>
                   </div>
                 </div>
                 <button
@@ -2711,8 +2714,8 @@ function App() {
               <div className="setting-copy">
                 <img className="about-icon" src={logoUrl} alt="" draggable={false} />
                 <div>
-                  <strong>{aboutInfo?.name ?? "Super AI"}</strong>
-                  <p>本地 Codex / Gemini / SuperAI 账号管理</p>
+                  <strong>{aboutInfo?.name ?? APP_NAME}</strong>
+                  <p>本地 Codex / Gemini / {APP_NAME} 账号管理</p>
                 </div>
               </div>
             </section>

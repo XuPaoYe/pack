@@ -89,7 +89,9 @@ fn show_main_window(app: &tauri::AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let _ = app.set_activation_policy(ActivationPolicy::Accessory);
-        let _ = app.set_dock_visibility(false);
+        if let Err(error) = app.set_dock_visibility(false) {
+            eprintln!("[macOS] 隐藏 Dock 图标失败: {error}");
+        }
     }
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -6620,7 +6622,7 @@ fn set_api_service_default_model(app: tauri::AppHandle, model: String) -> Result
     // 顺手把 ~/.codex/config.toml 的 model 行原地改写，
     // 这样 codex 重启后 TUI 顶部 `model:` 跟 SuperAI UI 一致。
     // 用户没点过"配置Codex"时该函数返回 false，不会擅自创建文件。
-    if let Err(error) = rewrite_managed_model_line(&settings.api_service_default_model) {
+    if let Err(error) = rewrite_managed_model_config(&settings.api_service_default_model) {
         eprintln!("[SuperAI] 改写 codex config.toml model 行失败: {error}");
     }
     Ok(())
@@ -6760,13 +6762,34 @@ fn escape_toml_basic_string(s: &str) -> String {
     out
 }
 
+fn codex_model_config_for_api_model(model_id: &str) -> (String, Option<String>) {
+    let trimmed = model_id.trim();
+    let model = if trimmed.is_empty() {
+        DEFAULT_WINDSURF_API_MODEL
+    } else {
+        trimmed
+    };
+
+    for effort in ["xhigh", "high", "medium", "low"] {
+        let suffix = format!("-{effort}");
+        if let Some(base) = model.strip_suffix(&suffix) {
+            if !base.is_empty() {
+                return (base.to_string(), Some(effort.to_string()));
+            }
+        }
+    }
+
+    (model.to_string(), None)
+}
+
 /// 写入 codex `~/.codex/config.toml` 的 SuperAI 配置。
 ///
 /// 设计：
-/// - `model` 字段直接用 SuperAI UI 当前选中的真实模型名（如 `claude-opus-4.7-medium`）。
-///   这样 codex TUI 顶部那行 `model:` 跟 SuperAI UI 一致，不再误导。
+/// - API 服务内部可以使用 sidecar 需要的完整模型 id（如 `gpt-5.5-medium`），
+///   但 Codex 的 config.toml 必须按 Codex 原生字段拆开：`model = "gpt-5.5"` 与
+///   `model_reasoning_effort = "medium"`。
 /// - SuperAI 切模型时，前端调 `set_api_service_default_model`，后端会顺手
-///   `rewrite_managed_model_line()` 把这行改掉，下次 codex 重启就显示新模型；
+///   `rewrite_managed_model_config()` 把这两行改掉，下次 codex 重启就显示新配置；
 ///   codex 进程没重启时，proxy 内存里 default_model 也已热更，请求立即生效。
 ///
 /// 鉴权选择 `requires_openai_auth = true`（**不**设 `env_key`）：
@@ -6781,11 +6804,13 @@ fn escape_toml_basic_string(s: &str) -> String {
 ///     历史会话视图会整个坏掉。
 fn build_superai_managed_block(base_url: &str, model_id: &str, _api_key: &str) -> String {
     let url = escape_toml_basic_string(base_url);
-    let model = escape_toml_basic_string(model_id);
+    let (codex_model, effort) = codex_model_config_for_api_model(model_id);
+    let model = escape_toml_basic_string(&codex_model);
+    let effort = escape_toml_basic_string(effort.as_deref().unwrap_or("medium"));
     format!(
         "model_provider = \"superai\"\n\
 model = \"{model}\"\n\
-model_reasoning_effort = \"medium\"\n\
+model_reasoning_effort = \"{effort}\"\n\
 approval_policy = \"on-request\"\n\
 sandbox_mode = \"workspace-write\"\n\
 network_access = \"enabled\"\n\
@@ -6796,7 +6821,7 @@ personality = \"pragmatic\"\n\
 service_tier = \"fast\"\n\
 \n\
 [model_providers.superai]\n\
-name = \"SuperAI\"\n\
+name = \"Super AI\"\n\
 base_url = \"{url}\"\n\
 wire_api = \"responses\"\n\
 requires_openai_auth = true\n\
@@ -6805,13 +6830,13 @@ requires_openai_auth = true\n\
 }
 
 /// 当 SuperAI UI 切换模型时调用：原地把 SuperAI 配置里的
-/// `model = "..."` 那一行改成新模型名。
+/// `model = "..."` 与 `model_reasoning_effort = "..."` 改成 Codex 原生格式。
 ///
 /// - 文件不存在 / 不是 SuperAI 配置 / 没找到 model 行 → 一律不动文件，返回 false。
 ///   说明用户还没点"配置 Codex"，不该擅自创建文件。
 /// - 改动成功返回 true。
 ///
-fn rewrite_managed_model_line(model_id: &str) -> Result<bool, String> {
+fn rewrite_managed_model_config(model_id: &str) -> Result<bool, String> {
     let codex_home = match codex_home_dir() {
         Ok(path) => path,
         Err(_) => return Ok(false),
@@ -6825,20 +6850,37 @@ fn rewrite_managed_model_line(model_id: &str) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let escaped = escape_toml_basic_string(model_id);
+    let (codex_model, effort) = codex_model_config_for_api_model(model_id);
+    let escaped_model = escape_toml_basic_string(&codex_model);
+    let escaped_effort = escape_toml_basic_string(effort.as_deref().unwrap_or("medium"));
     let mut new_lines: Vec<String> = Vec::with_capacity(existing.lines().count());
-    let mut replaced = false;
+    let mut replaced_model = false;
+    let mut replaced_effort = false;
     for line in existing.lines() {
         let trimmed = line.trim_start();
-        if !replaced && trimmed.starts_with("model = \"") {
-            new_lines.push(format!("model = \"{escaped}\""));
-            replaced = true;
+        if !replaced_model && trimmed.starts_with("model = \"") {
+            new_lines.push(format!("model = \"{escaped_model}\""));
+            replaced_model = true;
+        } else if !replaced_effort && trimmed.starts_with("model_reasoning_effort = \"") {
+            new_lines.push(format!("model_reasoning_effort = \"{escaped_effort}\""));
+            replaced_effort = true;
         } else {
             new_lines.push(line.to_string());
         }
     }
-    if !replaced {
+    if !replaced_model {
         return Ok(false);
+    }
+    if !replaced_effort {
+        if let Some(index) = new_lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("model = \""))
+        {
+            new_lines.insert(
+                index + 1,
+                format!("model_reasoning_effort = \"{escaped_effort}\""),
+            );
+        }
     }
     let mut next = new_lines.join("\n");
     if existing.ends_with('\n') && !next.ends_with('\n') {
@@ -7128,14 +7170,14 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             {
                 app.set_activation_policy(ActivationPolicy::Accessory);
-                let _ = app.set_dock_visibility(false);
+                app.set_dock_visibility(false);
             }
 
             let tray_menu = Menu::with_items(
                 app,
                 &[
                     &MenuItemBuilder::with_id(TRAY_MENU_SHOW, "显示主窗口").build(app)?,
-                    &MenuItemBuilder::with_id(TRAY_MENU_QUIT, "退出 SuperAI").build(app)?,
+                    &MenuItemBuilder::with_id(TRAY_MENU_QUIT, "退出 Super AI").build(app)?,
                 ],
             )?;
             let tray_builder = TrayIconBuilder::with_id("superai-tray")
@@ -7319,6 +7361,31 @@ mod tests {
         );
         assert_eq!(field_map.get("daily_quota_reset_at_unix"), Some(&"int_18"));
         assert_eq!(field_map.get("weekly_quota_reset_at_unix"), Some(&"int_17"));
+    }
+
+    #[test]
+    fn codex_config_splits_model_and_reasoning_effort() {
+        assert_eq!(
+            codex_model_config_for_api_model("gpt-5.5-medium"),
+            ("gpt-5.5".to_string(), Some("medium".to_string()))
+        );
+        assert_eq!(
+            codex_model_config_for_api_model("gpt-5.5-xhigh"),
+            ("gpt-5.5".to_string(), Some("xhigh".to_string()))
+        );
+        assert_eq!(
+            codex_model_config_for_api_model("gpt-5.3-codex"),
+            ("gpt-5.3-codex".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn superai_managed_block_uses_codex_native_reasoning_field() {
+        let block = build_superai_managed_block("http://127.0.0.1:1420/v1", "gpt-5.5-medium", "");
+
+        assert!(block.contains("model = \"gpt-5.5\"\n"));
+        assert!(block.contains("model_reasoning_effort = \"medium\"\n"));
+        assert!(!block.contains("model = \"gpt-5.5-medium\"\n"));
     }
 
     #[test]
