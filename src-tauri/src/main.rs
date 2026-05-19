@@ -2,6 +2,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[cfg(target_os = "macos")]
+tauri::embed_plist::embed_info_plist!("../Info.plist");
+
+#[cfg(target_os = "macos")]
 fn configure_macos_menubar_app() {
     use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
