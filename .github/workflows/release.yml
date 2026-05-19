@@ -45,16 +45,16 @@ jobs:
             BODY="See AGENTS.md / README for what's in this build."
           fi
 
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" >/dev/null 2>&1; then
-            RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
-          else
-            gh release create "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --draft \
-              --title "Super AI $TAG" \
-              --notes "$BODY" >/dev/null
-            RELEASE_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.id')"
-          fi
+          RELEASE_ID="$(gh api \
+            -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$TAG" \
+            -f name="Super AI $TAG" \
+            -f body="$BODY" \
+            -f draft=true \
+            -f prerelease=false \
+            --jq '.id')"
 
           echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
