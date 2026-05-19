@@ -18,7 +18,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::menu::{Menu, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Emitter, LogicalSize, Manager};
+use tauri::{Emitter, Manager, WebviewWindowBuilder};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
 #[cfg(desktop)]
@@ -93,11 +93,29 @@ fn show_main_window(app: &tauri::AppHandle) {
             eprintln!("[macOS] 隐藏 Dock 图标失败: {error}");
         }
     }
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+
+    let window = match app.get_webview_window("main") {
+        Some(window) => window,
+        None => {
+            let Some(config) = app.config().app.windows.iter().find(|window| window.label == "main")
+            else {
+                eprintln!("[window] 未找到主窗口配置");
+                return;
+            };
+            match WebviewWindowBuilder::from_config(app, config).and_then(|builder| builder.build())
+            {
+                Ok(window) => window,
+                Err(error) => {
+                    eprintln!("[window] 创建主窗口失败: {error}");
+                    return;
+                }
+            }
+        }
+    };
+
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
 }
 
 fn hide_main_window(window: &tauri::Window) {
@@ -7212,21 +7230,6 @@ pub fn run() {
                     show_main_window(app);
                 }
             });
-
-            if let Some(window) = app.get_webview_window("main") {
-                #[cfg(target_os = "windows")]
-                let app_size = LogicalSize::new(1320.0, 740.0);
-                #[cfg(not(target_os = "windows"))]
-                let app_size = LogicalSize::new(1320.0, 760.0);
-                #[cfg(target_os = "windows")]
-                window.set_resizable(true)?;
-                #[cfg(not(target_os = "windows"))]
-                window.set_resizable(false)?;
-                window.set_min_size(Some(app_size))?;
-                window.set_size(app_size)?;
-                #[cfg(target_os = "macos")]
-                window.hide()?;
-            }
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(

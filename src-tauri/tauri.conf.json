@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Super AI",
-  "version": "3.1.6",
+  "version": "3.1.7",
   "identifier": "cn.talentisan.super-ai",
   "build": {
     "frontendDist": "../dist",
@@ -12,7 +12,9 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Super AI",
+        "create": false,
         "width": 1320,
         "height": 740,
         "visible": false,
