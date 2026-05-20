@@ -48,22 +48,24 @@ import logoUrl from "./assets/logo.svg";
 import { useUpdater } from "./hooks/useUpdater";
 import { useNotice } from "./hooks/useNotice";
 import { ForceUpdateModal } from "./components/ForceUpdateModal";
+import { AccountDetailsDialog } from "./components/AccountDetailsDialog";
 import { NoticeToast } from "./components/NoticeToast";
 import { noticeToneConfig } from "./components/noticeTone";
 import { CodexIcon } from "./components/icons/CodexIcon";
 import { GeminiIcon } from "./components/icons/GeminiIcon";
 import { SuperaiIcon } from "./components/icons/SuperaiIcon";
+import { AntigravityIcon } from "./components/icons/AntigravityIcon";
 import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/accountPresentation";
 import {
   loadAppLogs as loadAppLogsRaw,
   persistAppLogs,
   pruneAppLogs,
 } from "./lib/appLogs";
-import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider } from "./lib/authParser";
+import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider, type QuotaMetric } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
 type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey" | "password";
-type OAuthProvider = "codex" | "gemini";
+type OAuthProvider = "codex" | "gemini" | "antigravity";
 type ThemeMode = "system" | "light" | "dark";
 
 const IS_PUBLIC_BUILD = import.meta.env.VITE_SUPERAI_PUBLIC_BUILD === "1";
@@ -166,6 +168,8 @@ const modeConfig: Record<
 };
 
 const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
+// Antigravity 没有标准本机凭证文件（Google IDE 把 token 存在 protobuf 编码的 vscdb 里），所以不提供本机导入。
+const antigravityImportModeOrder: ImportMode[] = ["oauth", "paste", "file"];
 // 完全版额外允许“账号密码”导入单个 SuperAI 账号；公开版仅批量密钥。
 const superaiImportModeOrder: ImportMode[] = IS_PUBLIC_BUILD
   ? ["batchKey"]
@@ -174,7 +178,9 @@ const defaultImportMode: ImportMode = "oauth";
 const defaultSuperaiImportMode: ImportMode = "batchKey";
 
 function importModesForProvider(provider: Provider): ImportMode[] {
-  return provider === PROVIDER_SUPERAI ? superaiImportModeOrder : importModeOrder;
+  if (provider === PROVIDER_SUPERAI) return superaiImportModeOrder;
+  if (provider === "antigravity") return antigravityImportModeOrder;
+  return importModeOrder;
 }
 
 function defaultImportModeForProvider(provider: Provider): ImportMode {
@@ -184,6 +190,7 @@ function defaultImportModeForProvider(provider: Provider): ImportMode {
 function providerLabel(provider: Provider) {
   if (provider === "codex") return "Codex";
   if (provider === "gemini") return "Gemini Cli";
+  if (provider === "antigravity") return "Antigravity";
   return APP_NAME;
 }
 
@@ -267,6 +274,9 @@ function activationSuccessMessage(account: ManagedAccount) {
   if (account.provider === "gemini") {
     return `已启用 ${label}，请重启 Gemini 相关产品`;
   }
+  if (account.provider === "antigravity") {
+    return `已启用 ${label}，请重启 Antigravity 相关产品`;
+  }
   return `已启用 ${label}`;
 }
 
@@ -317,6 +327,47 @@ function localizeQuotaLabel(label: string): string {
   return label;
 }
 
+function pickAntigravitySummaryMetrics(metrics: QuotaMetric[]): QuotaMetric[] {
+  if (metrics.length === 0) return metrics;
+  const pickLowest = (predicate: (label: string, name: string) => boolean, fallbackLabel: string, fallbackKey: string): QuotaMetric | undefined => {
+    const matches = metrics.filter((metric) => {
+      const display = (metric.displayName ?? metric.label ?? "").toLowerCase();
+      const name = (metric.modelName ?? "").toLowerCase();
+      return predicate(display, name);
+    });
+    if (matches.length === 0) return undefined;
+    const best = matches.reduce((acc, metric) => {
+      const remaining = metric.remainingPercent ?? 101;
+      const accRemaining = acc.remainingPercent ?? 101;
+      return remaining < accRemaining ? metric : acc;
+    });
+    return { ...best, key: fallbackKey, label: fallbackLabel };
+  };
+  const gemini31Pro = pickLowest(
+    (label, name) => name.includes("gemini-3.1-pro") || label.includes("gemini 3.1 pro"),
+    "Gemini 3.1 Pro",
+    "antigravity-summary-gemini-3.1-pro",
+  );
+  const gemini3Flash = pickLowest(
+    (label, name) =>
+      name.includes("gemini-3-flash") ||
+      name.includes("gemini-3.0-flash") ||
+      name.includes("gemini-3.1-flash") ||
+      label.includes("gemini 3 flash") ||
+      label.includes("gemini 3.0 flash") ||
+      label.includes("gemini 3.1 flash"),
+    "Gemini 3 Flash",
+    "antigravity-summary-gemini-3-flash",
+  );
+  const claude = pickLowest(
+    (label, name) => name.startsWith("claude") || label.includes("claude"),
+    "Claude",
+    "antigravity-summary-claude",
+  );
+  const picked = [gemini31Pro, gemini3Flash, claude].filter((m): m is QuotaMetric => Boolean(m));
+  return picked.length > 0 ? picked : metrics.slice(0, 3);
+}
+
 function QuotaMeters({ account }: { account: ManagedAccount }) {
   const isUnavailable = account.status?.state === "unavailable";
   const exhausted = isUsageExhausted(account);
@@ -340,6 +391,8 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
     if (metrics.length === 0) {
       metrics = [{ key: "superai-daily", label: "日限", remainingPercent: undefined, state: "unknown" }];
     }
+  } else if (account.provider === "antigravity" && account.quota?.metrics?.length) {
+    metrics = pickAntigravitySummaryMetrics(account.quota.metrics);
   }
 
   return (
@@ -371,17 +424,16 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
 
 function ValidityMeter({ account }: { account: ManagedAccount }) {
   const validity = formatValidityText(account);
-  return validity.detail ? (
+  if (!validity.detail) {
+    return <div className="validity-line placeholder" aria-hidden="true" />;
+  }
+  return (
     <div className={clsx("validity-line", validity.expired && "expired")} title={validity.title}>
       <CalendarDays size={15} strokeWidth={1.9} />
       <span>
         {validity.label} <strong>{validity.detail}</strong>
       </span>
       {validity.title && <time>{validity.title}</time>}
-    </div>
-  ) : (
-    <div className="validity-line">
-      <span>{validity.label} --</span>
     </div>
   );
 }
@@ -1034,6 +1086,7 @@ function App() {
   const [isLogsOpen, setIsLogsOpen] = useState(false);
   const [isAboutOpen, setIsAboutOpen] = useState(false);
   const [aboutInfo, setAboutInfo] = useState<{ name: string; version: string } | null>(null);
+  const [detailsAccountId, setDetailsAccountId] = useState<string | null>(null);
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
@@ -1110,6 +1163,7 @@ function App() {
     () => ({
       codex: accounts.filter((account) => account.provider === "codex").length,
       gemini: accounts.filter((account) => account.provider === "gemini").length,
+      antigravity: accounts.filter((account) => account.provider === "antigravity").length,
       [PROVIDER_SUPERAI]: accounts.filter((account) => account.provider === PROVIDER_SUPERAI).length,
     }),
     [accounts],
@@ -1325,6 +1379,7 @@ function App() {
       const result = await invoke<BackendImportResult>("import_accounts_from_json", {
         jsonContent: content,
         label,
+        providerHint: activeProvider,
       });
       return { result, accountsToPersist: [] };
     } catch (backendError) {
@@ -1385,6 +1440,10 @@ function App() {
 
   const handleLocalImport = async (provider: OAuthProvider) => {
     if (isImportBusy) return;
+    if (provider === "antigravity") {
+      showNotice("error", "Antigravity 暂不支持本机导入，请使用 OAuth 授权或粘贴/上传 JSON");
+      return;
+    }
     setIsImportBusy(true);
     try {
       const command = provider === "codex" ? "import_codex_from_local" : "import_gemini_from_local";
@@ -1405,7 +1464,10 @@ function App() {
     loginId: string,
     options: { silent?: boolean } = {},
   ) => {
-    const command = provider === "codex" ? "complete_codex_oauth" : "complete_gemini_oauth";
+    const command =
+      provider === "codex" ? "complete_codex_oauth"
+      : provider === "gemini" ? "complete_gemini_oauth"
+      : "complete_antigravity_oauth";
     try {
       const result = await invoke<BackendImportResult>(command, { loginId });
       if (result.imported.length === 0) {
@@ -1445,7 +1507,10 @@ function App() {
     if (isImportBusy) return;
     setIsImportBusy(true);
     try {
-      const command = provider === "codex" ? "start_codex_oauth" : "start_gemini_oauth";
+      const command =
+        provider === "codex" ? "start_codex_oauth"
+        : provider === "gemini" ? "start_gemini_oauth"
+        : "start_antigravity_oauth";
       const result = await invoke<OAuthStartResult>(command);
       setPendingOAuth((current) => ({ ...current, [provider]: result.login_id }));
       scheduleOAuthPoll(provider, result.login_id);
@@ -1461,7 +1526,11 @@ function App() {
   const ModeIcon = selectedMode.icon;
   const isActiveProviderOAuthPending =
     activeProvider !== PROVIDER_SUPERAI && Boolean(pendingOAuth[activeProvider as OAuthProvider]);
-  const oauthAccountLabel = activeProvider === "codex" ? "OpenAI" : "Gemini";
+  const oauthAccountLabel =
+    activeProvider === "codex" ? "OpenAI"
+    : activeProvider === "gemini" ? "Gemini"
+    : activeProvider === "antigravity" ? "Antigravity"
+    : "OpenAI";
   const localImportDesc =
     activeProvider === "codex" ? "从本地已登录的会话中导入 Codex 账号" : "从本地已登录的会话中导入 Gemini Cli 账号";
   const selectedModeDesc =
@@ -2143,6 +2212,11 @@ function App() {
             <span>Gemini Cli</span>
             <b>{counts.gemini}</b>
           </button>
+          <button className={clsx(activeProvider === "antigravity" && "active")} onClick={() => handleProviderChange("antigravity")}>
+            <AntigravityIcon className="provider-nav-icon antigravity" />
+            <span>Antigravity</span>
+            <b>{counts.antigravity}</b>
+          </button>
         </nav>
 
         <div className="sidebar-footer">
@@ -2292,6 +2366,18 @@ function App() {
                         </div>
                       </div>
                       <QuotaMeters account={account} />
+                      {account.provider === "antigravity" && (
+                        <button
+                          type="button"
+                          className="account-details-trigger"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setDetailsAccountId(account.id);
+                          }}
+                        >
+                          查看所有明细
+                        </button>
+                      )}
                       <ValidityMeter account={account} />
                       <div className="account-footer">
                         <time className="account-stamp">{account.status?.state === "unavailable" ? "--" : formatRelative(account.updatedAt)}</time>
@@ -2389,6 +2475,17 @@ function App() {
           onViewLogs={handleLogs}
         />
       )}
+
+      {detailsAccountId && (() => {
+        const target = accounts.find((account) => account.id === detailsAccountId);
+        if (!target) return null;
+        return (
+          <AccountDetailsDialog
+            account={target}
+            onClose={() => setDetailsAccountId(null)}
+          />
+        );
+      })()}
 
       {isImportModalOpen && (
         <AppModal

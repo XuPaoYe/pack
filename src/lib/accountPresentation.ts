@@ -53,6 +53,25 @@ function resolveGeminiPlanBadge(account: ManagedAccount): PlanBadge {
   return { label: account.plan || account.planType || "未知", tone: "unknown" };
 }
 
+function resolveAntigravityPlanBadge(account: ManagedAccount): PlanBadge {
+  const raw = normalizePlanKey(account.plan || account.planType);
+  if (!raw) return { label: "未知", tone: "unknown" };
+  if (raw.includes("ultra")) return { label: "ULTRA", tone: "ultra" };
+  if (raw.includes("legacy")) return { label: "LEGACY", tone: "unknown" };
+  if (
+    raw.includes("pro") ||
+    raw.includes("premium") ||
+    raw.includes("paid") ||
+    raw.includes("google-one")
+  ) {
+    return { label: "PRO", tone: "pro" };
+  }
+  if (raw === "standard-tier" || raw === "free-tier" || raw.includes("free")) {
+    return { label: "FREE", tone: "free" };
+  }
+  return { label: account.plan || account.planType || "未知", tone: "unknown" };
+}
+
 function resolveSuperaiPlanBadge(account: ManagedAccount): PlanBadge {
   const official = (account.plan || account.planType || "").trim();
   const raw = normalizePlanKey(official);
@@ -68,12 +87,14 @@ function resolveSuperaiPlanBadge(account: ManagedAccount): PlanBadge {
 
 export function resolvePlanBadge(account: ManagedAccount): PlanBadge {
   if (account.provider === "gemini") return resolveGeminiPlanBadge(account);
+  if (account.provider === "antigravity") return resolveAntigravityPlanBadge(account);
   if (account.provider === "superai") return resolveSuperaiPlanBadge(account);
   return resolveCodexPlanBadge(account);
 }
 
 export function resolveValidityUntil(account: ManagedAccount) {
   if (account.provider === "gemini") return undefined;
+  if (account.provider === "antigravity") return undefined;
   return normalizeUnixSeconds(account.subscriptionActiveUntil);
 }
 

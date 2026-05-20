@@ -55,6 +55,24 @@ const GEMINI_CODE_ASSIST_LOAD_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
 const GEMINI_CODE_ASSIST_QUOTA_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
+const ANTIGRAVITY_OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const ANTIGRAVITY_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_OAUTH_CLIENT_ID: &str =
+    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+const ANTIGRAVITY_OAUTH_CLIENT_SECRET: &str = "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";
+const ANTIGRAVITY_OAUTH_CALLBACK_PATH: &str = "/antigravity/callback";
+const ANTIGRAVITY_OAUTH_SCOPES: &str = "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
+const ANTIGRAVITY_OAUTH_CLIENT_KEY: &str = "antigravity_enterprise";
+const ANTIGRAVITY_LOAD_CODE_ASSIST_URLS: [&str; 3] = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+];
+const ANTIGRAVITY_FETCH_MODELS_URLS: [&str; 3] = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+];
 const WINDSURF_FIREBASE_API_KEY: &str = "AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY";
 const WINDSURF_FIREBASE_SIGNIN_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword";
@@ -169,7 +187,7 @@ struct AccountStatus {
     updated_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QuotaMetric {
     key: String,
@@ -178,6 +196,12 @@ struct QuotaMetric {
     reset_at: Option<Value>,
     detail: Option<String>,
     state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking_budget: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -863,7 +887,7 @@ fn import_result_for_frontend(mut result: ImportResult) -> ImportResult {
 fn enforce_single_current_account(conn: &Connection) -> Result<(), String> {
     let mut accounts = read_accounts_from_conn(conn)?;
     let mut keep_by_provider: HashMap<String, String> = HashMap::new();
-    for provider in ["codex", "gemini", "windsurf"] {
+    for provider in ["codex", "gemini", "windsurf", "antigravity"] {
         let mut current_ids = accounts
             .iter()
             .filter(|account| account.provider == provider && is_current_status(&account.status))
@@ -1309,6 +1333,7 @@ fn parse_codex_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuot
             reset_at,
             detail: None,
             state: Some(quota_state(Some(remaining))),
+            ..Default::default()
         });
     }
 
@@ -1324,6 +1349,7 @@ fn parse_codex_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuot
             reset_at,
             detail: None,
             state: Some(quota_state(Some(remaining))),
+            ..Default::default()
         });
     }
 
@@ -1403,6 +1429,7 @@ fn parse_gemini_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuo
                     .cloned(),
                 detail: Some(format!("{model_id} 剩余 {remaining}%")),
                 state: Some(quota_state(Some(remaining))),
+                ..Default::default()
             };
             match picked.get(&key) {
                 Some(existing) if existing.remaining_percent.unwrap_or(101) <= remaining => {}
@@ -1441,6 +1468,7 @@ fn parse_gemini_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuo
                     .cloned(),
                 detail: None,
                 state: Some(quota_state(remaining)),
+                ..Default::default()
             });
         }
     }
@@ -1459,6 +1487,7 @@ fn parse_gemini_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuo
                 reset_at: None,
                 detail: None,
                 state: Some(quota_state(Some(remaining))),
+                ..Default::default()
             });
         }
     }
@@ -1669,6 +1698,170 @@ fn parse_codex_account(value: &Value, source: &str) -> Option<ManagedAccount> {
             .or_else(|| number_field(obj.get("updated_at")))
             .unwrap_or(now),
         auth_payload: Some(value.clone()),
+    })
+}
+
+fn looks_like_antigravity(obj: &serde_json::Map<String, Value>) -> bool {
+    if string_field(obj.get("provider"))
+        .map(|p| p.eq_ignore_ascii_case("antigravity"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if string_field(obj.get("oauth_client_key"))
+        .map(|key| key.eq_ignore_ascii_case(ANTIGRAVITY_OAUTH_CLIENT_KEY))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let token = obj.get("token").and_then(Value::as_object);
+    if let Some(token) = token {
+        if string_field(token.get("oauth_client_key"))
+            .map(|key| key.eq_ignore_ascii_case(ANTIGRAVITY_OAUTH_CLIENT_KEY))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        // Antigravity-Manager 的 TokenData 有 is_gcp_tos 与 expiry_timestamp 这对独有字段
+        if token.contains_key("is_gcp_tos") && token.contains_key("expiry_timestamp") {
+            return true;
+        }
+    }
+    // 通过 scope 识别：Antigravity 请求的 cclog / experimentsandconfigs scope 是
+    // Gemini CLI 不会请求的，足够把粘贴进来的 Antigravity 凭证和 Gemini 凭证区分开。
+    let scope = string_field(obj.get("scope"))
+        .or_else(|| token.and_then(|t| string_field(t.get("scope"))));
+    if let Some(scope) = scope {
+        let lower = scope.to_ascii_lowercase();
+        if lower.contains("cclog") || lower.contains("experimentsandconfigs") {
+            return true;
+        }
+    }
+    // JWT aud 也可能带 Antigravity 客户端 ID
+    let id_token = string_field(obj.get("id_token"))
+        .or_else(|| token.and_then(|t| string_field(t.get("id_token"))));
+    if let Some(id_token) = id_token {
+        if let Some(jwt) = parse_jwt_payload(&id_token) {
+            let aud = string_field(jwt.get("aud")).unwrap_or_default();
+            if aud.contains(ANTIGRAVITY_OAUTH_CLIENT_ID) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn parse_antigravity_account(value: &Value, source: &str) -> Option<ManagedAccount> {
+    let obj = value.as_object()?;
+    if !looks_like_antigravity(obj) {
+        return None;
+    }
+    let token = obj.get("token").and_then(Value::as_object);
+    let tokens = obj.get("tokens").and_then(Value::as_object);
+
+    let access_token = string_field(obj.get("access_token"))
+        .or_else(|| token.and_then(|t| string_field(t.get("access_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("access_token"))));
+    let refresh_token = string_field(obj.get("refresh_token"))
+        .or_else(|| token.and_then(|t| string_field(t.get("refresh_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("refresh_token"))));
+    let id_token = string_field(obj.get("id_token"))
+        .or_else(|| token.and_then(|t| string_field(t.get("id_token"))))
+        .or_else(|| tokens.and_then(|t| string_field(t.get("id_token"))));
+
+    if access_token.is_none() && refresh_token.is_none() && id_token.is_none() {
+        return None;
+    }
+
+    let jwt = id_token.as_deref().and_then(parse_jwt_payload);
+    let email = string_field(obj.get("email"))
+        .or_else(|| token.and_then(|t| string_field(t.get("email"))))
+        .or_else(|| string_field(obj.get("active")))
+        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("email"))))
+        .or_else(|| string_field(obj.get("account")))?;
+
+    let auth_id = string_field(obj.get("auth_id"))
+        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("sub"))));
+    // Antigravity-Manager 的 TokenData 用 expiry_timestamp（秒），我们的 OAuth exchange
+    // 用 expiry_date（毫秒）。token.expires_at / jwt.exp 都按秒处理。
+    let expires_at = number_field(obj.get("expiry_date"))
+        .or_else(|| token.and_then(|t| number_field(t.get("expiry_date"))))
+        .or_else(|| {
+            token.and_then(|t| number_field(t.get("expiry_timestamp"))).map(|s| s.saturating_mul(1000))
+        })
+        .or_else(|| token.and_then(|t| number_field(t.get("expires_at"))))
+        .or_else(|| jwt.as_ref().and_then(|j| number_field(j.get("exp"))));
+    let plan_type = string_field(obj.get("plan_type"))
+        .or_else(|| string_field(obj.get("plan_name")))
+        .or_else(|| string_field(obj.get("planName")))
+        .or_else(|| string_field(obj.get("tier_name")))
+        .or_else(|| string_field(obj.get("subscription_tier")));
+    let now = now_ts();
+    let token_meta = TokenMeta {
+        has_access_token: access_token.is_some(),
+        has_refresh_token: refresh_token.is_some(),
+        has_id_token: id_token.is_some(),
+        expires_at,
+    };
+    let status = derive_status(obj, &token_meta, None);
+
+    // 入库时把识别用的 provider / oauth_client_key 标记写回 auth_payload，确保
+    // 后续 list_accounts / refresh 能稳定走 antigravity 分支。
+    let mut payload = value.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert(
+            "provider".to_string(),
+            Value::String("antigravity".to_string()),
+        );
+        obj.entry("oauth_client_key".to_string())
+            .or_insert_with(|| Value::String(ANTIGRAVITY_OAUTH_CLIENT_KEY.to_string()));
+        if let Some(refresh_token) = refresh_token.as_ref() {
+            obj.entry("refresh_token".to_string())
+                .or_insert_with(|| Value::String(refresh_token.clone()));
+        }
+        if let Some(access_token) = access_token.as_ref() {
+            obj.entry("access_token".to_string())
+                .or_insert_with(|| Value::String(access_token.clone()));
+        }
+        if let Some(id_token) = id_token.as_ref() {
+            obj.entry("id_token".to_string())
+                .or_insert_with(|| Value::String(id_token.clone()));
+        }
+    }
+
+    Some(ManagedAccount {
+        id: string_field(obj.get("id")).unwrap_or_else(|| {
+            format!(
+                "antigravity_{}",
+                stable_hash(&format!(
+                    "{}::{}",
+                    email.to_lowercase(),
+                    auth_id
+                        .clone()
+                        .unwrap_or_else(|| access_token.clone().unwrap_or(email.clone()))
+                ))
+            )
+        }),
+        provider: "antigravity".to_string(),
+        email: email.to_lowercase(),
+        display_name: string_field(obj.get("name")),
+        account_name: string_field(obj.get("name")),
+        organization_id: None,
+        plan: plan_type.clone(),
+        plan_type,
+        auth_file_plan_type: None,
+        subscription_active_until: expires_at.map(|value| Value::Number(value.into())),
+        account_id: auth_id.clone(),
+        user_id: auth_id,
+        source: source.to_string(),
+        token_meta,
+        status: Some(status),
+        quota: payload.as_object().and_then(parse_antigravity_quota),
+        created_at: number_field(obj.get("created_at")).unwrap_or(now),
+        updated_at: number_field(obj.get("last_used"))
+            .or_else(|| number_field(obj.get("updated_at")))
+            .unwrap_or(now),
+        auth_payload: Some(payload),
     })
 }
 
@@ -2816,6 +3009,7 @@ fn apply_windsurf_user_info(account: &mut ManagedAccount, user_info: &Value) {
                     } else {
                         "available".to_string()
                     }),
+                    ..Default::default()
                 });
             }
         }
@@ -2928,6 +3122,7 @@ fn apply_windsurf_plan_status(account: &mut ManagedAccount, plan_status: &Value)
                 .map(|value| Value::Number(value.into())),
             detail: Some(format!("剩余 {remaining}%")),
             state: Some(quota_state_from_remaining(remaining)),
+            ..Default::default()
         });
         let remaining = proto_i64(plan_status.get("weekly_quota_remaining_percent"))
             .unwrap_or(0)
@@ -2942,6 +3137,7 @@ fn apply_windsurf_plan_status(account: &mut ManagedAccount, plan_status: &Value)
                 .map(|value| Value::Number(value.into())),
             detail: Some(format!("剩余 {remaining}%")),
             state: Some(quota_state_from_remaining(remaining)),
+            ..Default::default()
         });
     }
 
@@ -2961,6 +3157,7 @@ fn apply_windsurf_plan_status(account: &mut ManagedAccount, plan_status: &Value)
                 reset_at: account.subscription_active_until.clone(),
                 detail: Some(format!("{}/{} used", used, total)),
                 state: Some(quota_state_from_remaining(remaining)),
+                ..Default::default()
             });
         }
     }
@@ -3847,6 +4044,7 @@ fn rewrite_quota_for_public_usage(account: &mut ManagedAccount) {
         reset_at: account.subscription_active_until.clone(),
         detail: Some(format!("已用 {used}% / 共 {baseline}%")),
         state: Some(quota_state_from_remaining(remaining)),
+        ..Default::default()
     };
     account.quota = Some(AccountQuota {
         metrics: vec![metric],
@@ -4332,6 +4530,7 @@ fn usage_window_metric(
         reset_at: reset_at.map(|value| Value::Number(value.into())),
         detail: Some(format!("剩余 {remaining}%")),
         state: Some(quota_state(Some(remaining))),
+        ..Default::default()
     })
 }
 
@@ -4671,6 +4870,388 @@ async fn refresh_gemini_account_remote(account: &mut ManagedAccount) -> Result<(
     Ok(())
 }
 
+async fn post_antigravity_json(
+    access_token: &str,
+    endpoint: &str,
+    payload: &Value,
+    action: &str,
+) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("创建 Antigravity API 客户端失败: {error}"))?;
+    let response = client
+        .post(endpoint)
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header(CONTENT_TYPE, "application/json")
+        .json(payload)
+        .send()
+        .await
+        .map_err(|error| format!("请求 Antigravity {action} 失败: {error}"))?;
+    let status = response.status();
+    if status.as_u16() == 401 {
+        return Err("UNAUTHORIZED: Antigravity access_token 已失效".to_string());
+    }
+    if status.as_u16() == 403 {
+        return Err("FORBIDDEN: Antigravity 拒绝访问".to_string());
+    }
+    if status.is_success() {
+        return response
+            .json::<Value>()
+            .await
+            .map_err(|error| format!("解析 Antigravity {action} 响应失败: {error}"));
+    }
+    let body = response.text().await.unwrap_or_default();
+    Err(format!(
+        "请求 Antigravity {action} 失败: status={status}, body_len={}",
+        body.len()
+    ))
+}
+
+async fn load_antigravity_code_assist_status(
+    access_token: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    let payload = serde_json::json!({
+        "metadata": {
+            "ideType": "ANTIGRAVITY"
+        }
+    });
+    let mut last_error: Option<String> = None;
+    for url in ANTIGRAVITY_LOAD_CODE_ASSIST_URLS.iter() {
+        match post_antigravity_json(access_token, url, &payload, "loadCodeAssist").await {
+            Ok(value) => {
+                let project_id = value
+                    .get("cloudaicompanionProject")
+                    .and_then(Value::as_str)
+                    .or_else(|| {
+                        value
+                            .get("cloudaicompanionProject")
+                            .and_then(|v| v.get("id"))
+                            .and_then(Value::as_str)
+                    })
+                    .and_then(|v| normalize_non_empty(Some(v)));
+                let paid_tier_name = value
+                    .get("paidTier")
+                    .and_then(|t| t.get("name").or_else(|| t.get("id")))
+                    .and_then(Value::as_str)
+                    .and_then(|v| normalize_non_empty(Some(v)));
+                let current_tier_name = value
+                    .get("currentTier")
+                    .and_then(|t| t.get("name").or_else(|| t.get("id")))
+                    .and_then(Value::as_str)
+                    .and_then(|v| normalize_non_empty(Some(v)));
+                let is_ineligible = value
+                    .get("ineligibleTiers")
+                    .and_then(Value::as_array)
+                    .map(|arr| !arr.is_empty())
+                    .unwrap_or(false);
+                let tier_name = if let Some(name) = paid_tier_name {
+                    Some(name)
+                } else if !is_ineligible {
+                    current_tier_name
+                } else {
+                    value
+                        .get("allowedTiers")
+                        .and_then(Value::as_array)
+                        .and_then(|tiers| {
+                            tiers
+                                .iter()
+                                .find(|t| {
+                                    t.get("isDefault")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false)
+                                })
+                                .or_else(|| tiers.first())
+                        })
+                        .and_then(|t| t.get("name").or_else(|| t.get("id")))
+                        .and_then(Value::as_str)
+                        .and_then(|v| normalize_non_empty(Some(v)))
+                        .map(|n| format!("{n} (Restricted)"))
+                };
+                return Ok((project_id, tier_name));
+            }
+            Err(error) => {
+                let lower = error.to_ascii_lowercase();
+                if lower.contains("unauthorized") {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "Antigravity loadCodeAssist 全部端点失败".to_string()))
+}
+
+async fn fetch_antigravity_available_models(
+    access_token: &str,
+    project_id: Option<&str>,
+) -> Result<Value, String> {
+    let mut payload = serde_json::Map::new();
+    if let Some(pid) = project_id {
+        payload.insert("project".to_string(), Value::String(pid.to_string()));
+    }
+    let base_payload = Value::Object(payload);
+    let mut last_error: Option<String> = None;
+    for (idx, url) in ANTIGRAVITY_FETCH_MODELS_URLS.iter().enumerate() {
+        let mut current_payload = base_payload.clone();
+        let mut retried_without_project = false;
+        loop {
+            match post_antigravity_json(access_token, url, &current_payload, "fetchAvailableModels")
+                .await
+            {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    let lower = error.to_ascii_lowercase();
+                    if lower.contains("unauthorized") {
+                        return Err(error);
+                    }
+                    if lower.contains("forbidden") && !retried_without_project {
+                        if current_payload
+                            .as_object()
+                            .map(|m| m.contains_key("project"))
+                            .unwrap_or(false)
+                        {
+                            current_payload = Value::Object(serde_json::Map::new());
+                            retried_without_project = true;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    last_error = Some(error);
+                    if idx + 1 < ANTIGRAVITY_FETCH_MODELS_URLS.len() {
+                        break;
+                    }
+                    return Err(last_error.unwrap());
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "Antigravity fetchAvailableModels 全部端点失败".to_string()))
+}
+
+fn parse_antigravity_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuota> {
+    let raw = obj
+        .get("antigravity_usage_raw")
+        .and_then(Value::as_object)?;
+    let models_obj = raw.get("models").and_then(Value::as_object)?;
+    let mut metrics: Vec<QuotaMetric> = Vec::new();
+    let mut index = 0usize;
+    for (name, info) in models_obj.iter() {
+        let Some(info) = info.as_object() else {
+            continue;
+        };
+        let lower_name = name.to_ascii_lowercase();
+        if !(lower_name.starts_with("gemini")
+            || lower_name.starts_with("claude")
+            || lower_name.starts_with("gpt")
+            || lower_name.starts_with("image")
+            || lower_name.starts_with("imagen"))
+        {
+            continue;
+        }
+        let quota_info = info.get("quotaInfo").and_then(Value::as_object);
+        let remaining_fraction = quota_info.and_then(|q| {
+            q.get("remainingFraction").and_then(|v| match v {
+                Value::Number(n) => n.as_f64(),
+                Value::String(s) => s.trim().parse::<f64>().ok(),
+                _ => None,
+            })
+        });
+        let remaining = remaining_fraction
+            .map(|f| (f * 100.0).round().clamp(0.0, 100.0) as i64);
+        let reset_time = quota_info
+            .and_then(|q| q.get("resetTime").or_else(|| q.get("reset_time")))
+            .cloned();
+        let display_name = info
+            .get("displayName")
+            .and_then(Value::as_str)
+            .and_then(|v| normalize_non_empty(Some(v)));
+        let thinking_budget = info
+            .get("thinkingBudget")
+            .and_then(|v| match v {
+                Value::Number(n) => n.as_i64(),
+                _ => None,
+            });
+        let label = display_name.clone().unwrap_or_else(|| name.clone());
+        metrics.push(QuotaMetric {
+            key: format!("antigravity-{}", index),
+            label,
+            remaining_percent: remaining,
+            reset_at: reset_time,
+            detail: Some(format!("{name} 剩余 {}%", remaining.unwrap_or(0))),
+            state: Some(quota_state(remaining)),
+            display_name,
+            thinking_budget,
+            model_name: Some(name.clone()),
+        });
+        index += 1;
+    }
+    let error = string_field(obj.get("quota_query_last_error"));
+    let is_forbidden = bool_field(obj.get("is_forbidden")).unwrap_or(false);
+    if metrics.is_empty() && error.is_none() && !is_forbidden {
+        return None;
+    }
+    Some(AccountQuota {
+        metrics,
+        last_updated: number_field(obj.get("usage_updated_at")),
+        error,
+        is_forbidden: Some(is_forbidden),
+    })
+}
+
+async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
+    if account.provider != "antigravity" {
+        return Ok(());
+    }
+    let mut access_token = gemini_payload_string(account, "access_token", "accessToken")
+        .ok_or_else(|| "缺少 Antigravity access_token".to_string())?;
+    let refresh_token = gemini_payload_string(account, "refresh_token", "refreshToken");
+
+    if gemini_payload_expiry(account)
+        .map(|expiry| expiry <= now_ts_ms() + 300_000)
+        .unwrap_or(false)
+    {
+        let refresh_token = refresh_token
+            .clone()
+            .ok_or_else(|| "Antigravity refresh_token 不存在，无法刷新 access_token".to_string())?;
+        let refreshed = refresh_antigravity_access_token(&refresh_token).await?;
+        access_token = refreshed
+            .access_token
+            .ok_or_else(|| "Antigravity token 刷新后 access_token 为空".to_string())?;
+        if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
+            payload.insert(
+                "access_token".to_string(),
+                Value::String(access_token.clone()),
+            );
+            if let Some(id_token) = refreshed.id_token {
+                payload.insert("id_token".to_string(), Value::String(id_token));
+            }
+            if let Some(token_type) = refreshed.token_type {
+                payload.insert("token_type".to_string(), Value::String(token_type));
+            }
+            if let Some(scope) = refreshed.scope {
+                payload.insert("scope".to_string(), Value::String(scope));
+            }
+            if let Some(expires_in) = refreshed.expires_in {
+                let expiry_date = now_ts_ms() + expires_in.saturating_mul(1000);
+                payload.insert("expiry_date".to_string(), Value::Number(expiry_date.into()));
+                account.token_meta.expires_at = Some(expiry_date);
+                account.subscription_active_until = Some(Value::Number(expiry_date.into()));
+            }
+        }
+    }
+
+    if let Some(userinfo) = fetch_google_userinfo(&access_token).await {
+        if let Some(email) = normalize_non_empty(userinfo.email.as_deref()) {
+            account.email = email.to_lowercase();
+        }
+        if account.user_id.is_none() {
+            account.user_id = normalize_non_empty(userinfo.id.as_deref());
+        }
+        if account.account_id.is_none() {
+            account.account_id = account.user_id.clone();
+        }
+        if account.display_name.is_none() {
+            account.display_name = normalize_non_empty(userinfo.name.as_deref());
+        }
+    }
+
+    // Refresh tier + quota from Antigravity (CloudCode) backend.
+    let mut status_result = load_antigravity_code_assist_status(&access_token).await;
+    if let Err(error) = &status_result {
+        if error.contains("UNAUTHORIZED") {
+            if let Some(ref refresh_token) = refresh_token {
+                let refreshed = refresh_antigravity_access_token(refresh_token).await?;
+                access_token = refreshed
+                    .access_token
+                    .ok_or_else(|| "Antigravity token 刷新后 access_token 为空".to_string())?;
+                if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut)
+                {
+                    payload.insert(
+                        "access_token".to_string(),
+                        Value::String(access_token.clone()),
+                    );
+                }
+                status_result = load_antigravity_code_assist_status(&access_token).await;
+            }
+        }
+    }
+
+    let (project_id, tier_name) = match status_result {
+        Ok(value) => value,
+        Err(error) => {
+            // Network / auth-level failure when reading subscription info: keep going so
+            // we still surface a status, but skip the quota fetch.
+            if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
+                payload.insert(
+                    "antigravity_status_error".to_string(),
+                    Value::String(error.clone()),
+                );
+            }
+            (None, None)
+        }
+    };
+
+    if let Some(tier) = tier_name.clone() {
+        account.plan = Some(tier.clone());
+        account.plan_type = Some(tier);
+    }
+    if let Some(pid) = project_id.clone() {
+        if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
+            payload.insert(
+                "antigravity_project_id".to_string(),
+                Value::String(pid),
+            );
+        }
+    }
+
+    match fetch_antigravity_available_models(&access_token, project_id.as_deref()).await {
+        Ok(quota_value) => {
+            if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
+                payload.insert("antigravity_usage_raw".to_string(), quota_value);
+                payload.insert(
+                    "usage_updated_at".to_string(),
+                    Value::Number(now_ts().into()),
+                );
+                payload.remove("quota_query_last_error");
+                payload.remove("is_forbidden");
+            }
+            let empty = serde_json::Map::new();
+            let payload = account
+                .auth_payload
+                .as_ref()
+                .and_then(Value::as_object)
+                .unwrap_or(&empty);
+            account.quota = parse_antigravity_quota(payload);
+        }
+        Err(error) => {
+            let lower = error.to_ascii_lowercase();
+            let is_forbidden = lower.contains("forbidden") || lower.contains("403");
+            if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
+                payload.insert(
+                    "quota_query_last_error".to_string(),
+                    Value::String(error.clone()),
+                );
+                if is_forbidden {
+                    payload.insert("is_forbidden".to_string(), Value::Bool(true));
+                } else {
+                    payload.remove("is_forbidden");
+                }
+            }
+            account.quota = Some(AccountQuota {
+                metrics: vec![],
+                last_updated: Some(now_ts()),
+                error: Some(error),
+                is_forbidden: Some(is_forbidden),
+            });
+        }
+    }
+
+    account.updated_at = now_ts();
+    account.status = Some(fallback_status_refreshed(account));
+    Ok(())
+}
+
 fn fallback_status_refreshed(account: &ManagedAccount) -> AccountStatus {
     let empty = serde_json::Map::new();
     let obj = account
@@ -4774,6 +5355,11 @@ async fn refresh_imported_accounts(accounts: &mut [ManagedAccount]) {
                     mark_account_unavailable(account, error);
                 }
             }
+            "antigravity" => {
+                if let Err(error) = refresh_antigravity_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
             "windsurf" => {
                 if let Err(error) = refresh_windsurf_account_remote(account).await {
                     mark_account_unavailable(account, error);
@@ -4848,13 +5434,14 @@ fn parse_auth_json_content(content: &str, source: &str, label: &str) -> ImportRe
         };
         if let Some(account) = parse_codex_account(item, source)
             .or_else(|| parse_windsurf_account(item, source))
+            .or_else(|| parse_antigravity_account(item, source))
             .or_else(|| parse_gemini_account(item, source))
         {
             imported.push(account);
         } else {
             failed.push(ImportFailure {
                 label: item_label,
-                reason: "未识别到 Codex / Gemini / SuperAI 凭证字段".to_string(),
+                reason: "未识别到 Codex / Gemini / Antigravity / SuperAI 凭证字段".to_string(),
             });
         }
     }
@@ -5807,6 +6394,158 @@ async fn refresh_gemini_access_token(refresh_token: &str) -> Result<OAuthTokenRe
         .map_err(|error| format!("解析 Gemini access_token 刷新响应失败: {error}"))
 }
 
+fn build_antigravity_oauth_url(redirect_uri: &str, state: &str) -> Result<String, String> {
+    let mut url = Url::parse(ANTIGRAVITY_OAUTH_AUTH_URL)
+        .map_err(|error| format!("构建 Antigravity OAuth URL 失败: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("access_type", "offline")
+        .append_pair("prompt", "consent")
+        .append_pair("include_granted_scopes", "true")
+        .append_pair("scope", ANTIGRAVITY_OAUTH_SCOPES)
+        .append_pair("state", state);
+    Ok(url.to_string())
+}
+
+async fn exchange_antigravity_oauth_code(
+    code: &str,
+    redirect_uri: &str,
+) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("创建 Antigravity OAuth 客户端失败: {error}"))?;
+    let response = client
+        .post(ANTIGRAVITY_OAUTH_TOKEN_URL)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&[
+            ("code", code),
+            ("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID),
+            ("client_secret", ANTIGRAVITY_OAUTH_CLIENT_SECRET),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("请求 Antigravity OAuth token 失败: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Antigravity OAuth token 交换失败: status={status}, body_len={}",
+            body.len()
+        ));
+    }
+    let payload = response
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|error| format!("解析 Antigravity OAuth token 响应失败: {error}"))?;
+    let access_token = payload.access_token.clone().ok_or_else(|| {
+        format!(
+            "Antigravity OAuth 响应缺少 access_token: error={:?}, desc={:?}",
+            payload.error, payload.error_description
+        )
+    })?;
+    let user_info = fetch_google_userinfo(&access_token).await;
+    let email = normalize_non_empty(user_info.as_ref().and_then(|info| info.email.as_deref()))
+        .or_else(|| {
+            payload
+                .id_token
+                .as_deref()
+                .and_then(parse_jwt_payload)
+                .and_then(|jwt| string_field(jwt.get("email")))
+        })
+        .unwrap_or_else(|| "unknown@gmail.com".to_string());
+    let auth_id = normalize_non_empty(user_info.as_ref().and_then(|info| info.id.as_deref()))
+        .or_else(|| {
+            payload
+                .id_token
+                .as_deref()
+                .and_then(parse_jwt_payload)
+                .and_then(|jwt| string_field(jwt.get("sub")))
+        });
+    let name = normalize_non_empty(user_info.as_ref().and_then(|info| info.name.as_deref()))
+        .or_else(|| {
+            payload
+                .id_token
+                .as_deref()
+                .and_then(parse_jwt_payload)
+                .and_then(|jwt| string_field(jwt.get("name")))
+        });
+    let expiry_date = payload
+        .expires_in
+        .map(|seconds| now_ts_ms() + seconds.saturating_mul(1000));
+
+    let mut result = serde_json::Map::new();
+    result.insert(
+        "provider".to_string(),
+        Value::String("antigravity".to_string()),
+    );
+    result.insert(
+        "oauth_client_key".to_string(),
+        Value::String(ANTIGRAVITY_OAUTH_CLIENT_KEY.to_string()),
+    );
+    result.insert("access_token".to_string(), Value::String(access_token));
+    if let Some(refresh_token) = payload.refresh_token {
+        result.insert("refresh_token".to_string(), Value::String(refresh_token));
+    }
+    if let Some(id_token) = payload.id_token {
+        result.insert("id_token".to_string(), Value::String(id_token));
+    }
+    if let Some(token_type) = payload.token_type {
+        result.insert("token_type".to_string(), Value::String(token_type));
+    }
+    if let Some(scope) = payload.scope {
+        result.insert("scope".to_string(), Value::String(scope));
+    }
+    if let Some(expiry_date) = expiry_date {
+        result.insert("expiry_date".to_string(), Value::Number(expiry_date.into()));
+    }
+    result.insert("email".to_string(), Value::String(email));
+    if let Some(auth_id) = auth_id {
+        result.insert("auth_id".to_string(), Value::String(auth_id));
+    }
+    if let Some(name) = name {
+        result.insert("name".to_string(), Value::String(name));
+    }
+    Ok(Value::Object(result))
+}
+
+async fn refresh_antigravity_access_token(
+    refresh_token: &str,
+) -> Result<OAuthTokenResponse, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("创建 Antigravity token 客户端失败: {error}"))?;
+    let response = client
+        .post(ANTIGRAVITY_OAUTH_TOKEN_URL)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .form(&[
+            ("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID),
+            ("client_secret", ANTIGRAVITY_OAUTH_CLIENT_SECRET),
+            ("refresh_token", refresh_token),
+            ("grant_type", "refresh_token"),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("刷新 Antigravity access_token 请求失败: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "刷新 Antigravity access_token 失败: status={status}, body_len={}",
+            body.len()
+        ));
+    }
+    response
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|error| format!("解析 Antigravity access_token 刷新响应失败: {error}"))
+}
+
 async fn post_gemini_code_assist_json(
     access_token: &str,
     endpoint: &str,
@@ -5908,6 +6647,11 @@ async fn refresh_account(
                 mark_account_unavailable(&mut account, error);
             }
         }
+        "antigravity" => {
+            if let Err(error) = refresh_antigravity_account_remote(&mut account).await {
+                mark_account_unavailable(&mut account, error);
+            }
+        }
         "windsurf" => {
             if let Err(error) = refresh_windsurf_account_remote(&mut account).await {
                 mark_account_unavailable(&mut account, error);
@@ -5960,6 +6704,11 @@ async fn refresh_provider_accounts(
                     mark_account_unavailable(account, error);
                 }
             }
+            "antigravity" => {
+                if let Err(error) = refresh_antigravity_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
             "windsurf" => {
                 if let Err(error) = refresh_windsurf_account_remote(account).await {
                     mark_account_unavailable(account, error);
@@ -6003,6 +6752,11 @@ async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccoun
             }
             "gemini" => {
                 if let Err(error) = refresh_gemini_account_remote(account).await {
+                    mark_account_unavailable(account, error);
+                }
+            }
+            "antigravity" => {
+                if let Err(error) = refresh_antigravity_account_remote(account).await {
                     mark_account_unavailable(account, error);
                 }
             }
@@ -6288,10 +7042,45 @@ fn import_accounts_from_json(
     app: tauri::AppHandle,
     json_content: String,
     label: Option<String>,
+    provider_hint: Option<String>,
 ) -> Result<ImportResult, String> {
-    let result =
-        parse_auth_json_content(&json_content, "paste", label.as_deref().unwrap_or("JSON"));
+    let hinted = apply_provider_hint(&json_content, provider_hint.as_deref());
+    let payload = hinted.as_deref().unwrap_or(&json_content);
+    let result = parse_auth_json_content(payload, "paste", label.as_deref().unwrap_or("JSON"));
     persist_and_refresh_imported(app, result)
+}
+
+/// 当用户在某个 provider tab 下粘贴/上传 JSON 时，把该 provider 注入到每个
+/// item 顶层，确保 parse 链能稳定路由到对应 parser。目前只对 antigravity
+/// 启用（codex/gemini 已有靠 token 字段名能稳定识别的路径）。
+fn apply_provider_hint(content: &str, provider_hint: Option<&str>) -> Option<String> {
+    let hint = provider_hint?.trim();
+    if hint != "antigravity" {
+        return None;
+    }
+    let mut parsed: Value = serde_json::from_str(content).ok()?;
+    fn inject(value: &mut Value) {
+        if let Some(obj) = value.as_object_mut() {
+            obj.entry("provider".to_string())
+                .or_insert_with(|| Value::String("antigravity".to_string()));
+        }
+    }
+    if let Some(arr) = parsed.as_array_mut() {
+        for item in arr.iter_mut() {
+            inject(item);
+        }
+    } else if let Some(accounts) = parsed
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("accounts"))
+        .and_then(Value::as_array_mut)
+    {
+        for item in accounts.iter_mut() {
+            inject(item);
+        }
+    } else {
+        inject(&mut parsed);
+    }
+    serde_json::to_string(&parsed).ok()
 }
 
 #[tauri::command]
@@ -6503,6 +7292,78 @@ async fn complete_gemini_oauth(
     };
     let payload = exchange_gemini_oauth_code(&code, &pending.redirect_uri).await?;
     let result = parse_auth_json_content(&payload.to_string(), "oauth", "Gemini OAuth");
+    let result = persist_and_refresh_imported(app, result)?;
+    oauth_pending_remove(&login_id);
+    Ok(result)
+}
+
+#[tauri::command]
+fn start_antigravity_oauth() -> Result<OAuthStartResult, String> {
+    cancel_pending_oauth_for_provider("antigravity");
+    let port = reserve_callback_port(None)?;
+    let login_id = random_urlsafe_token(24);
+    let state = random_urlsafe_token(24);
+    let redirect_uri = format!("http://127.0.0.1:{port}{ANTIGRAVITY_OAUTH_CALLBACK_PATH}");
+    let auth_url = build_antigravity_oauth_url(&redirect_uri, &state)?;
+    OAUTH_PENDING
+        .lock()
+        .map_err(|_| "OAuth 状态锁失败".to_string())?
+        .insert(
+            login_id.clone(),
+            OAuthPending {
+                provider: "antigravity".to_string(),
+                redirect_uri,
+                state,
+                code_verifier: None,
+                port,
+                expires_at: now_ts() + OAUTH_TIMEOUT_SECONDS,
+                code: None,
+            },
+        );
+    start_oauth_callback_listener(
+        login_id.clone(),
+        "antigravity".to_string(),
+        port,
+        ANTIGRAVITY_OAUTH_CALLBACK_PATH.to_string(),
+        None,
+    );
+    open_oauth_url(&auth_url)?;
+
+    Ok(OAuthStartResult {
+        login_id,
+        provider: "antigravity".to_string(),
+        command: auth_url.clone(),
+        message: "已启动 Antigravity OAuth，完成浏览器授权后会自动添加。".to_string(),
+        auth_url: Some(auth_url),
+    })
+}
+
+#[tauri::command]
+async fn complete_antigravity_oauth(
+    app: tauri::AppHandle,
+    login_id: String,
+) -> Result<ImportResult, String> {
+    let Some(pending) = oauth_pending_get(&login_id)? else {
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
+    };
+    if pending.provider != "antigravity" {
+        return Err("无效的 Antigravity OAuth 会话".to_string());
+    }
+    if pending.expires_at <= now_ts() {
+        oauth_pending_remove(&login_id);
+        return Err("Antigravity OAuth 登录已超时，请重新发起授权".to_string());
+    }
+    let Some(code) = pending.code else {
+        return Ok(ImportResult {
+            imported: vec![],
+            failed: vec![],
+        });
+    };
+    let payload = exchange_antigravity_oauth_code(&code, &pending.redirect_uri).await?;
+    let result = parse_auth_json_content(&payload.to_string(), "oauth", "Antigravity OAuth");
     let result = persist_and_refresh_imported(app, result)?;
     oauth_pending_remove(&login_id);
     Ok(result)
@@ -7162,6 +8023,8 @@ pub fn run() {
             complete_codex_oauth,
             start_gemini_oauth,
             complete_gemini_oauth,
+            start_antigravity_oauth,
+            complete_antigravity_oauth,
             add_superai_account_by_password,
             add_superai_accounts_by_batch_keys,
             add_superai_account_by_token,

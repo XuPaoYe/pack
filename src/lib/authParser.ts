@@ -8,7 +8,7 @@ const __SUPERAI_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
   .join("");
 const EXAFUNCTION_SUPERAI_AUD = "exafunction-" + __SUPERAI_AUD_PROTOCOL;
 
-export type Provider = "codex" | "gemini" | "superai";
+export type Provider = "codex" | "gemini" | "superai" | "antigravity";
 
 export type ImportSource = "paste" | "file" | "local" | "oauth";
 
@@ -55,6 +55,9 @@ export type QuotaMetric = {
   resetAt?: number | string;
   detail?: string;
   state?: AccountState;
+  displayName?: string;
+  thinkingBudget?: number;
+  modelName?: string;
 };
 
 export type AccountQuota = {
@@ -240,6 +243,65 @@ function parseGeminiQuota(value: JsonObject): AccountQuota | undefined {
     metrics,
     lastUpdated: numberField(value.usage_updated_at),
     error,
+  };
+}
+
+function parseAntigravityQuota(value: JsonObject): AccountQuota | undefined {
+  const raw = isObject(value.antigravity_usage_raw) ? value.antigravity_usage_raw : undefined;
+  const modelsObj = raw && isObject(raw.models) ? raw.models : undefined;
+  const metrics: QuotaMetric[] = [];
+
+  if (modelsObj) {
+    const entries = Object.entries(modelsObj);
+    entries.forEach(([name, info], index) => {
+      if (!isObject(info)) return;
+      const lower = name.toLowerCase();
+      if (
+        !(lower.startsWith("gemini") ||
+          lower.startsWith("claude") ||
+          lower.startsWith("gpt") ||
+          lower.startsWith("image") ||
+          lower.startsWith("imagen"))
+      ) {
+        return;
+      }
+      const quotaInfo = isObject(info.quotaInfo) ? info.quotaInfo : undefined;
+      const remainingFractionRaw = quotaInfo?.remainingFraction;
+      let remainingFraction: number | undefined;
+      if (typeof remainingFractionRaw === "number") {
+        remainingFraction = remainingFractionRaw;
+      } else if (typeof remainingFractionRaw === "string") {
+        const parsed = Number(remainingFractionRaw);
+        if (Number.isFinite(parsed)) remainingFraction = parsed;
+      }
+      const remainingPercent = remainingFraction !== undefined
+        ? Math.max(0, Math.min(100, Math.round(remainingFraction * 100)))
+        : undefined;
+      const displayName = stringField(info.displayName);
+      const thinkingBudget = typeof info.thinkingBudget === "number" ? info.thinkingBudget : undefined;
+      const resetTime = stringField(quotaInfo?.resetTime) ?? stringField(quotaInfo?.reset_time);
+      metrics.push({
+        key: `antigravity-${index}`,
+        label: displayName ?? name,
+        remainingPercent,
+        resetAt: resetTime,
+        state: quotaState(remainingPercent),
+        displayName,
+        thinkingBudget,
+        modelName: name,
+      });
+    });
+  }
+
+  const error = stringField(value.quota_query_last_error);
+  const isForbidden = boolField(value.is_forbidden) ?? false;
+  if (!metrics.length && !error && !isForbidden) return undefined;
+
+  return {
+    metrics,
+    lastUpdated: numberField(value.usage_updated_at),
+    error,
+    isForbidden,
   };
 }
 
@@ -565,6 +627,98 @@ function parseSuperAI(value: unknown, source: ImportSource): ManagedAccount | nu
   };
 }
 
+function looksLikeAntigravity(value: JsonObject): boolean {
+  const provider = stringField(value.provider)?.toLowerCase();
+  if (provider === "antigravity") return true;
+  const oauthClientKey = stringField(value.oauth_client_key)?.toLowerCase();
+  if (oauthClientKey === "antigravity_enterprise") return true;
+  const token = isObject(value.token) ? value.token : undefined;
+  if (token) {
+    const tokenOauthKey = stringField(token.oauth_client_key)?.toLowerCase();
+    if (tokenOauthKey === "antigravity_enterprise") return true;
+    // Antigravity-Manager 的 TokenData 独有这两个字段
+    if ("is_gcp_tos" in token && "expiry_timestamp" in token) return true;
+  }
+  const scope = stringField(value.scope) ?? stringField(token?.scope);
+  if (scope) {
+    const lower = scope.toLowerCase();
+    if (lower.includes("cclog") || lower.includes("experimentsandconfigs")) return true;
+  }
+  return false;
+}
+
+function parseAntigravity(value: unknown, source: ImportSource): ManagedAccount | null {
+  if (!isObject(value)) return null;
+  if (!looksLikeAntigravity(value)) return null;
+
+  const token = isObject(value.token) ? value.token : undefined;
+  const accessToken =
+    stringField(value.access_token) ??
+    stringField(value.accessToken) ??
+    stringField(token?.access_token) ??
+    stringField(token?.accessToken);
+  const refreshToken =
+    stringField(value.refresh_token) ??
+    stringField(value.refreshToken) ??
+    stringField(token?.refresh_token) ??
+    stringField(token?.refreshToken);
+  const idToken =
+    stringField(value.id_token) ??
+    stringField(value.idToken) ??
+    stringField(token?.id_token) ??
+    stringField(token?.idToken);
+
+  if (!accessToken && !refreshToken && !idToken) return null;
+
+  const jwt = parseJwtPayload(idToken);
+  const email =
+    stringField(value.email) ??
+    stringField(value.active) ??
+    stringField(jwt?.email) ??
+    stringField(value.account);
+  if (!email) return null;
+
+  const authId = stringField(value.auth_id) ?? stringField(value.authId) ?? stringField(jwt?.sub);
+  const planType =
+    stringField(value.plan_type) ??
+    stringField(value.plan_name) ??
+    stringField(value.planName) ??
+    stringField(value.tier_name) ??
+    stringField(value.subscription_tier);
+  const expiresAt =
+    numberField(value.expiry_date) ??
+    numberField(value.expiryDate) ??
+    numberField(token?.expires_at) ??
+    numberField(token?.expiresAt) ??
+    numberField(jwt?.exp);
+  const now = nowUnixSeconds();
+  const tokenMeta = {
+    hasAccessToken: Boolean(accessToken),
+    hasRefreshToken: Boolean(refreshToken),
+    hasIdToken: Boolean(idToken),
+    expiresAt,
+  };
+  const quota = parseAntigravityQuota(value);
+
+  return {
+    id: stringField(value.id) ?? accountIdFor("antigravity", email, authId ?? accessToken ?? email),
+    provider: "antigravity",
+    email: email.toLowerCase(),
+    displayName: stringField(value.name),
+    plan: planType,
+    planType,
+    subscriptionActiveUntil: expiresAt,
+    accountId: authId,
+    userId: authId,
+    source,
+    tokenMeta,
+    status: deriveStatus(value, tokenMeta, quota),
+    quota,
+    createdAt: numberField(value.created_at) ?? now,
+    updatedAt: numberField(value.last_used) ?? numberField(value.updated_at) ?? now,
+  };
+}
+
 function parseGemini(value: unknown, source: ImportSource): ManagedAccount | null {
   if (!isObject(value)) return null;
 
@@ -645,11 +799,11 @@ export function parseAuthJson(content: string, source: ImportSource, label = "JS
 
   items.forEach((item, index) => {
     const itemLabel = `${label}${items.length > 1 ? ` #${index + 1}` : ""}`;
-    const account = parseCodex(item, source) ?? parseSuperAI(item, source) ?? parseGemini(item, source);
+    const account = parseCodex(item, source) ?? parseSuperAI(item, source) ?? parseAntigravity(item, source) ?? parseGemini(item, source);
     if (account) {
       imported.push(account);
     } else {
-      failed.push({ label: itemLabel, reason: "未识别到 Codex 或 Gemini 凭证字段" });
+      failed.push({ label: itemLabel, reason: "未识别到 Codex / Antigravity / Gemini 凭证字段" });
     }
   });
 
