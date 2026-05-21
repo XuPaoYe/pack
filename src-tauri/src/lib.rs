@@ -1783,15 +1783,16 @@ fn parse_antigravity_account(value: &Value, source: &str) -> Option<ManagedAccou
     let token = obj.get("token").and_then(Value::as_object);
     let tokens = obj.get("tokens").and_then(Value::as_object);
 
-    let access_token = string_field(obj.get("access_token"))
-        .or_else(|| token.and_then(|t| string_field(t.get("access_token"))))
-        .or_else(|| tokens.and_then(|t| string_field(t.get("access_token"))));
-    let refresh_token = string_field(obj.get("refresh_token"))
-        .or_else(|| token.and_then(|t| string_field(t.get("refresh_token"))))
-        .or_else(|| tokens.and_then(|t| string_field(t.get("refresh_token"))));
-    let id_token = string_field(obj.get("id_token"))
-        .or_else(|| token.and_then(|t| string_field(t.get("id_token"))))
-        .or_else(|| tokens.and_then(|t| string_field(t.get("id_token"))));
+    let access_token =
+        nested_string_field(obj, token, "access_token", "accessToken").or_else(|| {
+            tokens.and_then(|t| nested_string_field(t, None, "access_token", "accessToken"))
+        });
+    let refresh_token =
+        nested_string_field(obj, token, "refresh_token", "refreshToken").or_else(|| {
+            tokens.and_then(|t| nested_string_field(t, None, "refresh_token", "refreshToken"))
+        });
+    let id_token = nested_string_field(obj, token, "id_token", "idToken")
+        .or_else(|| tokens.and_then(|t| nested_string_field(t, None, "id_token", "idToken")));
 
     if access_token.is_none() && refresh_token.is_none() && id_token.is_none() {
         return None;
@@ -2401,6 +2402,15 @@ fn build_windsurf_payload(account: &ManagedAccount) -> Result<Value, String> {
     }
     result.insert("tokens".to_string(), Value::Object(tokens_map));
     Ok(Value::Object(result))
+}
+
+fn build_antigravity_export_payload(account: &ManagedAccount) -> Result<Value, String> {
+    let refresh_token = gemini_payload_string(account, "refresh_token", "refreshToken")
+        .ok_or_else(|| "Antigravity 账号缺少 refresh_token，无法导出最小凭证".to_string())?;
+    Ok(serde_json::json!({
+        "email": account.email,
+        "refresh_token": refresh_token,
+    }))
 }
 
 async fn windsurf_firebase_sign_in(email: &str, password: &str) -> Result<Value, String> {
@@ -5129,11 +5139,11 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
     if account.provider != "antigravity" {
         return Ok(());
     }
-    let mut access_token = gemini_payload_string(account, "access_token", "accessToken")
-        .ok_or_else(|| "缺少 Antigravity access_token".to_string())?;
     let refresh_token = gemini_payload_string(account, "refresh_token", "refreshToken");
+    let mut access_token = gemini_payload_string(account, "access_token", "accessToken");
 
-    if gemini_payload_expiry(account)
+    if access_token.is_none()
+        || gemini_payload_expiry(account)
         .map(|expiry| expiry <= now_ts_ms() + 300_000)
         .unwrap_or(false)
     {
@@ -5141,16 +5151,17 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
             .clone()
             .ok_or_else(|| "Antigravity refresh_token 不存在，无法刷新 access_token".to_string())?;
         let refreshed = refresh_antigravity_access_token(&refresh_token).await?;
-        access_token = refreshed
+        let next_access_token = refreshed
             .access_token
             .ok_or_else(|| "Antigravity token 刷新后 access_token 为空".to_string())?;
         if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
             payload.insert(
                 "access_token".to_string(),
-                Value::String(access_token.clone()),
+                Value::String(next_access_token.clone()),
             );
             if let Some(id_token) = refreshed.id_token {
                 payload.insert("id_token".to_string(), Value::String(id_token));
+                account.token_meta.has_id_token = true;
             }
             if let Some(token_type) = refreshed.token_type {
                 payload.insert("token_type".to_string(), Value::String(token_type));
@@ -5165,7 +5176,12 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
                 account.subscription_active_until = Some(Value::Number(expiry_date.into()));
             }
         }
+        account.token_meta.has_access_token = true;
+        access_token = Some(next_access_token);
     }
+
+    let mut access_token =
+        access_token.ok_or_else(|| "缺少 Antigravity access_token".to_string())?;
 
     if let Some(userinfo) = fetch_google_userinfo(&access_token).await {
         if let Some(email) = normalize_non_empty(userinfo.email.as_deref()) {
@@ -6923,6 +6939,7 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
     let value = match account.provider.as_str() {
         "codex" => build_codex_auth_payload(&account)?,
         "gemini" => build_gemini_oauth_payload(&account)?,
+        "antigravity" => build_antigravity_export_payload(&account)?,
         "windsurf" if is_public_build() => {
             return Err("公开版不允许导出 SuperAI 原始凭证".to_string());
         }
