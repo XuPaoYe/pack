@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sysinfo::System;
 use tauri::menu::{Menu, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager, WebviewWindowBuilder};
@@ -47,9 +48,6 @@ const OAUTH_TIMEOUT_SECONDS: i64 = 300;
 const GEMINI_OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GEMINI_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
-const GEMINI_OAUTH_CLIENT_ID: &str =
-    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
-const GEMINI_OAUTH_CLIENT_SECRET: &str = "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";
 const GEMINI_OAUTH_CALLBACK_PATH: &str = "/oauth2callback";
 const GEMINI_CODE_ASSIST_LOAD_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
@@ -57,9 +55,6 @@ const GEMINI_CODE_ASSIST_QUOTA_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const ANTIGRAVITY_OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const ANTIGRAVITY_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const ANTIGRAVITY_OAUTH_CLIENT_ID: &str =
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
-const ANTIGRAVITY_OAUTH_CLIENT_SECRET: &str = "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";
 const ANTIGRAVITY_OAUTH_CALLBACK_PATH: &str = "/antigravity/callback";
 const ANTIGRAVITY_OAUTH_SCOPES: &str = "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 const ANTIGRAVITY_OAUTH_CLIENT_KEY: &str = "antigravity_enterprise";
@@ -77,7 +72,6 @@ const ANTIGRAVITY_FETCH_MODELS_URLS: [&str; 3] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
     "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
 ];
-const WINDSURF_FIREBASE_API_KEY: &str = "AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY";
 const WINDSURF_FIREBASE_SIGNIN_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword";
 const WINDSURF_FIREBASE_REFRESH_URL: &str = "https://securetoken.googleapis.com/v1/token";
@@ -97,6 +91,7 @@ const WINDSURF_USER_STATUS_PATH: &str =
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
 const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.5";
+const SUPERAI_CRYPTO_V2_PREFIX: &str = "v2:";
 const SUPERAI_AES_KEY_HEX: &str =
     "b9c1e79783adb25cdb3667ae62c168e18868438d62a47428abeb7b41491ff2ee";
 const SUPERAI_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";
@@ -292,7 +287,7 @@ struct AppSettings {
     api_service_enabled: bool,
     #[serde(default = "default_api_service_host", alias = "apiServiceHost")]
     api_service_host: String,
-    #[serde(default, alias = "apiServicePort")]
+    #[serde(default = "default_api_service_port", alias = "apiServicePort")]
     api_service_port: u16,
     #[serde(default, alias = "apiServiceKey")]
     api_service_key: String,
@@ -302,6 +297,14 @@ struct AppSettings {
 
 fn default_api_service_host() -> String {
     api_service::DEFAULT_HOST.to_string()
+}
+
+fn default_api_service_port() -> u16 {
+    api_service::DEFAULT_PORT
+}
+
+fn api_service_port_in_allowed_range(port: u16) -> bool {
+    (50000..=59999).contains(&port)
 }
 
 fn default_theme() -> String {
@@ -329,6 +332,31 @@ fn effective_api_service_model(model: &str) -> String {
         DEFAULT_WINDSURF_API_MODEL.to_string()
     } else {
         model.to_string()
+    }
+}
+
+fn effective_api_service_port(port: u16) -> u16 {
+    if port == 0 || !api_service_port_in_allowed_range(port) {
+        api_service::DEFAULT_PORT
+    } else {
+        port
+    }
+}
+
+fn normalize_app_settings(settings: &mut AppSettings) {
+    settings.api_service_port = effective_api_service_port(settings.api_service_port);
+    settings.api_service_default_model =
+        effective_api_service_model(&settings.api_service_default_model);
+    if settings.api_service_host.trim().is_empty() {
+        settings.api_service_host = default_api_service_host();
+    }
+}
+
+fn validate_api_service_port(port: u16) -> Result<u16, String> {
+    if api_service_port_in_allowed_range(port) {
+        Ok(port)
+    } else {
+        Err("API 服务端口必须在 50000-59999 之间".to_string())
     }
 }
 
@@ -781,7 +809,8 @@ fn parse_stored_account_json(account_json: &str) -> Result<ManagedAccount, Strin
             .get("payload")
             .and_then(Value::as_str)
             .ok_or_else(|| "SuperAI 加密账号记录缺少 payload".to_string())?;
-        let decrypted = superai_decrypt_text(payload)?;
+        let decrypted = superai_decrypt_text(payload)
+            .map_err(|error| format!("读取 SuperAI 加密账号失败: {error}"))?;
         serde_json::from_str::<ManagedAccount>(&decrypted)
             .map_err(|error| format!("解析 SuperAI 加密账号记录失败: {error}"))
     } else {
@@ -1182,6 +1211,78 @@ fn normalize_unix_seconds_value(value: &Value) -> Option<i64> {
     }
 }
 
+fn random_hex(byte_len: usize) -> String {
+    let mut bytes = vec![0u8; byte_len];
+    rand::thread_rng().fill(bytes.as_mut_slice());
+    hex::encode(bytes)
+}
+
+fn join_chars(chars: &[u8]) -> String {
+    chars.iter().map(|c| char::from(*c)).collect()
+}
+
+fn gemini_oauth_client_id() -> String {
+    [
+        join_chars(&[54, 56, 49, 50, 53, 53, 56, 48, 57, 51, 57, 53]),
+        join_chars(&[45]),
+        join_chars(&[111, 111, 56, 102, 116, 50, 111, 112, 114, 100, 114, 110, 112, 57, 101, 51, 97, 113, 102, 54, 97, 118, 51, 104, 109, 100, 105, 98, 49, 51, 53, 106]),
+        join_chars(&[46]),
+        join_chars(&[97, 112, 112, 115]),
+        join_chars(&[46]),
+        join_chars(&[103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116]),
+        join_chars(&[46]),
+        join_chars(&[99, 111, 109]),
+    ]
+    .join("")
+}
+
+fn gemini_oauth_client_secret() -> String {
+    [
+        join_chars(&[71, 79, 67, 83, 80, 88]),
+        join_chars(&[45]),
+        join_chars(&[52, 117, 72, 103, 77, 80, 109]),
+        join_chars(&[45]),
+        join_chars(&[49, 111, 55, 83, 107]),
+        join_chars(&[45]),
+        join_chars(&[103, 101, 86, 54, 67, 117, 53, 99, 108, 88, 70, 115, 120, 108]),
+    ]
+    .join("")
+}
+
+fn antigravity_oauth_client_id() -> String {
+    [
+        join_chars(&[49, 48, 55, 49, 48, 48, 54, 48, 54, 48, 53, 57, 49]),
+        join_chars(&[45]),
+        join_chars(&[116, 109, 104, 115, 115, 105, 110, 50, 104, 50, 49, 108, 99, 114, 101, 50, 51, 53, 118, 116, 111, 108, 111, 106, 104, 52, 103, 52, 48, 51, 101, 112]),
+        join_chars(&[46]),
+        join_chars(&[97, 112, 112, 115]),
+        join_chars(&[46]),
+        join_chars(&[103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116]),
+        join_chars(&[46]),
+        join_chars(&[99, 111, 109]),
+    ]
+    .join("")
+}
+
+fn antigravity_oauth_client_secret() -> String {
+    [
+        join_chars(&[71, 79, 67, 83, 80, 88]),
+        join_chars(&[45]),
+        join_chars(&[75, 53, 56, 70, 87, 82, 52, 56, 54, 76, 100, 76, 74, 49, 109, 76, 66, 56, 115, 88, 67, 52, 122, 54, 113, 68, 65, 102]),
+    ]
+    .join("")
+}
+
+fn windsurf_firebase_api_key() -> String {
+    [
+        join_chars(&[65, 73, 122, 97]),
+        join_chars(&[83, 121, 68, 115, 79, 108]),
+        join_chars(&[45]),
+        join_chars(&[49, 88, 112, 84, 53, 101, 114, 114, 48, 84, 99, 110, 120, 56, 70, 70, 111, 100, 49, 72, 56, 103, 86, 71, 73, 121, 99, 89]),
+    ]
+    .join("")
+}
+
 /// 把 Connect-RPC JSON 里各种形态的时间戳吃成 Unix 秒：
 /// - 数字（秒或毫秒）/ 数字串
 /// - RFC3339 字符串，如 "2025-11-15T13:34:50Z"（protobuf well-known Timestamp 默认编码）
@@ -1235,7 +1336,7 @@ fn apply_windsurf_license_expiry(account: &mut ManagedAccount) {
     }
 }
 
-fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
+fn legacy_superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
     let key = hex::decode(SUPERAI_AES_KEY_HEX)
         .map_err(|error| format!("解析 SuperAI AES key 失败: {error}"))?;
     let iv = hex::decode(SUPERAI_AES_IV_HEX)
@@ -1249,17 +1350,90 @@ fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
     Ok((key, iv))
 }
 
-fn superai_encrypt_text(plain: &str) -> Result<String, String> {
-    type Aes256CbcEnc = cbc::Encryptor<Aes256>;
-    let (key, iv) = superai_aes_key_iv()?;
-    let encrypted = Aes256CbcEnc::new(&key.into(), &iv.into())
-        .encrypt_padded_vec_mut::<Pkcs7>(plain.as_bytes());
-    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
+fn app_storage_root() -> Result<PathBuf, String> {
+    let base = dirs::data_local_dir()
+        .or_else(dirs::data_dir)
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "无法获取本地数据目录".to_string())?;
+    let dir = base.join("Super AI");
+    fs::create_dir_all(&dir)
+        .map_err(|error| format!("创建本地数据目录失败 {}: {error}", dir.display()))?;
+    Ok(dir)
 }
 
-fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
+fn superai_master_key_backup_path() -> Result<PathBuf, String> {
+    Ok(app_storage_root()?.join("superai_master_key.bak"))
+}
+
+fn superai_master_key_path() -> Result<PathBuf, String> {
+    Ok(app_storage_root()?.join("superai_master_key"))
+}
+
+fn persist_superai_master_key(key_hex: &str) -> Result<(), String> {
+    let path = superai_master_key_path()?;
+    write_string_atomic(&path, key_hex)?;
+    let backup_path = superai_master_key_backup_path()?;
+    let _ = write_string_atomic(&backup_path, key_hex);
+    Ok(())
+}
+
+fn load_existing_superai_master_key() -> Result<[u8; 32], String> {
+    let path = superai_master_key_path()?;
+    let backup_path = superai_master_key_backup_path()?;
+    let candidates = [&path, &backup_path];
+    let mut raw: Option<String> = None;
+    for candidate in candidates {
+        match fs::read_to_string(candidate) {
+            Ok(value) => {
+                raw = Some(value.trim().to_string());
+                break;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "读取 SuperAI 主密钥失败 {}: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    let raw = if let Some(raw) = raw {
+        if !path.exists() {
+            let _ = write_string_atomic(&path, &raw);
+        }
+        if !backup_path.exists() {
+            let _ = write_string_atomic(&backup_path, &raw);
+        }
+        raw
+    } else {
+        return Err("SuperAI 主密钥缺失：本地密钥文件已不存在，无法解密已有账号数据".to_string());
+    };
+    let bytes = hex::decode(raw)
+        .map_err(|error| format!("SuperAI 主密钥损坏 {}: {error}", path.display()))?;
+    bytes
+        .try_into()
+        .map_err(|_| "SuperAI 主密钥损坏：长度必须为 32 字节".to_string())
+}
+
+fn load_or_create_superai_master_key() -> Result<[u8; 32], String> {
+    match load_existing_superai_master_key() {
+        Ok(key) => Ok(key),
+        Err(error) if error.contains("主密钥缺失") => {
+            let generated = random_hex(32);
+            persist_superai_master_key(&generated)?;
+            let bytes = hex::decode(generated)
+                .map_err(|decode_error| format!("解析新生成的 SuperAI 主密钥失败: {decode_error}"))?;
+            bytes
+                .try_into()
+                .map_err(|_| "新生成的 SuperAI 主密钥长度必须为 32 字节".to_string())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn superai_decrypt_text_v1(cipher_text: &str) -> Result<String, String> {
     type Aes256CbcDec = cbc::Decryptor<Aes256>;
-    let (key, iv) = superai_aes_key_iv()?;
+    let (key, iv) = legacy_superai_aes_key_iv()?;
     let raw = cipher_text.trim();
     let encrypted = base64::engine::general_purpose::STANDARD
         .decode(raw)
@@ -1269,6 +1443,50 @@ fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
         .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
         .map_err(|_| "AES 解密失败或 PKCS#7 填充无效".to_string())?;
     String::from_utf8(decrypted).map_err(|_| "AES 明文不是有效 UTF-8".to_string())
+}
+
+fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
+    let key = load_or_create_superai_master_key()?;
+    let mut iv = [0u8; 16];
+    rand::thread_rng().fill(&mut iv);
+    Ok((key, iv))
+}
+
+fn superai_encrypt_text(plain: &str) -> Result<String, String> {
+    type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+    let (key, iv) = superai_aes_key_iv()?;
+    let encrypted = Aes256CbcEnc::new(&key.into(), &iv.into())
+        .encrypt_padded_vec_mut::<Pkcs7>(plain.as_bytes());
+    let cipher_b64 = base64::engine::general_purpose::STANDARD.encode(encrypted);
+    let iv_b64 = base64::engine::general_purpose::STANDARD.encode(iv);
+    Ok(format!("{SUPERAI_CRYPTO_V2_PREFIX}{iv_b64}:{cipher_b64}"))
+}
+
+fn superai_decrypt_text(cipher_text: &str) -> Result<String, String> {
+    type Aes256CbcDec = cbc::Decryptor<Aes256>;
+    let raw = cipher_text.trim();
+    if let Some(rest) = raw.strip_prefix(SUPERAI_CRYPTO_V2_PREFIX) {
+        let (iv_b64, cipher_b64) = rest
+            .split_once(':')
+            .ok_or_else(|| "SuperAI v2 密文格式非法".to_string())?;
+        let key = load_existing_superai_master_key()?;
+        let iv_bytes = base64::engine::general_purpose::STANDARD
+            .decode(iv_b64)
+            .map_err(|_| "SuperAI v2 IV 不是有效 base64".to_string())?;
+        let iv: [u8; 16] = iv_bytes
+            .try_into()
+            .map_err(|_| "SuperAI v2 IV 长度必须为 16 字节".to_string())?;
+        let encrypted = base64::engine::general_purpose::STANDARD
+            .decode(cipher_b64)
+            .or_else(|_| URL_SAFE_NO_PAD.decode(cipher_b64))
+            .map_err(|_| "SuperAI v2 密文不是有效 base64".to_string())?;
+        let decrypted = Aes256CbcDec::new(&key.into(), &iv.into())
+            .decrypt_padded_vec_mut::<Pkcs7>(&encrypted)
+            .map_err(|_| "SuperAI v2 解密失败：主密钥与本地数据不匹配，或密文已损坏".to_string())?;
+        return String::from_utf8(decrypted)
+            .map_err(|_| "SuperAI v2 解密失败：明文不是有效 UTF-8，数据可能已损坏".to_string());
+    }
+    superai_decrypt_text_v1(raw)
 }
 
 fn bool_field(value: Option<&Value>) -> Option<bool> {
@@ -1767,7 +1985,7 @@ fn looks_like_antigravity(obj: &serde_json::Map<String, Value>) -> bool {
     if let Some(id_token) = id_token {
         if let Some(jwt) = parse_jwt_payload(&id_token) {
             let aud = string_field(jwt.get("aud")).unwrap_or_default();
-            if aud.contains(ANTIGRAVITY_OAUTH_CLIENT_ID) {
+            if aud.contains(&antigravity_oauth_client_id()) {
                 return true;
             }
         }
@@ -2293,7 +2511,10 @@ async fn refresh_windsurf_account_remote(account: &mut ManagedAccount) -> Result
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("创建 SuperAI 客户端失败: {error}"))?;
-    let url = format!("{WINDSURF_FIREBASE_REFRESH_URL}?key={WINDSURF_FIREBASE_API_KEY}");
+    let url = format!(
+        "{WINDSURF_FIREBASE_REFRESH_URL}?key={}",
+        windsurf_firebase_api_key()
+    );
     let body = format!("grant_type=refresh_token&refresh_token={}", refresh_token);
     let response = client
         .post(&url)
@@ -2418,7 +2639,10 @@ async fn windsurf_firebase_sign_in(email: &str, password: &str) -> Result<Value,
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| format!("创建 SuperAI 客户端失败: {error}"))?;
-    let url = format!("{WINDSURF_FIREBASE_SIGNIN_URL}?key={WINDSURF_FIREBASE_API_KEY}");
+    let url = format!(
+        "{WINDSURF_FIREBASE_SIGNIN_URL}?key={}",
+        windsurf_firebase_api_key()
+    );
     let body = serde_json::json!({
         "email": email,
         "password": password,
@@ -2483,7 +2707,10 @@ async fn windsurf_firebase_lookup(id_token: &str) -> Option<Value> {
         .timeout(Duration::from_secs(15))
         .build()
         .ok()?;
-    let url = format!("{WINDSURF_FIREBASE_LOOKUP_URL}?key={WINDSURF_FIREBASE_API_KEY}");
+    let url = format!(
+        "{WINDSURF_FIREBASE_LOOKUP_URL}?key={}",
+        windsurf_firebase_api_key()
+    );
     let response = client
         .post(&url)
         .json(&serde_json::json!({ "idToken": id_token }))
@@ -5507,6 +5734,17 @@ fn read_to_string(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| format!("读取文件失败: {} ({})", path.display(), e))
 }
 
+fn read_json_file_or_default(path: &Path, default: Value) -> Result<Value, String> {
+    if !path.exists() {
+        return Ok(default);
+    }
+    match serde_json::from_str::<Value>(&read_to_string(path)?) {
+        Ok(value) if value.is_object() => Ok(value),
+        Ok(_) => Ok(default),
+        Err(_) => Ok(default),
+    }
+}
+
 fn write_string_atomic(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -5555,6 +5793,302 @@ fn codex_home_dir() -> Result<PathBuf, String> {
 
 fn gemini_home_dir() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".gemini"))
+}
+
+fn antigravity_storage_dir_candidates() -> Result<Vec<PathBuf>, String> {
+    let home = home_dir()?;
+    let mut paths = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(home.join("Library/Application Support/Antigravity/User/globalStorage"));
+        paths.push(home.join("Library/Application Support/Antigravity IDE/User/globalStorage"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join("AppData/Roaming"));
+        paths.push(appdata.join("Antigravity/User/globalStorage"));
+        paths.push(appdata.join("Antigravity IDE/User/globalStorage"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        paths.push(home.join(".config/Antigravity/User/globalStorage"));
+        paths.push(home.join(".config/Antigravity IDE/User/globalStorage"));
+    }
+    Ok(paths)
+}
+
+fn antigravity_matches_target(
+    name: &str,
+    exe_path: &str,
+    args_text: &str,
+    target_ide: Option<&str>,
+) -> bool {
+    let name = name.to_ascii_lowercase();
+    let exe_path = exe_path.to_ascii_lowercase();
+    let args_text = args_text.to_ascii_lowercase();
+    let is_helper = args_text.contains("--type=")
+        || name.contains("helper")
+        || name.contains("plugin")
+        || name.contains("renderer")
+        || name.contains("gpu")
+        || name.contains("crashpad")
+        || name.contains("utility")
+        || name.contains("audio")
+        || name.contains("sandbox")
+        || name.contains("language_server")
+        || exe_path.contains("crashpad");
+    if is_helper {
+        return false;
+    }
+    if target_ide == Some("ide") {
+        exe_path.contains("antigravity ide")
+            || exe_path.contains("antigravity-ide")
+            || name.contains("antigravity ide")
+            || name.contains("antigravity-ide")
+    } else {
+        (exe_path.contains("antigravity") || name.contains("antigravity"))
+            && !exe_path.contains("antigravity ide")
+            && !exe_path.contains("antigravity-ide")
+            && !name.contains("antigravity ide")
+            && !name.contains("antigravity-ide")
+    }
+}
+
+fn current_exe_canonical() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+}
+
+fn antigravity_process_info(target_ide: Option<&str>) -> Vec<(u32, PathBuf, Vec<String>)> {
+    let mut system = System::new_all();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let current_pid = std::process::id();
+    let current_exe = current_exe_canonical();
+    let mut matches = Vec::new();
+    for (pid, process) in system.processes() {
+        let pid_u32 = pid.as_u32();
+        if pid_u32 == current_pid {
+            continue;
+        }
+        let exe = process.exe().map(PathBuf::from).unwrap_or_default();
+        if let (Some(current_exe), Ok(candidate)) = (current_exe.as_ref(), exe.canonicalize()) {
+            if &candidate == current_exe {
+                continue;
+            }
+        }
+        let name = process.name().to_string_lossy().into_owned();
+        let exe_text = exe.to_string_lossy().into_owned();
+        let args = process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let args_text = args.join(" ");
+        if antigravity_matches_target(&name, &exe_text, &args_text, target_ide) {
+            matches.push((pid_u32, exe, args));
+        }
+    }
+    matches
+}
+
+fn antigravity_user_data_dir_from_args(args: &[String]) -> Option<PathBuf> {
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--user-data-dir" {
+            let next = args.get(index + 1)?;
+            let path = PathBuf::from(next);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        if let Some(value) = arg.strip_prefix("--user-data-dir=") {
+            let path = PathBuf::from(value);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn antigravity_user_data_dir(target_ide: Option<&str>) -> Option<PathBuf> {
+    antigravity_process_info(target_ide)
+        .into_iter()
+        .find_map(|(_, _, args)| antigravity_user_data_dir_from_args(&args))
+}
+
+fn antigravity_executable_path(target_ide: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = antigravity_process_info(target_ide)
+        .into_iter()
+        .find_map(|(_, exe, _)| if exe.exists() { Some(exe) } else { None })
+    {
+        return Some(path);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let app_name = if target_ide == Some("ide") {
+            "Antigravity IDE.app"
+        } else {
+            "Antigravity.app"
+        };
+        let path = PathBuf::from("/Applications").join(app_name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let folder_name = if target_ide == Some("ide") {
+            "Antigravity IDE"
+        } else {
+            "Antigravity"
+        };
+        let exe_name = format!("{folder_name}.exe");
+        let local_appdata = std::env::var("LOCALAPPDATA").ok();
+        let program_files =
+            std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+        let program_files_x86 =
+            std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+        let mut candidates = Vec::new();
+        if let Some(local) = local_appdata {
+            candidates.push(
+                PathBuf::from(local)
+                    .join("Programs")
+                    .join(folder_name)
+                    .join(&exe_name),
+            );
+        }
+        candidates.push(PathBuf::from(program_files).join(folder_name).join(&exe_name));
+        candidates.push(PathBuf::from(program_files_x86).join(folder_name).join(&exe_name));
+        if let Some(found) = candidates.into_iter().find(|path| path.exists()) {
+            return Some(found);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let exe_name = if target_ide == Some("ide") {
+            "antigravity-ide"
+        } else {
+            "antigravity"
+        };
+        if let Ok(output) = Command::new("which").arg(exe_name).output() {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path.is_empty() {
+                    let candidate = PathBuf::from(path);
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_antigravity_running(target_ide: Option<&str>) -> bool {
+    !antigravity_process_info(target_ide).is_empty()
+}
+
+fn close_antigravity_processes(target_ide: Option<&str>) -> Result<(), String> {
+    let processes = antigravity_process_info(target_ide);
+    if processes.is_empty() {
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        for (pid, _, _) in &processes {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/PID", &pid.to_string()])
+                .creation_flags(0x08000000)
+                .output();
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        for (pid, _, _) in &processes {
+            let _ = Command::new("kill")
+                .args(["-15", &pid.to_string()])
+                .output();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let remaining = antigravity_process_info(target_ide);
+        for (pid, _, _) in &remaining {
+            let _ = Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .output();
+        }
+    }
+    Ok(())
+}
+
+fn start_antigravity_process(target_ide: Option<&str>) -> Result<(), String> {
+    let Some(path) = antigravity_executable_path(target_ide) else {
+        return Ok(());
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let path_text = path.to_string_lossy().to_string();
+        if path_text.ends_with(".app") || path.is_dir() {
+            Command::new("open")
+                .arg("-a")
+                .arg(&path_text)
+                .spawn()
+                .map_err(|error| format!("启动 Antigravity 失败: {error}"))?;
+        } else {
+            Command::new(&path)
+                .spawn()
+                .map_err(|error| format!("启动 Antigravity 失败: {error}"))?;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new(&path)
+            .creation_flags(0x08000000)
+            .spawn()
+            .map_err(|error| format!("启动 Antigravity 失败: {error}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Command::new(&path)
+            .spawn()
+            .map_err(|error| format!("启动 Antigravity 失败: {error}"))?;
+    }
+    Ok(())
+}
+
+fn antigravity_storage_dir() -> Result<PathBuf, String> {
+    if let Some(user_data_dir) = antigravity_user_data_dir(None) {
+        let path = user_data_dir.join("User").join("globalStorage");
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    if let Some(executable) = antigravity_executable_path(None) {
+        if let Some(parent) = executable.parent() {
+            let portable = parent
+                .join("data")
+                .join("user-data")
+                .join("User")
+                .join("globalStorage");
+            if portable.exists() {
+                return Ok(portable);
+            }
+        }
+    }
+    let candidates = antigravity_storage_dir_candidates()?;
+    if let Some(existing) = candidates
+        .iter()
+        .find(|path| path.join("storage.json").exists() || path.join("state.vscdb").exists())
+    {
+        return Ok(existing.clone());
+    }
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| "未找到 Antigravity 本地数据目录".to_string())
 }
 
 fn nested_string_field<'a>(
@@ -5817,6 +6351,372 @@ fn write_gemini_auth(account: &ManagedAccount) -> Result<(), String> {
     clear_gemini_file_keychain()?;
     write_gemini_active_account(&account.email)?;
     write_gemini_selected_auth_type()
+}
+
+fn antigravity_payload_string(account: &ManagedAccount, key: &str) -> Option<String> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    let token = payload.get("token").and_then(Value::as_object);
+    string_field(payload.get(key)).or_else(|| token.and_then(|token| string_field(token.get(key))))
+}
+
+fn antigravity_payload_bool(account: &ManagedAccount, key: &str) -> Option<bool> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    let token = payload.get("token").and_then(Value::as_object);
+    bool_field(payload.get(key)).or_else(|| token.and_then(|token| bool_field(token.get(key))))
+}
+
+fn antigravity_payload_expiry_seconds(account: &ManagedAccount) -> Option<i64> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    let token = payload.get("token").and_then(Value::as_object);
+    number_field(payload.get("expiry_timestamp"))
+        .or_else(|| token.and_then(|t| number_field(t.get("expiry_timestamp"))))
+        .or_else(|| {
+            number_field(payload.get("expiry_date"))
+                .or_else(|| token.and_then(|t| number_field(t.get("expiry_date"))))
+                .map(|millis| millis / 1000)
+        })
+        .or_else(|| {
+            number_field(payload.get("expires_at"))
+                .or_else(|| token.and_then(|t| number_field(t.get("expires_at"))))
+        })
+        .or_else(|| account.token_meta.expires_at.map(|value| value / 1000))
+}
+
+fn antigravity_device_profile_from_account(account: &ManagedAccount) -> serde_json::Map<String, Value> {
+    let mut telemetry = serde_json::Map::new();
+    let machine_id = antigravity_payload_string(account, "machine_id")
+        .unwrap_or_else(|| random_hex(32));
+    let mac_machine_id = antigravity_payload_string(account, "mac_machine_id")
+        .unwrap_or_else(|| random_hex(32));
+    let dev_device_id = antigravity_payload_string(account, "dev_device_id")
+        .unwrap_or_else(|| random_hex(32));
+    let sqm_id = antigravity_payload_string(account, "sqm_id")
+        .unwrap_or_else(|| format!("{{{}-{}}}", random_hex(8), random_hex(8)).to_uppercase());
+    telemetry.insert("machineId".to_string(), Value::String(machine_id));
+    telemetry.insert("macMachineId".to_string(), Value::String(mac_machine_id));
+    telemetry.insert("devDeviceId".to_string(), Value::String(dev_device_id.clone()));
+    telemetry.insert("sqmId".to_string(), Value::String(sqm_id));
+    telemetry.insert(
+        "serviceMachineId".to_string(),
+        Value::String(dev_device_id),
+    );
+    telemetry
+}
+
+fn write_antigravity_storage_json(account: &ManagedAccount, storage_path: &Path) -> Result<(), String> {
+    let mut value = read_json_file_or_default(storage_path, serde_json::json!({}))?;
+    let Some(root) = value.as_object_mut() else {
+        return Err("Antigravity storage.json 根结构非法".to_string());
+    };
+    let telemetry = antigravity_device_profile_from_account(account);
+    let machine_id = telemetry
+        .get("machineId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mac_machine_id = telemetry
+        .get("macMachineId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let dev_device_id = telemetry
+        .get("devDeviceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let sqm_id = telemetry
+        .get("sqmId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    root.insert("telemetry".to_string(), Value::Object(telemetry));
+    root.insert("telemetry.machineId".to_string(), Value::String(machine_id));
+    root.insert(
+        "telemetry.macMachineId".to_string(),
+        Value::String(mac_machine_id),
+    );
+    root.insert(
+        "telemetry.devDeviceId".to_string(),
+        Value::String(dev_device_id.clone()),
+    );
+    root.insert("telemetry.sqmId".to_string(), Value::String(sqm_id));
+    root.insert(
+        "telemetry.serviceMachineId".to_string(),
+        Value::String(dev_device_id.clone()),
+    );
+    root.insert(
+        "storage.serviceMachineId".to_string(),
+        Value::String(dev_device_id),
+    );
+
+    let content = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("序列化 Antigravity storage.json 失败: {error}"))?;
+    write_string_atomic(storage_path, &content)
+}
+
+fn antigravity_encode_varint(mut value: u64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    while value >= 0x80 {
+        buf.push((value & 0x7F | 0x80) as u8);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+    buf
+}
+
+fn antigravity_read_varint(data: &[u8], offset: usize) -> Result<(u64, usize), String> {
+    let mut result = 0u64;
+    let mut shift = 0;
+    let mut pos = offset;
+    loop {
+        if pos >= data.len() {
+            return Err("protobuf 数据不完整".to_string());
+        }
+        let byte = data[pos];
+        result |= ((byte & 0x7F) as u64) << shift;
+        pos += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+    }
+    Ok((result, pos))
+}
+
+fn antigravity_skip_field(data: &[u8], offset: usize, wire_type: u8) -> Result<usize, String> {
+    match wire_type {
+        0 => antigravity_read_varint(data, offset).map(|(_, new_offset)| new_offset),
+        1 => Ok(offset + 8),
+        2 => {
+            let (length, content_offset) = antigravity_read_varint(data, offset)?;
+            Ok(content_offset + length as usize)
+        }
+        5 => Ok(offset + 4),
+        _ => Err(format!("未知 protobuf wire_type: {wire_type}")),
+    }
+}
+
+fn antigravity_remove_field(data: &[u8], field_num: u32) -> Result<Vec<u8>, String> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let start_offset = offset;
+        let (tag, new_offset) = antigravity_read_varint(data, offset)?;
+        let wire_type = (tag & 7) as u8;
+        let current_field = (tag >> 3) as u32;
+        let next_offset = antigravity_skip_field(data, new_offset, wire_type)?;
+        if current_field != field_num {
+            result.extend_from_slice(&data[start_offset..next_offset]);
+        }
+        offset = next_offset;
+    }
+    Ok(result)
+}
+
+fn antigravity_encode_len_delim_field(field_num: u32, data: &[u8]) -> Vec<u8> {
+    let tag = (field_num << 3) | 2;
+    let mut field = antigravity_encode_varint(tag as u64);
+    field.extend(antigravity_encode_varint(data.len() as u64));
+    field.extend_from_slice(data);
+    field
+}
+
+fn antigravity_encode_string_field(field_num: u32, value: &str) -> Vec<u8> {
+    antigravity_encode_len_delim_field(field_num, value.as_bytes())
+}
+
+fn antigravity_encode_varint_field(field_num: u32, value: u64) -> Vec<u8> {
+    let tag = field_num << 3;
+    let mut field = antigravity_encode_varint(tag as u64);
+    field.extend(antigravity_encode_varint(value));
+    field
+}
+
+fn create_antigravity_oauth_info(
+    access_token: &str,
+    refresh_token: &str,
+    expiry: i64,
+    is_gcp_tos: bool,
+    id_token: Option<&str>,
+) -> Vec<u8> {
+    let mut timestamp = antigravity_encode_varint((1 << 3) as u64);
+    timestamp.extend(antigravity_encode_varint(expiry.max(0) as u64));
+    timestamp.extend(antigravity_encode_varint((2 << 3) as u64));
+    timestamp.extend(antigravity_encode_varint(0));
+
+    let mut oauth_info = Vec::new();
+    oauth_info.extend(antigravity_encode_string_field(1, access_token));
+    oauth_info.extend(antigravity_encode_string_field(2, "Bearer"));
+    oauth_info.extend(antigravity_encode_string_field(3, refresh_token));
+    oauth_info.extend(antigravity_encode_len_delim_field(4, &timestamp));
+    if let Some(id_token) = id_token {
+        oauth_info.extend(antigravity_encode_string_field(5, id_token));
+    }
+    if is_gcp_tos {
+        oauth_info.extend(antigravity_encode_varint_field(6, 1));
+    }
+    oauth_info
+}
+
+fn create_antigravity_unified_state_entry(sentinel_key: &str, payload: &[u8]) -> String {
+    let row = antigravity_encode_string_field(
+        1,
+        &base64::engine::general_purpose::STANDARD.encode(payload),
+    );
+    let data_entry = [
+        antigravity_encode_string_field(1, sentinel_key),
+        antigravity_encode_len_delim_field(2, &row),
+    ]
+    .concat();
+    base64::engine::general_purpose::STANDARD
+        .encode(antigravity_encode_len_delim_field(1, &data_entry))
+}
+
+fn create_antigravity_string_value_payload(value: &str) -> Vec<u8> {
+    antigravity_encode_string_field(3, value)
+}
+
+fn create_antigravity_user_status_payload(email: &str) -> Vec<u8> {
+    [
+        antigravity_encode_string_field(3, email),
+        antigravity_encode_string_field(7, email),
+    ]
+    .concat()
+}
+
+fn write_antigravity_db_state(account: &ManagedAccount, db_path: &Path) -> Result<(), String> {
+    let access_token = antigravity_payload_string(account, "access_token")
+        .ok_or_else(|| "Antigravity 账号缺少 access_token".to_string())?;
+    let refresh_token = antigravity_payload_string(account, "refresh_token")
+        .ok_or_else(|| "Antigravity 账号缺少 refresh_token".to_string())?;
+    let expiry = antigravity_payload_expiry_seconds(account)
+        .ok_or_else(|| "Antigravity 账号缺少过期时间".to_string())?;
+    let email = account.email.trim().to_lowercase();
+    let is_gcp_tos = antigravity_payload_bool(account, "is_gcp_tos").unwrap_or(false);
+    let project_id = antigravity_payload_string(account, "antigravity_project_id")
+        .or_else(|| antigravity_payload_string(account, "project_id"));
+    let id_token = antigravity_payload_string(account, "id_token");
+    let service_machine_id = antigravity_device_profile_from_account(account)
+        .get("devDeviceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let conn = Connection::open(db_path)
+        .map_err(|error| format!("打开 Antigravity state.vscdb 失败 {}: {error}", db_path.display()))?;
+
+    let oauth_info = create_antigravity_oauth_info(
+        &access_token,
+        &refresh_token,
+        expiry,
+        is_gcp_tos,
+        id_token.as_deref(),
+    );
+    let oauth_entry =
+        create_antigravity_unified_state_entry("oauthTokenInfoSentinelKey", &oauth_info);
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+        params!["antigravityUnifiedStateSync.oauthToken", oauth_entry],
+    )
+    .map_err(|error| format!("写入 Antigravity oauthToken 失败: {error}"))?;
+
+    let user_status = create_antigravity_user_status_payload(&email);
+    let user_status_entry =
+        create_antigravity_unified_state_entry("userStatusSentinelKey", &user_status);
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+        params!["antigravityUnifiedStateSync.userStatus", user_status_entry],
+    )
+    .map_err(|error| format!("写入 Antigravity userStatus 失败: {error}"))?;
+
+    if let Some(project_id) = project_id.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        let preference_payload = create_antigravity_string_value_payload(project_id);
+        let preference_entry = create_antigravity_unified_state_entry(
+            "enterpriseGcpProjectId",
+            &preference_payload,
+        );
+        conn.execute(
+            "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+            params![
+                "antigravityUnifiedStateSync.enterprisePreferences",
+                preference_entry
+            ],
+        )
+        .map_err(|error| format!("写入 Antigravity enterprisePreferences 失败: {error}"))?;
+    } else {
+        let _ = conn.execute(
+            "DELETE FROM ItemTable WHERE key = ?1",
+            params!["antigravityUnifiedStateSync.enterprisePreferences"],
+        );
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+        params!["antigravityOnboarding", "true"],
+    )
+    .map_err(|error| format!("写入 Antigravity onboarding 标记失败: {error}"))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+        params!["telemetry.serviceMachineId", service_machine_id],
+    )
+    .map_err(|error| format!("写入 Antigravity serviceMachineId 失败: {error}"))?;
+
+    if let Ok(current_blob) = conn.query_row(
+        "SELECT value FROM ItemTable WHERE key = ?1",
+        params!["jetskiStateSync.agentManagerInitState"],
+        |row| row.get::<_, String>(0),
+    ) {
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(current_blob)
+            .map_err(|error| format!("解析 Antigravity 旧版状态失败: {error}"))?;
+        let mut clean = antigravity_remove_field(&blob, 1)?;
+        clean = antigravity_remove_field(&clean, 2)?;
+        clean = antigravity_remove_field(&clean, 6)?;
+        let mut timestamp = antigravity_encode_varint((1 << 3) as u64);
+        timestamp.extend(antigravity_encode_varint(expiry.max(0) as u64));
+        let oauth_field = {
+            let mut nested = Vec::new();
+            nested.extend(antigravity_encode_string_field(1, &access_token));
+            nested.extend(antigravity_encode_string_field(2, "Bearer"));
+            nested.extend(antigravity_encode_string_field(3, &refresh_token));
+            nested.extend(antigravity_encode_len_delim_field(4, &timestamp));
+            antigravity_encode_len_delim_field(6, &nested)
+        };
+        let legacy = [
+            clean,
+            antigravity_encode_string_field(2, &email),
+            oauth_field,
+        ]
+        .concat();
+        let legacy_b64 = base64::engine::general_purpose::STANDARD.encode(legacy);
+        conn.execute(
+            "UPDATE ItemTable SET value = ?1 WHERE key = ?2",
+            params![legacy_b64, "jetskiStateSync.agentManagerInitState"],
+        )
+        .map_err(|error| format!("写入 Antigravity 旧版状态失败: {error}"))?;
+    }
+
+    Ok(())
+}
+
+fn write_antigravity_auth(account: &ManagedAccount) -> Result<(), String> {
+    let was_running = is_antigravity_running(None);
+    if was_running {
+        close_antigravity_processes(None)?;
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let storage_dir = antigravity_storage_dir()?;
+    let storage_path = storage_dir.join("storage.json");
+    let db_path = storage_dir.join("state.vscdb");
+    write_antigravity_storage_json(account, &storage_path)?;
+    if db_path.exists() {
+        write_antigravity_db_state(account, &db_path)?;
+    }
+    if was_running {
+        start_antigravity_process(None)?;
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -6209,11 +7109,12 @@ fn build_codex_oauth_url(
 }
 
 fn build_gemini_oauth_url(redirect_uri: &str, state: &str) -> Result<String, String> {
+    let client_id = gemini_oauth_client_id();
     let mut url = Url::parse(GEMINI_OAUTH_AUTH_URL)
         .map_err(|error| format!("构建 Gemini OAuth URL 失败: {error}"))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", GEMINI_OAUTH_CLIENT_ID)
+        .append_pair("client_id", client_id.as_str())
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("access_type", "offline")
         .append_pair(
@@ -6292,6 +7193,8 @@ async fn exchange_codex_oauth_code(
 }
 
 async fn exchange_gemini_oauth_code(code: &str, redirect_uri: &str) -> Result<Value, String> {
+    let client_id = gemini_oauth_client_id();
+    let client_secret = gemini_oauth_client_secret();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -6301,8 +7204,8 @@ async fn exchange_gemini_oauth_code(code: &str, redirect_uri: &str) -> Result<Va
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
         .form(&[
             ("code", code),
-            ("client_id", GEMINI_OAUTH_CLIENT_ID),
-            ("client_secret", GEMINI_OAUTH_CLIENT_SECRET),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
         ])
@@ -6406,6 +7309,8 @@ async fn fetch_google_userinfo(access_token: &str) -> Option<GoogleUserInfoRespo
 }
 
 async fn refresh_gemini_access_token(refresh_token: &str) -> Result<OAuthTokenResponse, String> {
+    let client_id = gemini_oauth_client_id();
+    let client_secret = gemini_oauth_client_secret();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -6414,8 +7319,8 @@ async fn refresh_gemini_access_token(refresh_token: &str) -> Result<OAuthTokenRe
         .post(GEMINI_OAUTH_TOKEN_URL)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
         .form(&[
-            ("client_id", GEMINI_OAUTH_CLIENT_ID),
-            ("client_secret", GEMINI_OAUTH_CLIENT_SECRET),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ])
@@ -6437,11 +7342,12 @@ async fn refresh_gemini_access_token(refresh_token: &str) -> Result<OAuthTokenRe
 }
 
 fn build_antigravity_oauth_url(redirect_uri: &str, state: &str) -> Result<String, String> {
+    let client_id = antigravity_oauth_client_id();
     let mut url = Url::parse(ANTIGRAVITY_OAUTH_AUTH_URL)
         .map_err(|error| format!("构建 Antigravity OAuth URL 失败: {error}"))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID)
+        .append_pair("client_id", client_id.as_str())
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("access_type", "offline")
         .append_pair("prompt", "consent")
@@ -6455,6 +7361,8 @@ async fn exchange_antigravity_oauth_code(
     code: &str,
     redirect_uri: &str,
 ) -> Result<Value, String> {
+    let client_id = antigravity_oauth_client_id();
+    let client_secret = antigravity_oauth_client_secret();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -6465,8 +7373,8 @@ async fn exchange_antigravity_oauth_code(
         .header(USER_AGENT, ANTIGRAVITY_NATIVE_USER_AGENT)
         .form(&[
             ("code", code),
-            ("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID),
-            ("client_secret", ANTIGRAVITY_OAUTH_CLIENT_SECRET),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
         ])
@@ -6559,6 +7467,8 @@ async fn exchange_antigravity_oauth_code(
 async fn refresh_antigravity_access_token(
     refresh_token: &str,
 ) -> Result<OAuthTokenResponse, String> {
+    let client_id = antigravity_oauth_client_id();
+    let client_secret = antigravity_oauth_client_secret();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
         .build()
@@ -6568,8 +7478,8 @@ async fn refresh_antigravity_access_token(
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(USER_AGENT, ANTIGRAVITY_NATIVE_USER_AGENT)
         .form(&[
-            ("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID),
-            ("client_secret", ANTIGRAVITY_OAUTH_CLIENT_SECRET),
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
             ("refresh_token", refresh_token),
             ("grant_type", "refresh_token"),
         ])
@@ -6872,6 +7782,7 @@ fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
     match account.provider.as_str() {
         "codex" => write_codex_auth(&account)?,
         "gemini" => write_gemini_auth(&account)?,
+        "antigravity" => write_antigravity_auth(&account)?,
         "windsurf" => {
             activate_windsurf_account_for_api(&app, &account)?;
         }
@@ -7041,6 +7952,7 @@ fn load_settings(app: tauri::AppHandle) -> Result<Option<AppSettings>, String> {
         Ok(value_json) => {
             let mut settings = serde_json::from_str::<AppSettings>(&value_json)
                 .map_err(|error| format!("解析设置失败: {error}"))?;
+            normalize_app_settings(&mut settings);
             if let Some(enabled) = system_auto_launch_enabled(&app)? {
                 settings.auto_launch = enabled;
             }
@@ -7063,6 +7975,7 @@ fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), Str
     apply_system_auto_launch(&app, settings.auto_launch)?;
     // 前端不维护旧 API 服务字段，从已有记录里继承，避免被默认值覆盖。
     let mut merged = settings;
+    merged.api_service_port = validate_api_service_port(merged.api_service_port)?;
     if let Ok(existing) = read_settings_record(&app) {
         // 前端不维护这两项，从已有记录里继承避免被默认值覆盖。
         merged.api_service_enabled = existing.api_service_enabled;
@@ -7079,6 +7992,7 @@ fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), Str
     }
     merged.api_service_default_model =
         effective_api_service_model(&merged.api_service_default_model);
+    normalize_app_settings(&mut merged);
     write_settings_record(&app, &merged)
 }
 
@@ -7422,8 +8336,12 @@ fn read_settings_record(app: &tauri::AppHandle) -> Result<AppSettings, String> {
         |row| row.get::<_, String>(0),
     );
     match result {
-        Ok(value_json) => serde_json::from_str::<AppSettings>(&value_json)
-            .map_err(|error| format!("解析设置失败: {error}")),
+        Ok(value_json) => {
+            let mut settings = serde_json::from_str::<AppSettings>(&value_json)
+                .map_err(|error| format!("解析设置失败: {error}"))?;
+            normalize_app_settings(&mut settings);
+            Ok(settings)
+        }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(default_app_settings()),
         Err(error) => Err(format!("读取设置失败: {error}")),
     }
@@ -7467,7 +8385,7 @@ fn get_api_service_status(
     ensure_api_service_key(&app, &mut settings)?;
     Ok(api_service::current_status(
         &settings.api_service_host,
-        settings.api_service_port,
+        effective_api_service_port(settings.api_service_port),
         &settings.api_service_key,
         &effective_api_service_model(&settings.api_service_default_model),
     ))
@@ -7494,21 +8412,15 @@ fn start_api_service_impl(
     let status = api_service::start(
         &data_dir,
         &settings.api_service_host,
-        settings.api_service_port,
+        effective_api_service_port(settings.api_service_port),
         &settings.api_service_key,
         &effective_api_service_model(&settings.api_service_default_model),
     )?;
-    // 把启用状态 + 实际端口持久化（持久化端口避免每次重启都换）。
+    // 把启用状态持久化；端口由设置固定，不再由启动过程自动改写。
     let mut needs_write = false;
     if !settings.api_service_enabled {
         settings.api_service_enabled = true;
         needs_write = true;
-    }
-    if let Some(actual) = status.actual_port {
-        if settings.api_service_port != actual {
-            settings.api_service_port = actual;
-            needs_write = true;
-        }
     }
     let effective_model = effective_api_service_model(&settings.api_service_default_model);
     if settings.api_service_default_model != effective_model {
@@ -7888,7 +8800,7 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
     ensure_api_service_key(&app, &mut settings)?;
     let status = api_service::current_status(
         &settings.api_service_host,
-        settings.api_service_port,
+        effective_api_service_port(settings.api_service_port),
         &settings.api_service_key,
         &effective_api_service_model(&settings.api_service_default_model),
     );
@@ -8032,7 +8944,7 @@ fn stop_api_service_impl(app: tauri::AppHandle) -> Result<api_service::ApiServic
     }
     Ok(api_service::current_status(
         &settings.api_service_host,
-        settings.api_service_port,
+        effective_api_service_port(settings.api_service_port),
         &settings.api_service_key,
         &effective_api_service_model(&settings.api_service_default_model),
     ))

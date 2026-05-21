@@ -25,8 +25,8 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 /// 默认监听主机：`0.0.0.0` 表示同时监听本机与局域网。
 pub const DEFAULT_HOST: &str = "0.0.0.0";
-/// 默认端口 `0` 表示由内核分配未占用端口。
-pub const DEFAULT_PORT: u16 = 0;
+/// 默认固定端口。端口被占用时直接报错，用户可在设置里改端口后重启服务。
+pub const DEFAULT_PORT: u16 = 51889;
 /// 默认 API Key 前缀；首次启动会生成 `agt_superai_<随机串>`。
 pub const API_KEY_PREFIX: &str = "agt_superai_";
 
@@ -41,7 +41,7 @@ pub struct ApiServiceStatus {
     pub running: bool,
     pub bind_host: String,
     pub bind_port: u16,
-    /// 实际监听的端口（自动选端口时与 `bind_port` 不同）。
+    /// 实际监听的端口。
     pub actual_port: Option<u16>,
     /// 拼好的 base URL，例如 `http://127.0.0.1:63721/v1`。
     pub address: Option<String>,
@@ -783,22 +783,10 @@ fn start_internal(
     target: Option<ProxyTarget>,
     sidecar: Option<Sidecar>,
 ) -> Result<ApiServiceStatus, String> {
-    // 首选用户/上次记录的端口；被占用（典型如 Windows `WSAEADDRINUSE 10048`
-    // 或上次自动分配的端口在 TIME_WAIT / 被其他进程接手）时退回到内核自动选端口，
-    // 避免用户每次都要手动改端口才能启动。
     let bind = format!("{host}:{port}");
-    let server = match Server::http(&bind) {
-        Ok(server) => server,
-        Err(error) if port != 0 => {
-            let fallback_bind = format!("{host}:0");
-            eprintln!(
-                "[SuperAI api] 绑定 {bind} 失败（{error}），退回到自动选端口 {fallback_bind}"
-            );
-            Server::http(&fallback_bind)
-                .map_err(|fallback_error| format!("绑定 {fallback_bind} 失败: {fallback_error}"))?
-        }
-        Err(error) => return Err(format!("绑定 {bind} 失败: {error}")),
-    };
+    let server = Server::http(&bind).map_err(|error| {
+        format!("绑定 {bind} 失败: {error}。请在设置中修改 API 服务端口后重试。")
+    })?;
     let actual_port = server
         .server_addr()
         .to_ip()
@@ -1785,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_picks_new_port() {
+    fn restart_replaces_existing_runtime() {
         let _guard = lock_serial();
         let key = "agt_superai_restart_test";
         let s1 = start_no_sidecar("127.0.0.1", 0, key).unwrap();

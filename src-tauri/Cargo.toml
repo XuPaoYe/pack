@@ -1,6 +1,6 @@
 [package]
 name = "super-ai"
-version = "3.1.8"
+version = "3.1.9"
 description = "Super AI Codex and Gemini local account manager"
 authors = ["Talentisan"]
 license = ""
@@ -30,6 +30,7 @@ log = "0.4"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+sysinfo = "0.37"
 tiny_http = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
 tauri = { version = "2.11.0", features = ["tray-icon"] }

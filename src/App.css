@@ -622,18 +622,25 @@ h2 {
 }
 
 .toast-icon {
+  width: 16px;
+  height: 16px;
   align-self: center;
   color: var(--toast-accent);
 }
 
 .toast-text {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
   min-width: 0;
-  line-height: 17px;
+  line-height: 1.4;
   overflow-wrap: anywhere;
   white-space: normal;
 }
 
 .toast-text b {
+  display: inline-flex;
+  align-items: center;
   margin-right: 8px;
   color: var(--text-strong);
   font-weight: 800;

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// CI-only：把 tag 里的版本号同步写回 tauri.conf.json 和 src-tauri/Cargo.toml。
+// CI-only：把 tag 里的版本号同步写回 package.json / package-lock.json /
+// tauri.conf.json / src-tauri/Cargo.toml。
 // tauri-action 默认拿 tauri.conf.json 的 version 当产物文件名 + updater 的 version
 // 字段，如果它和 git tag 不一致，updater 的 latest.json 路径里会塞 tag 版本，
 // 但文件名里仍是 conf 里的旧版本，OSS 上对不上就 404。
@@ -19,8 +20,25 @@ if (!/^\d+\.\d+\.\d+(?:[-+].+)?$/.test(version)) {
   process.exit(1);
 }
 
+const packageJsonPath = "package.json";
+const packageLockPath = "package-lock.json";
 const tauriConfPath = "src-tauri/tauri.conf.json";
 const cargoPath = "src-tauri/Cargo.toml";
+
+const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+const oldPackageJsonVersion = packageJson.version;
+packageJson.version = version;
+writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
+console.log(`✓ ${packageJsonPath}: ${oldPackageJsonVersion} → ${version}`);
+
+const packageLock = JSON.parse(readFileSync(packageLockPath, "utf8"));
+const oldPackageLockVersion = packageLock.version;
+packageLock.version = version;
+if (packageLock.packages?.[""]) {
+  packageLock.packages[""].version = version;
+}
+writeFileSync(packageLockPath, `${JSON.stringify(packageLock, null, 2)}\n`);
+console.log(`✓ ${packageLockPath}: ${oldPackageLockVersion} → ${version}`);
 
 // tauri.conf.json: 顶层 "version": "x.y.z"
 const conf = JSON.parse(readFileSync(tauriConfPath, "utf8"));

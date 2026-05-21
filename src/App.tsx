@@ -122,9 +122,17 @@ type ExportPreview = {
   label: string;
   fileBase: string;
 };
+
+type KeyIssueModalState = {
+  title: string;
+  message: string;
+};
 const ACCOUNT_PAGE_SIZE = 12;
 const ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS = 15_000;
 const API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS = 3_000;
+const API_SERVICE_PORT_MIN = 50000;
+const API_SERVICE_PORT_MAX = 59999;
+const DEFAULT_API_SERVICE_PORT = 51889;
 const APP_NAME = [83, 117, 112, 101, 114, 32, 65, 73]
   .map((c) => String.fromCharCode(c))
   .join("");
@@ -227,6 +235,59 @@ function sanitizeUserFacingText(text: string) {
 
 function loadAppLogs() {
   return loadAppLogsRaw(sanitizeUserFacingText);
+}
+
+function normalizeUserError(error: unknown) {
+  const raw = String(error ?? "").trim();
+  const message = sanitizeUserFacingText(raw);
+  if (
+    message.includes("SuperAI 主密钥缺失")
+    || message.includes("本地密钥文件已不存在")
+  ) {
+    return "本机加密密钥缺失，现有 SuperAI 账号无法读取。请恢复本机数据目录中的密钥文件，或重新导入这些账号。";
+  }
+  if (message.includes("SuperAI 主密钥损坏")) {
+    return "本机加密密钥已损坏，现有 SuperAI 账号无法读取。请恢复正确的密钥文件，或删除后重新导入账号。";
+  }
+  if (
+    message.includes("主密钥与本地数据不匹配")
+    || message.includes("读取 SuperAI 加密账号失败")
+    || message.includes("SuperAI v2 解密失败")
+  ) {
+    return "SuperAI 本地加密数据无法解密。通常是当前机器上的密钥文件与已有账号数据不匹配，或数据本身已损坏。";
+  }
+  return message || "未知错误";
+}
+
+function resolveKeyIssueModal(error: unknown): KeyIssueModalState | null {
+  const raw = String(error ?? "").trim();
+  const message = sanitizeUserFacingText(raw);
+  if (
+    message.includes("SuperAI 主密钥缺失")
+    || message.includes("本地密钥文件已不存在")
+  ) {
+    return {
+      title: "本地密钥缺失",
+      message: "当前机器上用于解密 SuperAI 账号的本地密钥文件已经缺失，已有账号暂时无法读取。恢复原机器上的密钥文件后可继续使用；如果无法恢复，只能删除这些账号后重新导入。",
+    };
+  }
+  if (message.includes("SuperAI 主密钥损坏")) {
+    return {
+      title: "本地密钥损坏",
+      message: "当前机器上的 SuperAI 本地密钥文件已损坏，已有账号暂时无法读取。请恢复正确的密钥文件；如果无法恢复，只能删除这些账号后重新导入。",
+    };
+  }
+  if (
+    message.includes("主密钥与本地数据不匹配")
+    || message.includes("读取 SuperAI 加密账号失败")
+    || message.includes("SuperAI v2 解密失败")
+  ) {
+    return {
+      title: "本地加密数据无法解密",
+      message: "当前机器上的密钥文件与已有 SuperAI 账号数据不匹配，或本地加密数据本身已损坏。通常发生在更换机器、清理本地数据目录，或手动覆盖数据库之后。",
+    };
+  }
+  return null;
 }
 
 function stateLabel(state: AccountState) {
@@ -1091,6 +1152,7 @@ function App() {
   const [detailsAccountId, setDetailsAccountId] = useState<string | null>(null);
   const [isApiConfigOpen, setIsApiConfigOpen] = useState(false);
   const [exportPreview, setExportPreview] = useState<ExportPreview | null>(null);
+  const [keyIssueModal, setKeyIssueModal] = useState<KeyIssueModalState | null>(null);
   const [selectedExportIds, setSelectedExportIds] = useState<Set<string>>(() => new Set());
   const [pendingDeleteAccount, setPendingDeleteAccount] = useState<ManagedAccount | null>(null);
   const [pendingBatchDelete, setPendingBatchDelete] = useState<ManagedAccount[] | null>(null);
@@ -1112,7 +1174,7 @@ function App() {
     autoLaunch: false,
     maskSensitive: false,
     apiServiceHost: "0.0.0.0",
-    apiServicePort: 0,
+    apiServicePort: DEFAULT_API_SERVICE_PORT,
     apiServiceDefaultModel: "gpt-5.5",
   });
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
@@ -1221,6 +1283,14 @@ function App() {
     initialLogs: loadAppLogs(),
   });
 
+  const showNormalizedError = useCallback((prefix: string, error: unknown) => {
+    const keyIssue = resolveKeyIssueModal(error);
+    if (keyIssue) {
+      setKeyIssueModal(keyIssue);
+    }
+    showNotice("error", `${prefix}：${normalizeUserError(error)}`);
+  }, [showNotice]);
+
   const stopApiServiceForUpdate = useCallback(async () => {
     if (!isTauri() || !apiServiceRunning) return;
     setIsApiServiceBusy(true);
@@ -1275,7 +1345,7 @@ function App() {
       })
       .catch((error) => {
         reloadAccountsSoon(1200);
-        showNotice("error", `启动检查账号状态失败：${String(error)}`);
+        showNormalizedError("启动检查账号状态失败", error);
       })
       .finally(() => {
         setRefreshingAccountIds((current) => {
@@ -1284,7 +1354,7 @@ function App() {
           return next;
         });
       });
-  }, [reloadAccountsSoon, showNotice]);
+  }, [reloadAccountsSoon, showNormalizedError, showNotice]);
 
   const refreshActiveAccountSilently = useCallback(async () => {
     if (!activeAccount) return;
@@ -1425,7 +1495,7 @@ function App() {
         showNotice("error", allFailures[0]?.reason ?? "没有发现可添加的账号");
       }
     } catch (error) {
-      showNotice("error", `导入文件失败：${String(error)}`);
+      showNormalizedError("导入文件失败", error);
     } finally {
       setIsFileImporting(false);
       setIsImportBusy(false);
@@ -1439,7 +1509,7 @@ function App() {
       const { result, accountsToPersist } = await parseWithBackend(pasteValue, "粘贴内容");
       applyImportResult(result, { accountsToPersist });
     } catch (error) {
-      showNotice("error", `解析粘贴内容失败：${String(error)}`);
+      showNormalizedError("解析粘贴内容失败", error);
     } finally {
       setIsImportBusy(false);
     }
@@ -1460,7 +1530,7 @@ function App() {
         { accountsToPersist: [] },
       );
     } catch (error) {
-      showNotice("error", `读取本机 ${providerLabel(provider)} 失败：${String(error)}`);
+      showNormalizedError(`读取本机 ${providerLabel(provider)} 失败`, error);
     } finally {
       setIsImportBusy(false);
     }
@@ -1490,7 +1560,7 @@ function App() {
       return true;
     } catch (error) {
       if (!options.silent) {
-        showNotice("error", `${providerLabel(provider)} OAuth 完成失败：${String(error)}`);
+        showNormalizedError(`${providerLabel(provider)} OAuth 完成失败`, error);
       }
       return false;
     }
@@ -1523,7 +1593,7 @@ function App() {
       scheduleOAuthPoll(provider, result.login_id);
       showNotice("info", result.message);
     } catch (error) {
-      showNotice("error", `${providerLabel(provider)} OAuth 启动失败：${String(error)}`);
+      showNormalizedError(`${providerLabel(provider)} OAuth 启动失败`, error);
     } finally {
       setIsImportBusy(false);
     }
@@ -1607,7 +1677,7 @@ function App() {
       closeImportModal();
       showNotice("success", `已添加 ${APP_NAME} 账号${account.email ? "：" + account.email : ""}`);
     } catch (error) {
-      showNotice("error", `导入失败：${String(error)}`);
+      showNormalizedError("导入失败", error);
     } finally {
       setIsImportBusy(false);
     }
@@ -1635,7 +1705,7 @@ function App() {
         setSuperaiBatchKeys("");
       }
     } catch (error) {
-      showNotice("error", `批量导入失败：${String(error)}`);
+      showNormalizedError("批量导入失败", error);
     } finally {
       setIsImportBusy(false);
     }
@@ -1664,13 +1734,22 @@ function App() {
         setAboutInfo({ name, version });
       } catch (error) {
         setAboutInfo({ name: APP_NAME, version: "unknown" });
-        showNotice("error", `读取版本信息失败：${String(error)}`);
+        showNormalizedError("读取版本信息失败", error);
       }
     }
     setIsAboutOpen(true);
   };
   const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
     setSettings((current) => ({ ...current, [key]: value }));
+  };
+  const updateApiServicePort = (value: string) => {
+    const next = Number(value);
+    updateSetting(
+      "apiServicePort",
+      Number.isInteger(next)
+        ? Math.min(API_SERVICE_PORT_MAX, Math.max(API_SERVICE_PORT_MIN, next))
+        : DEFAULT_API_SERVICE_PORT,
+    );
   };
   const handleToggleAccount = async (account: ManagedAccount) => {
     if (isCurrentAccount(account)) return;
@@ -1685,7 +1764,7 @@ function App() {
       setAccountPage(1);
       showNotice("success", activationSuccessMessage(account));
     } catch (error) {
-      showNotice("error", `启用账号失败：${String(error)}`);
+      showNormalizedError("启用账号失败", error);
     } finally {
       setSwitchingAccountId(null);
     }
@@ -1704,7 +1783,7 @@ function App() {
         showNotice("success", `已刷新 ${accountDisplayLabel(refreshed)}`);
       }
     } catch (error) {
-      showNotice("error", `刷新账号失败：${String(error)}`);
+      showNormalizedError("刷新账号失败", error);
     } finally {
       setRefreshingAccountIds((current) => {
         const next = new Set(current);
@@ -1741,7 +1820,7 @@ function App() {
         showNotice("success", `已刷新 ${providerLabel(provider)} 账号`);
       }
     } catch (error) {
-      showNotice("error", `刷新 ${providerLabel(provider)} 失败：${String(error)}`);
+      showNormalizedError(`刷新 ${providerLabel(provider)} 失败`, error);
     } finally {
       setRefreshingProviders((current) => {
         const next = new Set(current);
@@ -1761,7 +1840,7 @@ function App() {
         ? await invoke<string>("export_public_superai_account", { accountId: account.id })
         : await invoke<string>("export_account", { accountId: account.id });
     } catch (error) {
-      showNotice("error", `导出账号失败：${String(error)}`);
+      showNormalizedError("导出账号失败", error);
       return;
     } finally {
       setIsExportBusy(false);
@@ -1814,7 +1893,7 @@ function App() {
       });
       setSelectedExportIds(new Set());
     } catch (error) {
-      showNotice("error", `批量导出失败：${String(error)}`);
+      showNormalizedError("批量导出失败", error);
     } finally {
       setIsExportBusy(false);
     }
@@ -1841,7 +1920,7 @@ function App() {
       setPendingBatchDelete(null);
       showNotice("success", `已删除 ${targets.length} 个账号`);
     } catch (error) {
-      showNotice("error", `批量删除失败：${String(error)}`);
+      showNormalizedError("批量删除失败", error);
     } finally {
       setIsAccountBusy(false);
     }
@@ -1879,7 +1958,7 @@ function App() {
       setPendingDeleteAccount(null);
       showNotice("success", `已删除 ${accountDisplayLabel(account)}`);
     } catch (error) {
-      showNotice("error", `删除账号失败：${String(error)}`);
+      showNormalizedError("删除账号失败", error);
     } finally {
       setIsDeletingAccount(false);
     }
@@ -1895,7 +1974,9 @@ function App() {
         setAccounts(sortAccountsForView(storedAccounts));
         refreshAllAccountsOnLaunch(storedAccounts);
       })
-      .catch(() => undefined);
+      .catch((error) => {
+        showNormalizedError("读取账号列表失败", error);
+      });
 
     void invoke<AppSettings | null>("load_settings")
       .then((storedSettings) => {
@@ -1912,14 +1993,14 @@ function App() {
       });
       oauthPollTimers.current = {};
     };
-  }, [refreshAllAccountsOnLaunch]);
+  }, [refreshAllAccountsOnLaunch, showNotice, showNormalizedError]);
 
   useEffect(() => {
     if (!isSettingsLoaded) return;
     void invoke("save_settings", { settings }).catch((error) => {
-      showNotice("error", `保存设置失败：${String(error)}`);
+      showNormalizedError("保存设置失败", error);
     });
-  }, [isSettingsLoaded, settings, showNotice]);
+  }, [isSettingsLoaded, settings, showNormalizedError]);
 
   useEffect(() => {
     persistAppLogs(appLogs);
@@ -1984,7 +2065,7 @@ function App() {
     return () => {
       unlisten?.();
     };
-  }, [showNotice]);
+  }, [showNotice, showNormalizedError]);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -2012,7 +2093,9 @@ function App() {
         showNotice("info", "有账号本地额度已用满，已自动停用");
         void invoke<ManagedAccount[]>("list_accounts")
           .then((next) => setAccounts(sortAccountsForView(next)))
-          .catch(() => undefined);
+          .catch((error) => {
+            showNormalizedError("读取账号列表失败", error);
+          });
       },
     ).then((fn) => {
       unlisten = fn;
@@ -2020,7 +2103,7 @@ function App() {
     return () => {
       unlisten?.();
     };
-  }, [showNotice]);
+  }, [showNotice, showNormalizedError]);
 
   // 后台定时任务删掉过期 SuperAI 账号时由 Rust 主动 emit；前端 re-fetch 列表，
   // 避免已过期卡片残留在 UI 直到用户手动点刷新（且手动刷新会触发 "no rows" 报错）。
@@ -2036,7 +2119,9 @@ function App() {
         }
         void invoke<ManagedAccount[]>("list_accounts")
           .then((next) => setAccounts(sortAccountsForView(next)))
-          .catch(() => undefined);
+          .catch((error) => {
+            showNormalizedError("读取账号列表失败", error);
+          });
       },
     ).then((fn) => {
       unlisten = fn;
@@ -2044,7 +2129,7 @@ function App() {
     return () => {
       unlisten?.();
     };
-  }, [showNotice]);
+  }, [showNotice, showNormalizedError]);
 
   const toggleApiService = useCallback(async () => {
     if (isApiServiceBusy) return;
@@ -2058,11 +2143,11 @@ function App() {
         status.running ? `已启动 API 服务${status.address ? "：" + status.address : ""}` : "已停用 API 服务",
       );
     } catch (error) {
-      showNotice("error", `操作 API 服务失败：${String(error)}`);
+      showNormalizedError("操作 API 服务失败", error);
     } finally {
       setIsApiServiceBusy(false);
     }
-  }, [isApiServiceBusy, showNotice, apiServiceRunning]);
+  }, [isApiServiceBusy, showNormalizedError, apiServiceRunning, showNotice]);
 
   const applyApiPref = useCallback(
     (updater: (prev: ApiModelPref) => ApiModelPref) => {
@@ -2076,13 +2161,13 @@ function App() {
               setApiService((status) => status ? { ...status, defaultModel: modelId } : status);
             })
             .catch((error) => {
-              showNotice("error", `设置默认模型失败：${String(error)}`);
+              showNormalizedError("设置默认模型失败", error);
             });
         }
         return next;
       });
     },
-    [showNotice],
+    [showNormalizedError],
   );
 
   const handleChangeFamily = useCallback(
@@ -2127,11 +2212,11 @@ function App() {
       await invoke<CodexAppSetupResult>("configure_codex_app");
       showNotice("success", "Codex 已配置完成，请重启 Codex App / CLI 生效。");
     } catch (error) {
-      showNotice("error", `配置 Codex 失败：${String(error)}`);
+      showNormalizedError("配置 Codex 失败", error);
     } finally {
       setIsConfiguringCodex(false);
     }
-  }, [apiService?.running, showNotice]);
+  }, [apiService?.running, showNormalizedError, showNotice]);
 
   const restoreCodexApp = useCallback(async () => {
     if (!isTauri()) {
@@ -2143,11 +2228,11 @@ function App() {
       await invoke<CodexAppRestoreResult>("restore_codex_app");
       showNotice("success", "Codex 已恢复完成，请重启 Codex App / CLI 生效。");
     } catch (error) {
-      showNotice("error", `恢复 Codex 配置失败：${String(error)}`);
+      showNormalizedError("恢复 Codex 配置失败", error);
     } finally {
       setIsRestoringCodex(false);
     }
-  }, [showNotice]);
+  }, [showNormalizedError, showNotice]);
 
   const copyApiServiceText = useCallback(
     async (text: string, label: string) => {
@@ -2184,8 +2269,7 @@ function App() {
       className={clsx(
         "shell",
         settings.maskSensitive && "privacy-mask",
-        (isImportModalOpen || isSettingsOpen || isLogsOpen || isAboutOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
-        (isImportModalOpen || isSettingsOpen || isLogsOpen || isAboutOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate) && "modal-active",
+        (isImportModalOpen || isSettingsOpen || isLogsOpen || isAboutOpen || isApiConfigOpen || exportPreview || pendingDeleteAccount || pendingBatchDelete || forceUpdate || keyIssueModal) && "modal-active",
       )}
       onMouseDownCapture={handleShellTopDrag}
     >
@@ -2481,6 +2565,48 @@ function App() {
         />
       )}
 
+      {keyIssueModal && (
+        <AppModal
+          title={keyIssueModal.title}
+          description="本地加密密钥异常"
+          closeLabel="关闭密钥异常提示"
+          className="settings-panel"
+          onClose={() => setKeyIssueModal(null)}
+        >
+          <div className="settings-body">
+            <section className="setting-block">
+              <div className="setting-copy">
+                <CircleAlert size={18} />
+                <div>
+                  <strong>{keyIssueModal.title}</strong>
+                  <p>{keyIssueModal.message}</p>
+                </div>
+              </div>
+            </section>
+
+            <section className="setting-block">
+              <div className="setting-copy">
+                <Info size={18} />
+                <div>
+                  <strong>处理方式</strong>
+                  <p>如果你有原机器上的数据目录，请优先恢复 `superai_master_key` 或 `superai_master_key.bak`。如果无法恢复，就删除受影响的 SuperAI 账号后重新导入。</p>
+                </div>
+              </div>
+            </section>
+
+            <div className="api-config-actions">
+              <button type="button" className="superai-api-secondary" onClick={handleLogs}>
+                <ScrollText size={14} />
+                打开日志
+              </button>
+              <button type="button" className="primary" onClick={() => setKeyIssueModal(null)}>
+                知道了
+              </button>
+            </div>
+          </div>
+        </AppModal>
+      )}
+
       {detailsAccountId && (() => {
         const target = accounts.find((account) => account.id === detailsAccountId);
         if (!target) return null;
@@ -2717,7 +2843,11 @@ function App() {
                   <Server size={18} />
                   <div>
                     <strong>API 服务监听</strong>
-                    <p>地址 0.0.0.0 同时监听本机与局域网；端口 0 表示首次启动随机分配，之后会保持。</p>
+                    <p>
+                      {apiService?.running
+                        ? "API 服务运行中时不允许修改端口；请先停止服务。"
+                        : "地址 0.0.0.0 同时监听本机与局域网；端口限制在 50000-59999。"}
+                    </p>
                   </div>
                 </div>
                 <div className="setting-inline-fields">
@@ -2728,19 +2858,18 @@ function App() {
                       value={settings.apiServiceHost}
                       onChange={(event) => updateSetting("apiServiceHost", event.target.value)}
                       placeholder="0.0.0.0"
+                      disabled={Boolean(apiService?.running)}
                     />
                   </label>
                   <label className="setting-inline-field">
                     <span>端口</span>
                     <input
                       type="number"
-                      min={0}
-                      max={65535}
+                      min={API_SERVICE_PORT_MIN}
+                      max={API_SERVICE_PORT_MAX}
                       value={settings.apiServicePort}
-                      onChange={(event) => {
-                        const next = Number(event.target.value);
-                        updateSetting("apiServicePort", Number.isFinite(next) ? next : 0);
-                      }}
+                      onChange={(event) => updateApiServicePort(event.target.value)}
+                      disabled={Boolean(apiService?.running)}
                     />
                   </label>
                 </div>
