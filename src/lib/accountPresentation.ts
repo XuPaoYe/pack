@@ -99,6 +99,11 @@ export function resolveValidityUntil(account: ManagedAccount) {
 }
 
 export function formatValidityText(account: ManagedAccount): ValidityText {
+  // gemini / antigravity 走 Google OAuth，订阅维度的"有效期"上游不返回，
+  // access_token 的过期时间不代表订阅本身，硬塞会误导用户，所以这两种 provider 一律不显示。
+  if (account.provider === "gemini" || account.provider === "antigravity") {
+    return { label: "有效期", detail: "" };
+  }
   if ((account.status ?? fallbackStatus(account)).state === "unavailable") {
     return { label: "有效期", detail: "--", title: account.status?.reason };
   }

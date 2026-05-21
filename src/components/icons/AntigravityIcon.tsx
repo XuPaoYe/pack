@@ -5,15 +5,15 @@ type AntigravityIconProps = {
 
 export function AntigravityIcon({ className, size = 20 }: AntigravityIconProps) {
   return (
-    <svg className={className} width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none">
-      <path
-        d="M12 2.5c-.42 0-.81.22-1.03.58l-3.7 6.21a1.2 1.2 0 0 0 .42 1.66 1.2 1.2 0 0 0 1.66-.4l1.45-2.42v12.66a1.2 1.2 0 0 0 2.4 0V8.13l1.45 2.42a1.2 1.2 0 0 0 1.66.4 1.2 1.2 0 0 0 .42-1.66l-3.7-6.21A1.2 1.2 0 0 0 12 2.5Z"
-        fill="currentColor"
-      />
-      <circle cx="6.4" cy="14.6" r="1.05" fill="currentColor" />
-      <circle cx="17.6" cy="14.6" r="1.05" fill="currentColor" />
-      <circle cx="5.1" cy="19.1" r="0.85" fill="currentColor" opacity="0.7" />
-      <circle cx="18.9" cy="19.1" r="0.85" fill="currentColor" opacity="0.7" />
+    <svg
+      className={className}
+      width={size}
+      height={size}
+      viewBox="6 14 100 86"
+      aria-hidden="true"
+      fill="currentColor"
+    >
+      <path d="M89.6992 93.695C94.3659 97.195 101.366 94.8617 94.9492 88.445C75.6992 69.7783 79.7825 18.445 55.8659 18.445C31.9492 18.445 36.0325 69.7783 16.7825 88.445C9.78251 95.445 17.3658 97.195 22.0325 93.695C40.1159 81.445 38.9492 59.8617 55.8659 59.8617C72.7825 59.8617 71.6159 81.445 89.6992 93.695Z" />
     </svg>
   );
 }

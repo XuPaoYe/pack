@@ -63,6 +63,10 @@ const ANTIGRAVITY_OAUTH_CLIENT_SECRET: &str = "GOCSPX-K58FWR486LdLJ1mLB8sXC4z6qD
 const ANTIGRAVITY_OAUTH_CALLBACK_PATH: &str = "/antigravity/callback";
 const ANTIGRAVITY_OAUTH_SCOPES: &str = "openid https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs";
 const ANTIGRAVITY_OAUTH_CLIENT_KEY: &str = "antigravity_enterprise";
+// Google CloudCode 与 OAuth 端点会校验 UA 是否来自合法的 Antigravity / VSCode 客户端；
+// 缺失或不被识别的 UA 会让 loadCodeAssist / fetchAvailableModels 返回 401/403，
+// 进而导致新加的账号 tier / project_id / quota 都读不出来。
+const ANTIGRAVITY_NATIVE_USER_AGENT: &str = "vscode/1.X.X (Antigravity/4.2.0)";
 const ANTIGRAVITY_LOAD_CODE_ASSIST_URLS: [&str; 3] = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
     "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
@@ -935,16 +939,36 @@ fn load_account_from_db(conn: &Connection, account_id: &str) -> Result<ManagedAc
 
 fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), String> {
     let mut account_to_write = account.clone();
+
+    // (provider, email) 维度的兜底去重：parse_*_account 算出来的 id 只要 fallback 链
+    // 沾上短期变化字段（access_token 等）就会让同账号反复入库。这里在 INSERT 前先按
+    // (provider, email) 查一下，如果已有不同 id 的同账号，就改写 id 触发 ON CONFLICT 替换。
+    // windsurf 的 email 列存的是 id 而不是真 email，跳过；其它三家 email 列就是真 email。
+    if account_to_write.provider != "windsurf" && !account_to_write.email.trim().is_empty() {
+        let stored_provider = redact_provider_to_storage(&account_to_write.provider);
+        let existing: Option<(String, i64)> = conn
+            .query_row(
+                "SELECT id, created_at FROM accounts WHERE provider = ?1 AND email = ?2 AND id != ?3 LIMIT 1",
+                params![stored_provider, account_to_write.email, account_to_write.id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .ok();
+        if let Some((existing_id, existing_created_at)) = existing {
+            account_to_write.id = existing_id;
+            account_to_write.created_at = existing_created_at;
+        }
+    }
+
     if account_to_write.auth_payload.is_none() {
-        if let Ok(existing) = load_account_from_db(conn, &account.id) {
-            if existing.provider == account.provider {
+        if let Ok(existing) = load_account_from_db(conn, &account_to_write.id) {
+            if existing.provider == account_to_write.provider {
                 account_to_write.auth_payload = existing.auth_payload;
             }
         }
     }
     if !is_current_status(&account_to_write.status) {
-        if let Ok(existing) = load_account_from_db(conn, &account.id) {
-            if existing.provider == account.provider && is_current_status(&existing.status) {
+        if let Ok(existing) = load_account_from_db(conn, &account_to_write.id) {
+            if existing.provider == account_to_write.provider && is_current_status(&existing.status) {
                 mark_account_current(&mut account_to_write);
             }
         }
@@ -1831,14 +1855,14 @@ fn parse_antigravity_account(value: &Value, source: &str) -> Option<ManagedAccou
 
     Some(ManagedAccount {
         id: string_field(obj.get("id")).unwrap_or_else(|| {
+            // 同 parse_gemini_account：access_token 每次刷新都变，会让同账号反复入库。
+            // 改成 auth_id → email，保证 (provider, email) 维度的 id 稳定。
             format!(
                 "antigravity_{}",
                 stable_hash(&format!(
                     "{}::{}",
                     email.to_lowercase(),
-                    auth_id
-                        .clone()
-                        .unwrap_or_else(|| access_token.clone().unwrap_or(email.clone()))
+                    auth_id.clone().unwrap_or_else(|| email.to_lowercase())
                 ))
             )
         }),
@@ -1906,14 +1930,15 @@ fn parse_gemini_account(value: &Value, source: &str) -> Option<ManagedAccount> {
 
     Some(ManagedAccount {
         id: string_field(obj.get("id")).unwrap_or_else(|| {
+            // 旧版 fallback 链是 auth_id → access_token → email；access_token 每次刷新都变，
+            // 同一 Google 账号的 ~/.gemini/oauth_creds.json 经常没有 id_token（刷新后不返回），
+            // 导致每次导入生成不同 id、DB 里堆出重复账号。改成 auth_id → email 保证稳定。
             format!(
                 "gemini_{}",
                 stable_hash(&format!(
                     "{}::{}",
                     email.to_lowercase(),
-                    auth_id
-                        .clone()
-                        .unwrap_or_else(|| access_token.clone().unwrap_or(email.clone()))
+                    auth_id.clone().unwrap_or_else(|| email.to_lowercase())
                 ))
             )
         }),
@@ -4884,6 +4909,7 @@ async fn post_antigravity_json(
         .post(endpoint)
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header(CONTENT_TYPE, "application/json")
+        .header(USER_AGENT, ANTIGRAVITY_NATIVE_USER_AGENT)
         .json(payload)
         .send()
         .await
@@ -6420,6 +6446,7 @@ async fn exchange_antigravity_oauth_code(
     let response = client
         .post(ANTIGRAVITY_OAUTH_TOKEN_URL)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(USER_AGENT, ANTIGRAVITY_NATIVE_USER_AGENT)
         .form(&[
             ("code", code),
             ("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID),
@@ -6523,6 +6550,7 @@ async fn refresh_antigravity_access_token(
     let response = client
         .post(ANTIGRAVITY_OAUTH_TOKEN_URL)
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(USER_AGENT, ANTIGRAVITY_NATIVE_USER_AGENT)
         .form(&[
             ("client_id", ANTIGRAVITY_OAUTH_CLIENT_ID),
             ("client_secret", ANTIGRAVITY_OAUTH_CLIENT_SECRET),

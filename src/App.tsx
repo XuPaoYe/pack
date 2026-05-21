@@ -17,6 +17,7 @@ import {
   Copy,
   Cloud,
   Download,
+  Eye,
   EyeOff,
   ExternalLink,
   FileJson,
@@ -47,6 +48,7 @@ import "./App.css";
 import logoUrl from "./assets/logo.svg";
 import { useUpdater } from "./hooks/useUpdater";
 import { useNotice } from "./hooks/useNotice";
+import { useVirtualScrollbar } from "./hooks/useVirtualScrollbar";
 import { ForceUpdateModal } from "./components/ForceUpdateModal";
 import { AccountDetailsDialog } from "./components/AccountDetailsDialog";
 import { NoticeToast } from "./components/NoticeToast";
@@ -1127,6 +1129,11 @@ function App() {
     top: 0,
     height: 0,
   });
+  const {
+    ref: logListRef,
+    state: logScrollbar,
+    update: updateLogScrollbar,
+  } = useVirtualScrollbar<HTMLDivElement>(isLogsOpen);
   const appWindow = useMemo(() => {
     try {
       return getCurrentWindow();
@@ -2366,18 +2373,6 @@ function App() {
                         </div>
                       </div>
                       <QuotaMeters account={account} />
-                      {account.provider === "antigravity" && (
-                        <button
-                          type="button"
-                          className="account-details-trigger"
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setDetailsAccountId(account.id);
-                          }}
-                        >
-                          查看所有明细
-                        </button>
-                      )}
                       <ValidityMeter account={account} />
                       <div className="account-footer">
                         <time className="account-stamp">{account.status?.state === "unavailable" ? "--" : formatRelative(account.updatedAt)}</time>
@@ -2400,6 +2395,16 @@ function App() {
                             className={clsx(switchingAccountId === account.id && "spin")}
                           />
                         </button>
+                        {account.provider === "antigravity" && (
+                          <button
+                            className="icon-button"
+                            aria-label="查看账号明细"
+                            title="查看明细"
+                            onClick={() => setDetailsAccountId(account.id)}
+                          >
+                            <Eye size={15} strokeWidth={1.75} />
+                          </button>
+                        )}
                         <button
                           className="icon-button"
                           aria-label="刷新账号"
@@ -2778,19 +2783,24 @@ function App() {
                 <p>成功、错误和提示信息会自动记录在这里。</p>
               </div>
             ) : (
-              <div className="log-list">
-                {appLogs.map((log) => (
-                  <article className="log-row" key={log.id}>
-                    <span className="log-dot" data-tone={log.tone} />
-                    <div>
-                      <div className="log-meta">
-                        <strong>{noticeToneConfig[log.tone].label}</strong>
-                        <time>{formatDateTime(Math.floor(log.createdAt / 1000))}</time>
+              <div className="logs-list-wrap">
+                <div className="log-list" ref={logListRef} onScroll={updateLogScrollbar}>
+                  {appLogs.map((log) => (
+                    <article className="log-row" key={log.id}>
+                      <span className="log-dot" data-tone={log.tone} />
+                      <div>
+                        <div className="log-meta">
+                          <strong>{noticeToneConfig[log.tone].label}</strong>
+                          <time>{formatDateTime(Math.floor(log.createdAt / 1000))}</time>
+                        </div>
+                        <p>{sanitizeUserFacingText(log.text)}</p>
                       </div>
-                      <p>{sanitizeUserFacingText(log.text)}</p>
-                    </div>
-                  </article>
-                ))}
+                    </article>
+                  ))}
+                </div>
+                <div className={clsx("account-scrollbar", "in-dialog", logScrollbar.visible && "visible")} aria-hidden="true">
+                  <i style={{ height: logScrollbar.height, transform: `translateY(${logScrollbar.top}px)` }} />
+                </div>
               </div>
             )}
             <p className="log-note">日志只存储在本机，超过 3 天会自动清理。</p>

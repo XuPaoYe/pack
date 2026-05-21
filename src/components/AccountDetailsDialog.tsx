@@ -3,6 +3,7 @@ import { Clock, X } from "lucide-react";
 import clsx from "clsx";
 import type { ManagedAccount, QuotaMetric } from "../lib/authParser";
 import { formatDateTime, formatResetTime } from "../lib/time";
+import { useVirtualScrollbar } from "../hooks/useVirtualScrollbar";
 
 function quotaTone(percent?: number): "good" | "warn" | "bad" | "unknown" {
   if (percent === undefined) return "unknown";
@@ -34,6 +35,9 @@ export function AccountDetailsDialog({
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
 
+  const { ref: bodyRef, state: scrollbar, update: updateScrollbar } =
+    useVirtualScrollbar<HTMLDivElement>();
+
   const metrics = account.quota?.metrics ? sortMetrics(account.quota.metrics) : [];
   const tier = account.plan ?? account.planType;
 
@@ -56,47 +60,49 @@ export function AccountDetailsDialog({
             <X size={18} strokeWidth={1.8} />
           </button>
         </header>
-        <div className="account-details-body">
-          {metrics.length === 0 ? (
-            <div className="account-details-empty">
-              {account.quota?.error ?? "暂无明细数据"}
-            </div>
-          ) : (
-            <div className="account-details-grid">
-              {metrics.map((metric) => {
-                const tone = quotaTone(metric.remainingPercent);
-                const reset = formatResetTime(metric.resetAt);
-                const resetTitle = formatDateTime(metric.resetAt);
-                return (
-                  <article className={clsx("quota-detail-tile", tone)} key={metric.key}>
-                    <div className="quota-detail-tile-head">
-                      <div className="quota-detail-tile-name">
-                        <strong>{metric.displayName ?? metric.label}</strong>
-                        {metric.modelName && metric.modelName !== (metric.displayName ?? metric.label) && (
-                          <span className="quota-detail-tile-model">{metric.modelName}</span>
-                        )}
+        <div className="account-details-body-wrap">
+          <div className="account-details-body" ref={bodyRef} onScroll={updateScrollbar}>
+            {metrics.length === 0 ? (
+              <div className="account-details-empty">
+                {account.quota?.error ?? "暂无明细数据"}
+              </div>
+            ) : (
+              <div className="account-details-grid">
+                {metrics.map((metric) => {
+                  const tone = quotaTone(metric.remainingPercent);
+                  const reset = formatResetTime(metric.resetAt);
+                  const resetTitle = formatDateTime(metric.resetAt);
+                  return (
+                    <article className={clsx("quota-detail-tile", tone)} key={metric.key}>
+                      <div className="quota-detail-tile-head">
+                        <div className="quota-detail-tile-name">
+                          <strong>{metric.displayName ?? metric.label}</strong>
+                        </div>
+                        <span className="quota-detail-percent">
+                          {metric.remainingPercent === undefined ? "N/A" : `${metric.remainingPercent}%`}
+                        </span>
                       </div>
-                      <span className="quota-detail-percent">
-                        {metric.remainingPercent === undefined ? "N/A" : `${metric.remainingPercent}%`}
-                      </span>
-                    </div>
-                    {metric.thinkingBudget !== undefined && (
-                      <span className="thinking-budget-pill">
-                        Thinking Budget: {metric.thinkingBudget}
-                      </span>
-                    )}
-                    <div className={clsx("quota-detail-bar", tone)}>
-                      <i style={{ width: `${metric.remainingPercent ?? 0}%` }} />
-                    </div>
-                    <div className="quota-detail-foot" title={resetTitle ?? undefined}>
-                      <Clock size={11} strokeWidth={1.8} />
-                      <span>重置时间：{reset ?? "未知"}</span>
-                    </div>
-                  </article>
-                );
-              })}
-            </div>
-          )}
+                      {metric.thinkingBudget !== undefined && (
+                        <span className="thinking-budget-pill">
+                          Thinking Budget: {metric.thinkingBudget}
+                        </span>
+                      )}
+                      <div className={clsx("quota-detail-bar", tone)}>
+                        <i style={{ width: `${metric.remainingPercent ?? 0}%` }} />
+                      </div>
+                      <div className="quota-detail-foot" title={resetTitle ?? undefined}>
+                        <Clock size={11} strokeWidth={1.8} />
+                        <span>重置时间：{reset ?? "未知"}</span>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+          <div className={clsx("account-scrollbar", "in-dialog", scrollbar.visible && "visible")} aria-hidden="true">
+            <i style={{ height: scrollbar.height, transform: `translateY(${scrollbar.top}px)` }} />
+          </div>
         </div>
       </aside>
     </div>

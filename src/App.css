@@ -177,8 +177,8 @@ button:disabled {
 }
 
 .provider-nav-icon.superai {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   padding: 0;
 }
 
@@ -327,26 +327,26 @@ button:disabled {
   gap: 16px;
 }
 
-:where(.workspace, .modal-content, textarea, .log-list) {
+:where(.workspace, .modal-content, textarea) {
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text-soft) 18%, transparent) transparent;
 }
 
-:where(.workspace, .modal-content, textarea, .log-list)::-webkit-scrollbar {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar {
   width: 11px;
   height: 11px;
 }
 
-:where(.workspace, .modal-content, textarea, .log-list)::-webkit-scrollbar-track {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-track {
   background: transparent;
 }
 
-:where(.workspace, .modal-content, textarea, .log-list)::-webkit-scrollbar-track-piece {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-track-piece {
   margin: 8px 0;
   background: transparent;
 }
 
-:where(.workspace, .modal-content, textarea, .log-list)::-webkit-scrollbar-thumb {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-thumb {
   min-height: 46px;
   border: 4px solid transparent;
   border-radius: 999px;
@@ -357,17 +357,17 @@ button:disabled {
     border-color 0.18s ease;
 }
 
-:where(.workspace, .modal-content, textarea, .log-list)::-webkit-scrollbar-thumb:hover {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-thumb:hover {
   border-width: 3px;
   background: color-mix(in srgb, var(--text-soft) 30%, transparent);
 }
 
-:where(.workspace, .modal-content, textarea, .log-list)::-webkit-scrollbar-thumb:active {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-thumb:active {
   border-width: 3px;
   background: color-mix(in srgb, var(--text-soft) 44%, transparent);
 }
 
-:where(.workspace, .modal-content, textarea, .log-list)::-webkit-scrollbar-corner {
+:where(.workspace, .modal-content, textarea)::-webkit-scrollbar-corner {
   background: transparent;
 }
 
@@ -2061,12 +2061,26 @@ h2 {
   padding: 16px;
 }
 
+.logs-list-wrap {
+  position: relative;
+  min-height: 0;
+}
+
 .log-list {
   display: grid;
   gap: 8px;
   max-height: min(420px, calc(100vh - 190px));
   overflow-y: auto;
-  padding-right: 2px;
+  /* 跟明细弹窗对齐：右侧留出 16px 内边距，给虚拟 thumb 留位置，避免压住 .log-row 右边 */
+  padding-right: 16px;
+  /* 隐藏原生 scrollbar，复用 .account-scrollbar 虚拟滚动条 */
+  scrollbar-width: none;
+}
+
+.log-list::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
 }
 
 .log-row {
@@ -3120,22 +3134,6 @@ textarea:focus {
   align-self: center;
 }
 
-.account-details-trigger {
-  align-self: flex-end;
-  margin-top: 8px;
-  padding: 2px 6px;
-  font-size: 11px;
-  color: var(--text-soft);
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  transition: color 0.15s ease;
-}
-
-.account-details-trigger:hover {
-  color: var(--accent);
-}
-
 .account-details-overlay {
   z-index: 120;
 }
@@ -3194,9 +3192,31 @@ textarea:focus {
   border-radius: 6px;
 }
 
+.account-details-body-wrap {
+  position: relative;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
 .account-details-body {
   padding: 20px;
-  overflow-y: auto;
+  overflow-y: scroll;
+  overflow-x: hidden;
+  height: 100%;
+  /* 隐藏原生滚动条，复用主列表 .account-scrollbar 的虚拟滚动条 */
+  scrollbar-width: none;
+}
+
+.account-details-body::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+/* dialog 内部的虚拟滚动条不需要 -14px 偏移到容器外，靠右内嵌即可 */
+.account-scrollbar.in-dialog {
+  right: 6px;
 }
 
 .account-details-empty {
@@ -3245,12 +3265,6 @@ textarea:focus {
   font-weight: 600;
   color: var(--text);
   word-break: break-word;
-}
-
-.quota-detail-tile-model {
-  font-size: 10px;
-  color: var(--text-soft);
-  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
 }
 
 .quota-detail-percent {
