@@ -418,8 +418,8 @@ fn now_ts_ms() -> i64 {
 }
 
 fn random_urlsafe_token(byte_len: usize) -> String {
-    let mut rng = rand::thread_rng();
-    let bytes = (0..byte_len).map(|_| rng.gen::<u8>()).collect::<Vec<_>>();
+    let mut rng = rand::rng();
+    let bytes = (0..byte_len).map(|_| rng.random::<u8>()).collect::<Vec<_>>();
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -1213,7 +1213,7 @@ fn normalize_unix_seconds_value(value: &Value) -> Option<i64> {
 
 fn random_hex(byte_len: usize) -> String {
     let mut bytes = vec![0u8; byte_len];
-    rand::thread_rng().fill(bytes.as_mut_slice());
+    rand::rng().fill(bytes.as_mut_slice());
     hex::encode(bytes)
 }
 
@@ -1448,7 +1448,7 @@ fn superai_decrypt_text_v1(cipher_text: &str) -> Result<String, String> {
 fn superai_aes_key_iv() -> Result<([u8; 32], [u8; 16]), String> {
     let key = load_or_create_superai_master_key()?;
     let mut iv = [0u8; 16];
-    rand::thread_rng().fill(&mut iv);
+    rand::rng().fill(&mut iv);
     Ok((key, iv))
 }
 
@@ -3911,10 +3911,11 @@ fn parse_windsurf_batch_key_line(line: &str) -> Result<WindsurfBatchCredential, 
         return Err("密钥为空".to_string());
     }
 
+    let decrypt_result = superai_decrypt_text(trimmed);
     let candidates = [
         trimmed.to_string(),
         decode_batch_key_text(trimmed).unwrap_or_default(),
-        superai_decrypt_text(trimmed).unwrap_or_default(),
+        decrypt_result.clone().unwrap_or_default(),
     ];
     for candidate in candidates.iter().filter(|value| !value.trim().is_empty()) {
         if let Ok(value) = serde_json::from_str::<Value>(candidate) {
@@ -3927,6 +3928,11 @@ fn parse_windsurf_batch_key_line(line: &str) -> Result<WindsurfBatchCredential, 
         }
     }
 
+    if trimmed.starts_with(SUPERAI_CRYPTO_V2_PREFIX) {
+        if let Err(error) = decrypt_result {
+            return Err(format!("密钥解密失败: {error}"));
+        }
+    }
     Err("密钥格式无效".to_string())
 }
 
