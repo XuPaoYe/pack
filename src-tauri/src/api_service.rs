@@ -26,7 +26,7 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 /// 默认监听主机：`0.0.0.0` 表示同时监听本机与局域网。
 pub const DEFAULT_HOST: &str = "0.0.0.0";
 /// 默认固定端口。端口被占用时直接报错，用户可在设置里改端口后重启服务。
-pub const DEFAULT_PORT: u16 = 51889;
+pub const DEFAULT_PORT: u16 = 51888;
 /// 默认 API Key 前缀；首次启动会生成 `agt_superai_<随机串>`。
 pub const API_KEY_PREFIX: &str = "agt_superai_";
 

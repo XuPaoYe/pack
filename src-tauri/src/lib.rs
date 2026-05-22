@@ -304,7 +304,7 @@ fn default_api_service_port() -> u16 {
 }
 
 fn api_service_port_in_allowed_range(port: u16) -> bool {
-    (50000..=59999).contains(&port)
+    (51000..=59999).contains(&port)
 }
 
 fn default_theme() -> String {
@@ -349,6 +349,8 @@ fn normalize_app_settings(settings: &mut AppSettings) {
         effective_api_service_model(&settings.api_service_default_model);
     if settings.api_service_host.trim().is_empty() {
         settings.api_service_host = default_api_service_host();
+    } else if let Ok(host) = validate_api_service_host(&settings.api_service_host) {
+        settings.api_service_host = host;
     }
 }
 
@@ -356,8 +358,15 @@ fn validate_api_service_port(port: u16) -> Result<u16, String> {
     if api_service_port_in_allowed_range(port) {
         Ok(port)
     } else {
-        Err("API 服务端口必须在 50000-59999 之间".to_string())
+        Err("API 服务端口必须在 51000-59999 之间".to_string())
     }
+}
+
+fn validate_api_service_host(host: &str) -> Result<String, String> {
+    let host = host.trim();
+    host.parse::<std::net::Ipv4Addr>()
+        .map(|addr| addr.to_string())
+        .map_err(|_| "API 服务监听地址必须是 IPv4 地址，例如 127.0.0.1 或 0.0.0.0".to_string())
 }
 
 fn default_true() -> bool {
@@ -7981,6 +7990,7 @@ fn save_settings(app: tauri::AppHandle, settings: AppSettings) -> Result<(), Str
     apply_system_auto_launch(&app, settings.auto_launch)?;
     // 前端不维护旧 API 服务字段，从已有记录里继承，避免被默认值覆盖。
     let mut merged = settings;
+    merged.api_service_host = validate_api_service_host(&merged.api_service_host)?;
     merged.api_service_port = validate_api_service_port(merged.api_service_port)?;
     if let Ok(existing) = read_settings_record(&app) {
         // 前端不维护这两项，从已有记录里继承避免被默认值覆盖。
@@ -8415,10 +8425,12 @@ fn start_api_service_impl(
         .path()
         .app_data_dir()
         .map_err(|error| format!("读取应用数据目录失败: {error}"))?;
+    let host = validate_api_service_host(&settings.api_service_host)?;
+    let port = validate_api_service_port(settings.api_service_port)?;
     let status = api_service::start(
         &data_dir,
-        &settings.api_service_host,
-        effective_api_service_port(settings.api_service_port),
+        &host,
+        port,
         &settings.api_service_key,
         &effective_api_service_model(&settings.api_service_default_model),
     )?;

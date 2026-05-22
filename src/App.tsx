@@ -130,9 +130,9 @@ type KeyIssueModalState = {
 const ACCOUNT_PAGE_SIZE = 12;
 const ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS = 15_000;
 const API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS = 3_000;
-const API_SERVICE_PORT_MIN = 50000;
+const API_SERVICE_PORT_MIN = 51000;
 const API_SERVICE_PORT_MAX = 59999;
-const DEFAULT_API_SERVICE_PORT = 51889;
+const DEFAULT_API_SERVICE_PORT = 51888;
 const APP_NAME = [83, 117, 112, 101, 114, 32, 65, 73]
   .map((c) => String.fromCharCode(c))
   .join("");
@@ -388,6 +388,29 @@ function localizeQuotaLabel(label: string): string {
   if (upper === "WEEKLY") return "周限";
   if (/^\d+[HD]$/.test(upper)) return upper;
   return label;
+}
+
+function parseApiServicePort(value: string): number | null {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const port = Number(trimmed);
+  if (!Number.isInteger(port)) return null;
+  if (port < API_SERVICE_PORT_MIN || port > API_SERVICE_PORT_MAX) return null;
+  return port;
+}
+
+function parseApiServiceHost(value: string): string | null {
+  const trimmed = value.trim();
+  const parts = trimmed.split(".");
+  if (parts.length !== 4) return null;
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const octet = Number(part);
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return null;
+    octets.push(octet);
+  }
+  return octets.join(".");
 }
 
 function pickAntigravitySummaryMetrics(metrics: QuotaMetric[]): QuotaMetric[] {
@@ -1160,6 +1183,8 @@ function App() {
     apiServicePort: DEFAULT_API_SERVICE_PORT,
     apiServiceDefaultModel: "gpt-5.5",
   });
+  const [apiServiceHostInput, setApiServiceHostInput] = useState("0.0.0.0");
+  const [apiServicePortInput, setApiServicePortInput] = useState(String(DEFAULT_API_SERVICE_PORT));
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
   const [isConfiguringCodex, setIsConfiguringCodex] = useState(false);
@@ -1725,14 +1750,35 @@ function App() {
   const updateSetting = <Key extends keyof typeof settings>(key: Key, value: (typeof settings)[Key]) => {
     setSettings((current) => ({ ...current, [key]: value }));
   };
+  const updateApiServiceHost = (value: string) => {
+    const ipText = value.replace(/[^\d.]/g, "").slice(0, 15);
+    setApiServiceHostInput(ipText);
+    const next = parseApiServiceHost(ipText);
+    if (next !== null) updateSetting("apiServiceHost", next);
+  };
+  const commitApiServiceHost = () => {
+    const next = parseApiServiceHost(apiServiceHostInput);
+    if (next !== null) {
+      setApiServiceHostInput(next);
+      updateSetting("apiServiceHost", next);
+      return;
+    }
+    setApiServiceHostInput(settings.apiServiceHost);
+  };
   const updateApiServicePort = (value: string) => {
-    const next = Number(value);
-    updateSetting(
-      "apiServicePort",
-      Number.isInteger(next)
-        ? Math.min(API_SERVICE_PORT_MAX, Math.max(API_SERVICE_PORT_MIN, next))
-        : DEFAULT_API_SERVICE_PORT,
-    );
+    const digitsOnly = value.replace(/\D/g, "").slice(0, 5);
+    setApiServicePortInput(digitsOnly);
+    const next = parseApiServicePort(digitsOnly);
+    if (next !== null) updateSetting("apiServicePort", next);
+  };
+  const commitApiServicePort = () => {
+    const next = parseApiServicePort(apiServicePortInput);
+    if (next !== null) {
+      setApiServicePortInput(String(next));
+      updateSetting("apiServicePort", next);
+      return;
+    }
+    setApiServicePortInput(String(settings.apiServicePort));
   };
   const handleToggleAccount = async (account: ManagedAccount) => {
     if (isCurrentAccount(account)) return;
@@ -1965,6 +2011,8 @@ function App() {
       .then((storedSettings) => {
         if (storedSettings) {
           setSettings(storedSettings);
+          setApiServiceHostInput(storedSettings.apiServiceHost);
+          setApiServicePortInput(String(storedSettings.apiServicePort));
         }
       })
       .catch(() => undefined)
@@ -2829,7 +2877,7 @@ function App() {
                     <p>
                       {apiService?.running
                         ? "API 服务运行中时不允许修改端口；请先停止服务。"
-                        : "地址 0.0.0.0 同时监听本机与局域网；端口限制在 50000-59999。"}
+                        : "地址 0.0.0.0 同时监听本机与局域网；端口限制在 51000-59999。"}
                     </p>
                   </div>
                 </div>
@@ -2838,8 +2886,16 @@ function App() {
                     <span>地址</span>
                     <input
                       type="text"
-                      value={settings.apiServiceHost}
-                      onChange={(event) => updateSetting("apiServiceHost", event.target.value)}
+                      inputMode="decimal"
+                      pattern="[0-9.]*"
+                      maxLength={15}
+                      value={apiServiceHostInput}
+                      onChange={(event) => updateApiServiceHost(event.target.value)}
+                      onBlur={commitApiServiceHost}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") event.currentTarget.blur();
+                      }}
+                      aria-invalid={parseApiServiceHost(apiServiceHostInput) === null}
                       placeholder="0.0.0.0"
                       disabled={Boolean(apiService?.running)}
                     />
@@ -2847,11 +2903,18 @@ function App() {
                   <label className="setting-inline-field">
                     <span>端口</span>
                     <input
-                      type="number"
-                      min={API_SERVICE_PORT_MIN}
-                      max={API_SERVICE_PORT_MAX}
-                      value={settings.apiServicePort}
+                      type="text"
+                      inputMode="numeric"
+                      pattern="[0-9]*"
+                      maxLength={5}
+                      value={apiServicePortInput}
                       onChange={(event) => updateApiServicePort(event.target.value)}
+                      onBlur={commitApiServicePort}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") event.currentTarget.blur();
+                      }}
+                      aria-invalid={parseApiServicePort(apiServicePortInput) === null}
+                      placeholder={String(DEFAULT_API_SERVICE_PORT)}
                       disabled={Boolean(apiService?.running)}
                     />
                   </label>
