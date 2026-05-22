@@ -19,7 +19,6 @@ import {
   Download,
   Eye,
   EyeOff,
-  ExternalLink,
   FileJson,
   FolderDown,
   Info,
@@ -52,6 +51,8 @@ import { useVirtualScrollbar } from "./hooks/useVirtualScrollbar";
 import { ForceUpdateModal } from "./components/ForceUpdateModal";
 import { AccountDetailsDialog } from "./components/AccountDetailsDialog";
 import { NoticeToast } from "./components/NoticeToast";
+import { AboutPanelBody } from "./components/AboutPanel";
+import { SidebarAdCard } from "./components/SidebarAdCard";
 import { noticeToneConfig } from "./components/noticeTone";
 import { CodexIcon } from "./components/icons/CodexIcon";
 import { GeminiIcon } from "./components/icons/GeminiIcon";
@@ -2361,13 +2362,7 @@ function App() {
         </nav>
 
         <div className="sidebar-footer">
-          <a className="ad-card" href="https://ai.talentisan.cn/" onClick={handleOpenStore}>
-            <div>
-              <span>AI 权益补给站</span>
-              <strong>购买 AI 到 Super Store</strong>
-            </div>
-            <ExternalLink size={18} />
-          </a>
+          <SidebarAdCard onOpenStore={handleOpenStore} />
           <div className="sidebar-divider" />
           <button onClick={handleLogs}>
             <ScrollText size={18} />
@@ -3005,67 +3000,12 @@ function App() {
           className="about-panel"
           onClose={() => setIsAboutOpen(false)}
         >
-          <div className="settings-body about-body">
-            <section className="setting-row about-app-row">
-              <div className="setting-copy">
-                <img className="about-icon" src={logoUrl} alt="" draggable={false} />
-                <div>
-                  <strong>{aboutInfo?.name ?? APP_NAME}</strong>
-                  <p>本地 Codex / Gemini / {APP_NAME} 账号管理</p>
-                </div>
-              </div>
-            </section>
-
-            <div className="about-info-grid">
-              <section className="about-info-card">
-                <div className="setting-copy">
-                  <BadgeCheck size={18} />
-                  <div>
-                    <strong>应用版本</strong>
-                    <p>{aboutInfo?.version ?? "加载中…"}</p>
-                  </div>
-                </div>
-              </section>
-
-              <section className="about-info-card">
-                <div className="setting-copy">
-                  <LockKeyhole size={18} />
-                  <div>
-                    <strong>构建模式</strong>
-                    <p>{IS_PUBLIC_BUILD ? "公开版" : "完全版"}</p>
-                  </div>
-                </div>
-              </section>
-
-              <section className="about-info-card">
-                <div className="setting-copy">
-                  <Monitor size={18} />
-                  <div>
-                    <strong>运行平台</strong>
-                    <p>{typeof navigator !== "undefined" ? navigator.platform || "—" : "—"}</p>
-                  </div>
-                </div>
-              </section>
-
-              <section className="about-info-card">
-                <div className="setting-copy">
-                  <Info size={18} />
-                  <div>
-                    <strong>应用标识</strong>
-                    <p>cn.talentisan.super-ai</p>
-                  </div>
-                </div>
-              </section>
-            </div>
-
-            <p className="about-note">
-              更多说明见{" "}
-              <a href="https://ai.talentisan.cn/" onClick={handleOpenStore}>
-                ai.talentisan.cn
-              </a>
-              。所有账号凭证仅保存在本机。
-            </p>
-          </div>
+          <AboutPanelBody
+            appName={APP_NAME}
+            isPublicBuild={IS_PUBLIC_BUILD}
+            aboutInfo={aboutInfo}
+            onOpenStore={handleOpenStore}
+          />
         </AppModal>
       )}
 

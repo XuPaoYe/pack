@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Super AI",
-  "version": "3.2.1",
+  "version": "3.3.2",
   "identifier": "cn.talentisan.super-ai",
   "build": {
     "frontendDist": "../dist",
@@ -20,6 +20,8 @@
         "visible": false,
         "minWidth": 1320,
         "minHeight": 740,
+        "maxWidth": 1320,
+        "maxHeight": 740,
         "center": true,
         "decorations": true,
         "titleBarStyle": "Overlay",
@@ -29,12 +31,13 @@
           "y": 18
         },
         "transparent": false,
-        "resizable": true,
+        "resizable": false,
+        "maximizable": false,
         "fullscreen": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' asset: https://asset.localhost data: blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {

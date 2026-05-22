@@ -1,6 +1,6 @@
 [package]
 name = "super-ai"
-version = "3.2.1"
+version = "3.3.2"
 description = "Super AI Codex and Gemini local account manager"
 authors = ["Talentisan"]
 license = ""
