@@ -195,6 +195,58 @@ jobs:
 
       # 仅当第一次失败时触发；tauri-action 见 release 已存在会直接追加 artifact，
       # cargo/rustc 产物沿用上轮缓存，实际只重跑 bundler（dmg/nsis）。
+      - name: Remove partially uploaded assets before retry
+        if: steps.tauri_build.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_TARGET: ${{ matrix.tauri_target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_version || github.ref_name }}"
+          VERSION="${TAG#v}"
+          RELEASE_ID="${{ needs.prepare-release.outputs.release_id }}"
+
+          case "$TAURI_TARGET" in
+            aarch64-apple-darwin)
+              ASSETS=(
+                "Super.AI_${VERSION}_aarch64.dmg"
+                "Super.AI_aarch64.app.tar.gz"
+                "Super.AI_aarch64.app.tar.gz.sig"
+              )
+              ;;
+            x86_64-apple-darwin)
+              ASSETS=(
+                "Super.AI_${VERSION}_x64.dmg"
+                "Super.AI_x64.app.tar.gz"
+                "Super.AI_x64.app.tar.gz.sig"
+              )
+              ;;
+            x86_64-pc-windows-msvc)
+              ASSETS=(
+                "Super.AI_${VERSION}_x64-setup.exe"
+                "Super.AI_${VERSION}_x64-setup.exe.sig"
+              )
+              ;;
+            aarch64-pc-windows-msvc)
+              ASSETS=(
+                "Super.AI_${VERSION}_arm64-setup.exe"
+                "Super.AI_${VERSION}_arm64-setup.exe.sig"
+              )
+              ;;
+            *)
+              ASSETS=()
+              ;;
+          esac
+
+          for asset_name in "${ASSETS[@]}"; do
+            asset_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" --paginate \
+              --jq ".[] | select(.name == \"$asset_name\") | .id" | head -n1 || true)"
+            if [ -n "$asset_id" ]; then
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
+            fi
+          done
+
       - name: Tauri build & release (retry)
         if: steps.tauri_build.outcome == 'failure'
         uses: tauri-apps/tauri-action@v0
