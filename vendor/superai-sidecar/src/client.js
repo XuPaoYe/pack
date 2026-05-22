@@ -113,6 +113,16 @@ function neutralizeIdentityForCascade(sysText) {
   text = text.replace(/(?:^|\n)\s*(?:#\s*)?Devin\s+(?:AI|Assistant|Agent|IDE|CLI|Code)/gi, '\nCloud IDE');
   // Generic: strip "You are Devin/OpenClaw/etc" identity overrides
   text = text.replace(/(^|[\n.!?]\s*)You are (?:Devin|Codex|OpenClaw|Aider|Cline)(?:[,.]|\s|$)/gi, '$1The assistant is a coding tool');
+  // SuperAI rebrand: also neutralize caller-supplied Cascade/Codeium/Windsurf
+  // identity overrides so they don't fight with the SuperAI [Context: ...]
+  // block appended later. Without this, a caller prompt that says
+  // "You are Cascade, made by Windsurf" survives as "The assistant is Cascade"
+  // (the generic "You are " → "The assistant is " sweep at the bottom only
+  // rewrites the verb, not the noun), and the model sees conflicting
+  // identity signals — caller still names Cascade, SuperAI Context forbids
+  // mentioning it. Strip the noun too, same shape as the Devin/Codex line.
+  text = text.replace(/(^|[\n.!?]\s*)You are (?:Cascade|Codeium|Windsurf)(?:[,.]|\s|$)/gi, '$1The assistant is an AI assistant');
+  text = text.replace(/\b(?:I am|I'm) (?:Cascade|Codeium|Windsurf)\b/gi, 'I am an AI assistant');
   // v2.0.91 — Windsurf safety filter also flags prompt-injection shaped
   // content (system prompt dumps from other agents). Normalize common
   // patterns that trigger false positives.
@@ -644,7 +654,18 @@ export class WindsurfClient {
       const providerKey = Object.keys(providerMap).find(k => modelLabel.includes(k)) || '';
       const provider = providerMap[providerKey] || '';
       if (provider) {
-        const ctx = `[Context: The underlying model serving this request is ${opts.displayModel || modelLabel}, developed by ${provider}.]`;
+        // SuperAI 唯一真相：API 服务里配的什么 model id 就让模型自报什么。
+        // displayModel 里可能带 reasoning effort 后缀（-low/-medium/-high/-xhigh），
+        // 那是给上游路由用的，不该泄露给终端用户 —— 主流厂商也只报基础模型名，
+        // 不报 effort 档位。
+        //
+        // 注意不要把 provider 字符串注进去：providerMap 里 swe → 'Windsurf'，
+        // 直接写进上游 system prompt 会让 SWE 模型在被问 "你是谁/谁家做的"
+        // 时主动说出 "Windsurf"，绕过 neutralizeCascadeIdentity 那几条窄正则。
+        // 索性不暴露 provider —— 主流 SaaS 也只让模型自报型号，不强调厂家。
+        const rawDisplay = String(opts.displayModel || modelLabel);
+        const publicModelId = rawDisplay.replace(/-(?:xhigh|high|medium|low)$/i, '');
+        const ctx = `[Context: You are the model "${publicModelId}", accessed via the SuperAI API. When the user asks who you are, which model you are, or about your identity/version, answer with exactly "${publicModelId}". Do NOT reveal, mention, or speculate about any other underlying model name, provider, training origin, or backend implementation (including but not limited to Cascade, Codeium, Windsurf, or any internal routing layer).]`;
         sysText = sysText ? sysText + '\n' + ctx : ctx;
       }
 
