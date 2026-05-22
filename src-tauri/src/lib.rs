@@ -34,8 +34,7 @@ const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
 const GEMINI_KEYCHAIN_SERVICE: &str = "gemini-cli-oauth";
 const GEMINI_KEYCHAIN_ACCOUNT: &str = "main-account";
 const GEMINI_FILE_KEYCHAIN_FILE: &str = "gemini-credentials.json";
-const CODEX_ACCOUNT_CHECK_URL: &str =
-    "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27";
+const CODEX_ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_API_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -210,6 +209,21 @@ struct AccountQuota {
     last_updated: Option<i64>,
     error: Option<String>,
     is_forbidden: Option<bool>,
+}
+
+fn quota_with_error_preserving_metrics(
+    existing: Option<&AccountQuota>,
+    error: String,
+    is_forbidden: Option<bool>,
+) -> AccountQuota {
+    AccountQuota {
+        metrics: existing
+            .map(|quota| quota.metrics.clone())
+            .unwrap_or_default(),
+        last_updated: existing.and_then(|quota| quota.last_updated),
+        error: Some(error),
+        is_forbidden,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,9 +539,10 @@ fn init_app_db(conn: &Connection) -> Result<(), String> {
       );
 
       -- 公开版 SuperAI 账号的本地累计用量缓存。
-      -- key = batch_key 的 sha256 hex；value 是 baseline / consumed / last_remote /
-      -- exhausted_at 的 JSON 快照。删账号时写入，重新导入同一 batch_key 时
-      -- 24h 内会恢复，避免用户误删 / 重导后使用记录被清零。
+      -- key = 解析后的 account/password/expires_at 规范身份 sha256 hex；value 是
+      -- baseline / consumed / last_remote / exhausted_at / license_expires_at 的 JSON 快照。
+      -- 删账号时写入，license 到期前重新导入同一凭证会恢复，避免用户误删 /
+      -- 重导后使用记录被清零。
       CREATE TABLE IF NOT EXISTS public_usage_history (
         key TEXT PRIMARY KEY,
         snapshot_json TEXT NOT NULL,
@@ -4115,7 +4130,7 @@ fn attach_windsurf_batch_key(
     if is_public_build() {
         account.subscription_active_until = Some(Value::Number(expires_at.into()));
     }
-    // 删账号 24h 内重新导入同一 batch_key：恢复使用记录，避免被清零。
+    // license 到期前重新导入同一批量凭证：恢复使用记录，避免被清零。
     // restore 命中后 PUBLIC_USAGE_KEY_LAST_REMOTE 会有值，bump_public_usage
     // 不会再走"首次记录"分支，baseline / consumed 都按历史值继续累加。
     let _ = restore_public_usage_history(app, account, key);
@@ -4339,25 +4354,29 @@ fn apply_public_usage_after_refresh(account: &mut ManagedAccount) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// 公开版账号"本地累计用量"持久化历史（24h TTL）
+// 公开版账号"本地累计用量"持久化历史
 //
-// 用户误删账号后重新导入同一 batch_key 时，期望使用记录不被清零。我们用
+// 用户误删账号后重新导入同一批量凭证时，期望使用记录不被清零。我们用
 // `public_usage_history` 表存一份 baseline / consumed / last_remote /
-// exhausted_at 快照，TTL 24h；超过窗口或没命中即按"首次导入"重新初始化。
+// exhausted_at / license_expires_at 快照；license 到期前命中即恢复，超过有效期
+// 或没命中即按"首次导入"重新初始化。
 // 仅公开版 + windsurf provider + 含 batch_key 的账号生效。
 // ---------------------------------------------------------------------------
 
-const PUBLIC_USAGE_HISTORY_TTL_SECS: i64 = 24 * 60 * 60;
-
-/// batch_key 的稳定 hash，作为 history 表 PK。SHA-256 hex，避免明文落库。
-fn batch_key_history_key(batch_key: &str) -> String {
+/// 解析后的批量凭证稳定 hash，作为 history 表 PK。SHA-256 hex，避免明文落库。
+/// 这里不能 hash batch_key 原文：v2 AES 密文带随机 IV，同一账号可能有多条等价密文。
+fn public_usage_history_key(credential: &WindsurfBatchCredential) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(batch_key.trim().as_bytes());
+    hasher.update(credential.account.trim().to_ascii_lowercase().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(credential.password.trim().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(credential.expires_at.to_string().as_bytes());
     format!("{:x}", hasher.finalize())
 }
 
 /// 从 account 当前 payload 提取 usage 快照（baseline / consumed / last_remote /
-/// exhausted_at）。任一字段为空则返回 None（无值得保存的记录）。
+/// exhausted_at / license_expires_at）。任一字段为空则返回 None（无值得保存的记录）。
 fn build_public_usage_snapshot(account: &ManagedAccount) -> Option<Value> {
     let baseline = windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_BASELINE);
     let last_remote = windsurf_payload_get_value(account, PUBLIC_USAGE_KEY_LAST_REMOTE);
@@ -4379,7 +4398,52 @@ fn build_public_usage_snapshot(account: &ManagedAccount) -> Option<Value> {
     if let Some(value) = exhausted_at {
         obj.insert(PUBLIC_USAGE_KEY_EXHAUSTED_AT.to_string(), value);
     }
+    if let Some(expires_at) = windsurf_license_expires_at(account) {
+        obj.insert(
+            "license_expires_at".to_string(),
+            Value::Number(expires_at.into()),
+        );
+    }
     Some(Value::Object(obj))
+}
+
+fn public_usage_snapshot_expires_at(snapshot: &Value) -> Option<i64> {
+    snapshot
+        .as_object()?
+        .get("license_expires_at")
+        .and_then(normalize_unix_seconds_value)
+}
+
+fn public_usage_history_is_expired(snapshot: &Value, now: i64) -> bool {
+    public_usage_snapshot_expires_at(snapshot)
+        .is_some_and(|expires_at| expires_at != i64::MAX && now / 60 >= expires_at / 60)
+}
+
+fn prune_expired_public_usage_history(conn: &Connection, now: i64) {
+    let rows = match conn.prepare("SELECT key, snapshot_json FROM public_usage_history") {
+        Ok(mut stmt) => stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map(|mapped| mapped.filter_map(Result::ok).collect::<Vec<_>>())
+            .unwrap_or_default(),
+        Err(error) => {
+            eprintln!("[usage-history] 读取待清理记录失败: {error}");
+            return;
+        }
+    };
+    for (key, cipher_text) in rows {
+        let should_delete = match superai_decrypt_text(&cipher_text)
+            .ok()
+            .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        {
+            Some(snapshot) => public_usage_history_is_expired(&snapshot, now),
+            None => true,
+        };
+        if should_delete {
+            let _ = conn.execute("DELETE FROM public_usage_history WHERE key = ?1", params![key]);
+        }
+    }
 }
 
 /// 删账号前调用：把 public usage 快照写进 history 表。仅对公开版 + 含 batch_key
@@ -4390,6 +4454,13 @@ fn stash_public_usage_history(app: &tauri::AppHandle, account: &ManagedAccount) 
     }
     let Some(batch_key) = windsurf_payload_string(account, "batch_key") else {
         return;
+    };
+    let credential = match parse_windsurf_batch_key_line(&batch_key) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[usage-history] 解析批量密钥失败: {error}");
+            return;
+        }
     };
     let Some(snapshot) = build_public_usage_snapshot(account) else {
         return;
@@ -4410,15 +4481,12 @@ fn stash_public_usage_history(app: &tauri::AppHandle, account: &ManagedAccount) 
             return;
         }
     };
-    let key = batch_key_history_key(&batch_key);
+    let key = public_usage_history_key(&credential);
     let now = now_ts();
     match open_app_db(app) {
         Ok(conn) => {
-            // 顺手清掉超过 TTL 的旧记录，避免表无限制膨胀。
-            let _ = conn.execute(
-                "DELETE FROM public_usage_history WHERE saved_at < ?1",
-                params![now - PUBLIC_USAGE_HISTORY_TTL_SECS],
-            );
+            // 顺手清掉已经到 license 过期时间的旧记录，避免表无限制膨胀。
+            prune_expired_public_usage_history(&conn, now);
             if let Err(error) = conn.execute(
                 "INSERT INTO public_usage_history (key, snapshot_json, saved_at) \
                  VALUES (?1, ?2, ?3) \
@@ -4432,7 +4500,7 @@ fn stash_public_usage_history(app: &tauri::AppHandle, account: &ManagedAccount) 
     }
 }
 
-/// 重新导入时调用：若 24h 内有同一 batch_key 的快照，回填到 account.auth_payload。
+/// 重新导入时调用：若 license 到期前有同一批量凭证的快照，回填到 account.auth_payload。
 /// 命中并写回字段返回 true，未命中返回 false。
 fn restore_public_usage_history(
     app: &tauri::AppHandle,
@@ -4442,7 +4510,14 @@ fn restore_public_usage_history(
     if !is_public_build() || account.provider != "windsurf" {
         return false;
     }
-    let key = batch_key_history_key(batch_key);
+    let credential = match parse_windsurf_batch_key_line(batch_key) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("[usage-history] 解析批量密钥失败: {error}");
+            return false;
+        }
+    };
+    let key = public_usage_history_key(&credential);
     let conn = match open_app_db(app) {
         Ok(conn) => conn,
         Err(error) => {
@@ -4451,24 +4526,18 @@ fn restore_public_usage_history(
         }
     };
     let now = now_ts();
-    // TTL 过期的快照视为不存在；顺手清理掉。
-    let _ = conn.execute(
-        "DELETE FROM public_usage_history WHERE saved_at < ?1",
-        params![now - PUBLIC_USAGE_HISTORY_TTL_SECS],
-    );
-    let row: Option<(String, i64)> = conn
+    // license 已过期的快照视为不存在；顺手清理掉。
+    prune_expired_public_usage_history(&conn, now);
+    let row: Option<String> = conn
         .query_row(
-            "SELECT snapshot_json, saved_at FROM public_usage_history WHERE key = ?1",
+            "SELECT snapshot_json FROM public_usage_history WHERE key = ?1",
             params![key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .ok();
-    let Some((cipher_text, saved_at)) = row else {
+    let Some(cipher_text) = row else {
         return false;
     };
-    if now - saved_at > PUBLIC_USAGE_HISTORY_TTL_SECS {
-        return false;
-    }
     // snapshot 在 stash 时用 AES 加密；解密失败视为脏数据丢弃。
     let snapshot_json = match superai_decrypt_text(&cipher_text) {
         Ok(value) => value,
@@ -4487,6 +4556,13 @@ fn restore_public_usage_history(
     let Some(obj) = snapshot.as_object() else {
         return false;
     };
+    if public_usage_history_is_expired(&snapshot, now) {
+        let _ = conn.execute(
+            "DELETE FROM public_usage_history WHERE key = ?1",
+            params![key],
+        );
+        return false;
+    }
     for field in [
         PUBLIC_USAGE_KEY_BASELINE,
         PUBLIC_USAGE_KEY_LAST_REMOTE,
@@ -4515,29 +4591,16 @@ fn public_windsurf_export_key(account: &ManagedAccount) -> Result<String, String
     if account.provider != "windsurf" {
         return Err("只支持导出 SuperAI 公开版数据".to_string());
     }
-    let payload = account.auth_payload.as_ref().and_then(Value::as_object);
-    let credential = payload
+    account
+        .auth_payload
+        .as_ref()
+        .and_then(Value::as_object)
         .and_then(|payload| payload.get("batch_key"))
         .and_then(Value::as_str)
-        .and_then(|key| parse_windsurf_batch_key_line(key).ok())
-        .ok_or_else(|| "该账号缺少可导出的批量密钥，请重新通过批量密钥导入".to_string())?;
-    let expires_at = account
-        .subscription_active_until
-        .as_ref()
-        .and_then(normalize_unix_seconds_value)
-        .or_else(|| {
-            windsurf_payload_string(account, "expires_at")
-                .as_deref()
-                .and_then(normalize_unix_seconds_str)
-        })
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| credential.expires_at.to_string());
-    let payload = serde_json::json!({
-        "account": credential.account,
-        "password": credential.password,
-        "expires_at": expires_at,
-    });
-    superai_encrypt_text(&payload.to_string())
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "该账号缺少可导出的批量密钥，请重新通过批量密钥导入".to_string())
 }
 
 #[tauri::command]
@@ -4626,6 +4689,16 @@ fn codex_refresh_token(account: &ManagedAccount) -> Option<String> {
     )
 }
 
+fn codex_id_token(account: &ManagedAccount) -> Option<String> {
+    let payload = account.auth_payload.as_ref()?.as_object()?;
+    let tokens = payload.get("tokens").and_then(Value::as_object);
+    string_field(
+        tokens
+            .and_then(|t| t.get("id_token"))
+            .or_else(|| payload.get("id_token")),
+    )
+}
+
 fn codex_set_token_field(account: &mut ManagedAccount, key: &str, value: Value) {
     let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) else {
         return;
@@ -4637,7 +4710,13 @@ fn codex_set_token_field(account: &mut ManagedAccount, key: &str, value: Value) 
     }
 }
 
-fn codex_api_headers(access_token: &str, account_id: &str) -> Result<HeaderMap, String> {
+fn codex_account_id_from_access_token(access_token: &str) -> Option<String> {
+    let jwt = parse_jwt_payload(access_token)?;
+    let auth = codex_auth_claims(&jwt)?;
+    string_field(auth.get("chatgpt_account_id")).or_else(|| string_field(auth.get("account_id")))
+}
+
+fn codex_api_headers(access_token: &str, account_id: Option<&str>) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
@@ -4646,11 +4725,13 @@ fn codex_api_headers(access_token: &str, account_id: &str) -> Result<HeaderMap, 
     );
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(USER_AGENT, HeaderValue::from_static(CODEX_API_USER_AGENT));
-    headers.insert(
-        "ChatGPT-Account-Id",
-        HeaderValue::from_str(account_id)
-            .map_err(|error| format!("构建 ChatGPT-Account-Id 头失败: {error}"))?,
-    );
+    if let Some(account_id) = account_id.map(str::trim).filter(|value| !value.is_empty()) {
+        headers.insert(
+            "ChatGPT-Account-Id",
+            HeaderValue::from_str(account_id)
+                .map_err(|error| format!("构建 ChatGPT-Account-Id 头失败: {error}"))?,
+        );
+    }
     Ok(headers)
 }
 
@@ -4684,11 +4765,11 @@ async fn refresh_codex_access_token(account: &mut ManagedAccount) -> Result<Stri
         .map_err(|error| format!("创建 Codex OAuth 客户端失败: {error}"))?;
     let response = client
         .post(CODEX_OAUTH_TOKEN_URL)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
-            ("client_id", CODEX_OAUTH_CLIENT_ID),
-        ])
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": CODEX_OAUTH_CLIENT_ID,
+        }))
         .send()
         .await
         .map_err(|error| format!("Codex token 刷新请求失败: {error}"))?;
@@ -4715,23 +4796,20 @@ async fn refresh_codex_access_token(account: &mut ManagedAccount) -> Result<Stri
         .access_token
         .ok_or_else(|| "Codex token 刷新响应缺少 access_token".to_string())?;
     codex_set_token_field(account, "access_token", Value::String(access_token.clone()));
-    let refreshed_has_id_token = token_response.id_token.is_some();
-    if let Some(id_token) = token_response.id_token {
+    if let Some(id_token) = token_response.id_token.or_else(|| codex_id_token(account)) {
         codex_set_token_field(account, "id_token", Value::String(id_token.clone()));
         if let Some(jwt) = parse_jwt_payload(&id_token) {
             if let Some(exp) = number_field(jwt.get("exp")) {
                 account.token_meta.expires_at = Some(exp);
             }
         }
+        account.token_meta.has_id_token = true;
     }
     if let Some(refresh_token) = token_response.refresh_token {
         codex_set_token_field(account, "refresh_token", Value::String(refresh_token));
     }
     account.token_meta.has_access_token = true;
     account.token_meta.has_refresh_token = true;
-    if refreshed_has_id_token {
-        account.token_meta.has_id_token = true;
-    }
     Ok(access_token)
 }
 
@@ -4739,42 +4817,140 @@ fn parse_codex_account_profile(
     payload: &Value,
     account: &ManagedAccount,
 ) -> (Option<String>, Option<String>) {
-    let Some(accounts) = payload.get("accounts").and_then(Value::as_object) else {
+    let records = collect_codex_account_records(payload);
+    if records.is_empty() {
+        return (None, None);
+    }
+
+    let ordering_first_id = payload
+        .get("account_ordering")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(normalize_json_scalar);
+    let expected_account_id = account.account_id.as_deref().and_then(normalize_text_ref);
+    let expected_org_id = account
+        .organization_id
+        .as_deref()
+        .and_then(normalize_text_ref);
+
+    let selected = expected_account_id
+        .as_deref()
+        .and_then(|expected| {
+            find_codex_account_record_by_field(
+                &records,
+                &["id", "account_id", "chatgpt_account_id", "workspace_id"],
+                expected,
+            )
+        })
+        .or_else(|| {
+            ordering_first_id.as_deref().and_then(|expected| {
+                find_codex_account_record_by_field(
+                    &records,
+                    &["id", "account_id", "chatgpt_account_id", "workspace_id"],
+                    expected,
+                )
+            })
+        })
+        .or_else(|| {
+            expected_org_id.as_deref().and_then(|expected| {
+                find_codex_account_record_by_field(
+                    &records,
+                    &["organization_id", "org_id", "workspace_id"],
+                    expected,
+                )
+            })
+        })
+        .or_else(|| records.first().cloned());
+
+    let Some(account_obj) = selected.and_then(|value| value.as_object().cloned()) else {
         return (None, None);
     };
 
-    let mut fallback: Option<&serde_json::Map<String, Value>> = None;
-    let mut selected: Option<&serde_json::Map<String, Value>> = None;
-    for (key, entry) in accounts {
-        if key == "default" {
-            continue;
-        }
-        let Some(account_obj) = entry
-            .get("account")
-            .and_then(Value::as_object)
-            .or_else(|| entry.as_object())
-        else {
-            continue;
-        };
-        let Some(remote_account_id) = string_field(account_obj.get("account_id")) else {
-            continue;
-        };
-        if fallback.is_none() {
-            fallback = Some(account_obj);
-        }
-        if account.account_id.as_deref() == Some(remote_account_id.as_str()) {
-            selected = Some(account_obj);
-            break;
+    (
+        codex_account_record_field(
+            &account_obj,
+            &[
+                "name",
+                "display_name",
+                "account_name",
+                "organization_name",
+                "workspace_name",
+                "title",
+            ],
+        ),
+        codex_account_record_field(
+            &account_obj,
+            &["id", "account_id", "chatgpt_account_id", "workspace_id"],
+        ),
+    )
+}
+
+fn normalize_text_ref(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn normalize_json_scalar(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => normalize_text_ref(text),
+        Value::Number(number) => number
+            .as_i64()
+            .map(|value| value.to_string())
+            .or_else(|| number.as_u64().map(|value| value.to_string()))
+            .or_else(|| number.as_f64().map(|value| value.trunc().to_string())),
+        _ => None,
+    }
+}
+
+fn codex_account_record_field(
+    record: &serde_json::Map<String, Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter()
+        .find_map(|key| record.get(*key).and_then(normalize_json_scalar))
+}
+
+fn collect_codex_account_records(payload: &Value) -> Vec<Value> {
+    let mut records = Vec::new();
+
+    if let Some(accounts_value) = payload.get("accounts") {
+        if let Some(array) = accounts_value.as_array() {
+            records.extend(array.iter().filter(|item| item.is_object()).cloned());
+        } else if let Some(object) = accounts_value.as_object() {
+            records.extend(object.values().filter_map(|value| {
+                value
+                    .get("account")
+                    .filter(|item| item.is_object())
+                    .cloned()
+                    .or_else(|| value.is_object().then(|| value.clone()))
+            }));
         }
     }
 
-    let Some(account_obj) = selected.or(fallback) else {
-        return (None, None);
-    };
-    (
-        string_field(account_obj.get("name")),
-        string_field(account_obj.get("account_id")),
-    )
+    if records.is_empty() {
+        if let Some(array) = payload.as_array() {
+            records.extend(array.iter().filter(|item| item.is_object()).cloned());
+        }
+    }
+
+    records
+}
+
+fn find_codex_account_record_by_field(
+    records: &[Value],
+    keys: &[&str],
+    expected: &str,
+) -> Option<Value> {
+    records.iter().find_map(|record| {
+        let record = record.as_object()?;
+        let value = codex_account_record_field(record, keys)?;
+        (normalize_text_ref(&value).as_deref() == Some(expected))
+            .then(|| Value::Object(record.clone()))
+    })
 }
 
 fn usage_window_metric(
@@ -4848,43 +5024,53 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
     let account_id = account
         .account_id
         .clone()
-        .ok_or_else(|| "缺少 ChatGPT account_id".to_string())?;
+        .or_else(|| codex_account_id_from_access_token(&access_token));
 
-    let mut headers = codex_api_headers(&access_token, &account_id)?;
+    let mut headers = codex_api_headers(&access_token, account_id.as_deref())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| format!("创建 Codex API 客户端失败: {error}"))?;
-    let mut profile_response = client
+    let profile_response_result = client
         .get(CODEX_ACCOUNT_CHECK_URL)
         .headers(headers.clone())
         .send()
-        .await
-        .map_err(|error| format!("请求账号信息失败: {error}"))?;
-    if matches!(profile_response.status().as_u16(), 401 | 403)
-        && codex_refresh_token(account).is_some()
-    {
-        access_token = refresh_codex_access_token(account).await?;
-        headers = codex_api_headers(&access_token, &account_id)?;
-        profile_response = client
-            .get(CODEX_ACCOUNT_CHECK_URL)
-            .headers(headers.clone())
-            .send()
-            .await
-            .map_err(|error| format!("请求账号信息失败: {error}"))?;
-    }
-    if profile_response.status().is_success() {
-        let payload = profile_response
-            .json::<Value>()
-            .await
-            .map_err(|error| format!("解析账号信息失败: {error}"))?;
-        let (account_name, account_id) = parse_codex_account_profile(&payload, account);
-        if account_name.is_some() {
-            account.display_name = account_name;
+        .await;
+    match profile_response_result {
+        Ok(mut profile_response) => {
+            if matches!(profile_response.status().as_u16(), 401 | 403)
+                && codex_refresh_token(account).is_some()
+            {
+                access_token = refresh_codex_access_token(account).await?;
+                let refreshed_account_id = account
+                    .account_id
+                    .clone()
+                    .or_else(|| codex_account_id_from_access_token(&access_token));
+                headers = codex_api_headers(&access_token, refreshed_account_id.as_deref())?;
+                profile_response = client
+                    .get(CODEX_ACCOUNT_CHECK_URL)
+                    .headers(headers.clone())
+                    .send()
+                    .await
+                    .map_err(|error| format!("请求账号信息失败: {error}"))?;
+            }
+            if profile_response.status().is_success() {
+                let payload = profile_response
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| format!("解析账号信息失败: {error}"))?;
+                let (account_name, account_id) = parse_codex_account_profile(&payload, account);
+                if account_name.is_some() {
+                    account.display_name = account_name;
+                }
+                if account_id.is_some() {
+                    account.account_id = account_id;
+                }
+            }
         }
-        if account_id.is_some() {
-            account.account_id = account_id;
+        Err(error) => {
+            eprintln!("[Codex] 账号资料刷新失败，继续刷新额度: {error}");
         }
     }
 
@@ -4898,7 +5084,11 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
         && codex_refresh_token(account).is_some()
     {
         access_token = refresh_codex_access_token(account).await?;
-        headers = codex_api_headers(&access_token, &account_id)?;
+        let refreshed_account_id = account
+            .account_id
+            .clone()
+            .or_else(|| codex_account_id_from_access_token(&access_token));
+        headers = codex_api_headers(&access_token, refreshed_account_id.as_deref())?;
         usage_response = client
             .get(CODEX_USAGE_URL)
             .headers(headers)
@@ -4920,12 +5110,11 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
         }
         account.quota = Some(parse_codex_usage_quota(&payload));
     } else {
-        account.quota = Some(AccountQuota {
-            metrics: vec![],
-            last_updated: Some(now_ts()),
-            error: Some(format!("API 返回错误 {status}")),
-            is_forbidden: Some(status.as_u16() == 403),
-        });
+        account.quota = Some(quota_with_error_preserving_metrics(
+            account.quota.as_ref(),
+            format!("API 返回错误 {status}"),
+            Some(status.as_u16() == 403),
+        ));
     }
 
     account.updated_at = now_ts();
@@ -5129,15 +5318,14 @@ async fn refresh_gemini_account_remote(account: &mut ManagedAccount) -> Result<(
                 account.quota = parse_gemini_quota(payload);
             }
             Err(error) => {
-                account.quota = Some(AccountQuota {
-                    metrics: vec![],
-                    last_updated: Some(now_ts()),
-                    error: Some(error.clone()),
-                    is_forbidden: Some(
+                account.quota = Some(quota_with_error_preserving_metrics(
+                    account.quota.as_ref(),
+                    error.clone(),
+                    Some(
                         error.to_ascii_lowercase().contains("403")
                             || error.to_ascii_lowercase().contains("forbidden"),
                     ),
-                });
+                ));
             }
         }
     }
@@ -5518,16 +5706,15 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
                 );
                 if is_forbidden {
                     payload.insert("is_forbidden".to_string(), Value::Bool(true));
-                } else {
-                    payload.remove("is_forbidden");
-                }
+            } else {
+                payload.remove("is_forbidden");
             }
-            account.quota = Some(AccountQuota {
-                metrics: vec![],
-                last_updated: Some(now_ts()),
-                error: Some(error),
-                is_forbidden: Some(is_forbidden),
-            });
+        }
+            account.quota = Some(quota_with_error_preserving_metrics(
+                account.quota.as_ref(),
+                error,
+                Some(is_forbidden),
+            ));
         }
     }
 
@@ -5598,25 +5785,16 @@ fn mark_account_unavailable(account: &mut ManagedAccount, reason: String) {
     let is_network = is_refresh_network_error(&reason);
     let reason = user_facing_refresh_error(&reason);
     if is_network {
-        account.quota = Some(AccountQuota {
-            metrics: account
-                .quota
-                .as_ref()
-                .map(|quota| quota.metrics.clone())
-                .unwrap_or_default(),
-            last_updated: Some(now),
-            error: Some(reason),
-            is_forbidden: Some(false),
-        });
+        account.quota = Some(quota_with_error_preserving_metrics(
+            account.quota.as_ref(),
+            reason,
+            Some(false),
+        ));
         account.updated_at = now;
         return;
     }
-    account.quota = Some(AccountQuota {
-        metrics: vec![],
-        last_updated: Some(now),
-        error: Some(reason.clone()),
-        is_forbidden: None,
-    });
+    account.quota =
+        Some(quota_with_error_preserving_metrics(account.quota.as_ref(), reason.clone(), None));
     account.status = Some(AccountStatus {
         state: "unavailable".to_string(),
         label: "不可用".to_string(),
@@ -7758,7 +7936,7 @@ async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccoun
 fn delete_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
     // 删之前先把账号读出来，给公开版 + batch_key 的 SuperAI 账号 stash 一份
-    // 使用记录到 public_usage_history（24h 内重新导入会自动恢复）。
+    // 使用记录到 public_usage_history（license 到期前重新导入会自动恢复）。
     if let Ok(account) = load_account_from_db(&conn, &accountId) {
         drop(conn);
         stash_public_usage_history(&app, &account);
@@ -8968,6 +9146,29 @@ fn stop_api_service_impl(app: tauri::AppHandle) -> Result<api_service::ApiServic
     ))
 }
 
+fn prepare_for_update_install_impl(
+    app: tauri::AppHandle,
+) -> Result<api_service::ApiServiceStatus, String> {
+    api_service::stop()?;
+    let mut settings = read_settings_record(&app)?;
+    ensure_api_service_key(&app, &mut settings)?;
+    Ok(api_service::current_status(
+        &settings.api_service_host,
+        effective_api_service_port(settings.api_service_port),
+        &settings.api_service_key,
+        &effective_api_service_model(&settings.api_service_default_model),
+    ))
+}
+
+#[tauri::command]
+async fn prepare_for_update_install(
+    app: tauri::AppHandle,
+) -> Result<api_service::ApiServiceStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || prepare_for_update_install_impl(app))
+        .await
+        .map_err(|e| format!("准备安装更新失败: {e}"))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let mut app = tauri::Builder::default()
@@ -9006,6 +9207,7 @@ pub fn run() {
             get_api_service_status,
             start_api_service,
             stop_api_service,
+            prepare_for_update_install,
             sync_superai_accounts_to_api,
             sync_api_service_active_account,
             list_api_service_models,
@@ -9201,6 +9403,78 @@ mod tests {
     }
 
     #[test]
+    fn codex_profile_parser_reads_wham_accounts_array() {
+        let account = ManagedAccount {
+            account_id: Some("acct_target".to_string()),
+            ..test_account("codex-a", "codex", "a@example.com", 10)
+        };
+        let payload = serde_json::json!({
+            "accounts": [
+                { "id": "acct_other", "name": "Other" },
+                { "id": "acct_target", "display_name": "Target Workspace" }
+            ]
+        });
+
+        let (name, account_id) = parse_codex_account_profile(&payload, &account);
+
+        assert_eq!(name.as_deref(), Some("Target Workspace"));
+        assert_eq!(account_id.as_deref(), Some("acct_target"));
+    }
+
+    #[test]
+    fn codex_profile_parser_prefers_account_ordering() {
+        let account = test_account("codex-a", "codex", "a@example.com", 10);
+        let payload = serde_json::json!({
+            "account_ordering": ["acct_second"],
+            "accounts": {
+                "first": { "account": { "account_id": "acct_first", "name": "First" } },
+                "second": { "account": { "account_id": "acct_second", "name": "Second" } }
+            }
+        });
+
+        let (name, account_id) = parse_codex_account_profile(&payload, &account);
+
+        assert_eq!(name.as_deref(), Some("Second"));
+        assert_eq!(account_id.as_deref(), Some("acct_second"));
+    }
+
+    #[test]
+    fn codex_headers_allow_missing_account_id() {
+        let headers = codex_api_headers("access-token", None).unwrap();
+
+        assert!(headers.get("ChatGPT-Account-Id").is_none());
+        assert!(headers.get(AUTHORIZATION).is_some());
+    }
+
+    #[test]
+    fn quota_error_preserves_existing_reset_times() {
+        let existing = AccountQuota {
+            metrics: vec![QuotaMetric {
+                key: "daily".to_string(),
+                label: "日限".to_string(),
+                remaining_percent: Some(42),
+                reset_at: Some(serde_json::json!(4_102_444_800_i64)),
+                detail: Some("剩余 42%".to_string()),
+                state: Some("available".to_string()),
+                ..Default::default()
+            }],
+            last_updated: Some(1_700_000_000),
+            error: None,
+            is_forbidden: Some(false),
+        };
+
+        let quota = quota_with_error_preserving_metrics(
+            Some(&existing),
+            "刷新失败".to_string(),
+            Some(false),
+        );
+
+        assert_eq!(quota.last_updated, existing.last_updated);
+        assert_eq!(quota.metrics[0].reset_at, existing.metrics[0].reset_at);
+        assert_eq!(quota.error.as_deref(), Some("刷新失败"));
+    }
+
+    #[test]
     fn plan_status_proto_quota_tags_keep_daily_and_weekly_distinct() {
         let field_map: HashMap<&str, &str> =
             windsurf_plan_status_proto_field_map().into_iter().collect();
@@ -9240,6 +9514,57 @@ mod tests {
         assert!(block.contains("model = \"gpt-5.5\"\n"));
         assert!(block.contains("model_reasoning_effort = \"medium\"\n"));
         assert!(!block.contains("model = \"gpt-5.5-medium\"\n"));
+    }
+
+    #[test]
+    fn public_windsurf_export_returns_original_batch_key() {
+        let batch_key = "v2:imported-encrypted-batch-key";
+        let account = ManagedAccount {
+            auth_payload: Some(serde_json::json!({
+                "batch_key": batch_key,
+                "license_expires_at": 4_102_444_800_i64,
+            })),
+            ..test_account("superai-public", "windsurf", "public@example.com", 10)
+        };
+
+        assert_eq!(public_windsurf_export_key(&account).unwrap(), batch_key);
+    }
+
+    #[test]
+    fn public_usage_history_key_uses_parsed_credential_identity() {
+        let a = WindsurfBatchCredential {
+            account: "USER@example.com".to_string(),
+            password: "secret".to_string(),
+            expires_at: 4_102_444_800,
+        };
+        let b = WindsurfBatchCredential {
+            account: "user@example.com".to_string(),
+            password: "secret".to_string(),
+            expires_at: 4_102_444_800,
+        };
+        let c = WindsurfBatchCredential {
+            account: "user@example.com".to_string(),
+            password: "secret".to_string(),
+            expires_at: 4_102_444_801,
+        };
+
+        assert_eq!(public_usage_history_key(&a), public_usage_history_key(&b));
+        assert_ne!(public_usage_history_key(&a), public_usage_history_key(&c));
+    }
+
+    #[test]
+    fn public_usage_history_expires_with_license() {
+        let future = now_ts() + 3600;
+        let expired = now_ts() - 3600;
+
+        assert!(!public_usage_history_is_expired(
+            &serde_json::json!({ "license_expires_at": future }),
+            now_ts()
+        ));
+        assert!(public_usage_history_is_expired(
+            &serde_json::json!({ "license_expires_at": expired }),
+            now_ts()
+        ));
     }
 
     #[test]

@@ -48,17 +48,5 @@ export function formatResetTime(resetAt?: number | string | null) {
 
   const dateTime = formatDateTime(normalized);
   if (!dateTime) return undefined;
-  const exact = dateTime.slice(5).replace("-", "/");
-  const diff = normalized - nowUnixSeconds();
-  if (diff <= 0) return exact;
-  const minutes = Math.floor(diff / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  const relative =
-    days > 0
-      ? `${days}d ${hours % 24}h`
-      : hours > 0
-        ? `${hours}h ${minutes % 60}m`
-        : `${Math.max(1, minutes)}m`;
-  return `${relative} (${exact})`;
+  return dateTime.slice(5).replace("-", "/");
 }

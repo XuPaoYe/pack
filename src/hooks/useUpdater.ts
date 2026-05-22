@@ -26,6 +26,7 @@ const POLL_INTERVAL_MS = 15 * 60 * 1000;
 const APP_NAME = [83, 117, 112, 101, 114, 32, 65, 73]
   .map((c) => String.fromCharCode(c))
   .join("");
+const isWindowsRuntime = () => navigator.userAgent.includes("Windows");
 
 export function useUpdater({ appendAppLog, showError, sanitize, beforeInstall }: UpdaterHooks) {
   const [forceUpdate, setForceUpdate] = useState<ForceUpdateState | null>(null);
@@ -153,6 +154,10 @@ export function useUpdater({ appendAppLog, showError, sanitize, beforeInstall }:
       };
 
       await forceUpdate.update.downloadAndInstall(handleDownloadEvent);
+      if (isWindowsRuntime()) {
+        appendAppLog("info", "升级安装器已启动，应用将自动退出并由安装器重启。");
+        return;
+      }
       appendAppLog("info", "升级安装完成，正在重启应用。");
       await relaunch();
     } catch (error) {

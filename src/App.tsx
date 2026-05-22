@@ -224,7 +224,6 @@ function sanitizeUserFacingText(text: string) {
     .replaceAll(__SUPERAI_LEGACY_NAME, APP_NAME);
   if (IS_PUBLIC_BUILD) {
     next = next
-      .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[account]")
       .replace(/(password|pwd|api[_-]?key|session[_-]?token|auth1[_-]?token|refresh[_-]?token|access[_-]?token|id[_-]?token)(["'\s:=]+)([^"',\s}]+)/gi, "$1$2[secret]")
       .replace(/\b(auth1_[A-Za-z0-9._-]+)/g, "[secret]")
       .replace(/\b(devin-session-token\$[A-Za-z0-9._-]+)/g, "[secret]")
@@ -325,12 +324,25 @@ function shouldHideAccountDetails(account: ManagedAccount) {
   return IS_PUBLIC_BUILD && account.provider === PROVIDER_SUPERAI;
 }
 
+function accountCardTitle(account: ManagedAccount) {
+  return shouldHideAccountDetails(account) ? publicAccountCode(account, "SUPERAI") : accountTitle(account);
+}
+
 function accountDisplayLabel(account: ManagedAccount) {
-  return shouldHideAccountDetails(account) ? publicAccountCode(account, "SUPERAI") : account.email;
+  return accountCardTitle(account);
+}
+
+function accountNoticeLabel(account: ManagedAccount) {
+  if (shouldHideAccountDetails(account)) return publicAccountCode(account, "ACCT");
+  return account.accountId || account.email || accountTitle(account);
+}
+
+function accountActionLabel(account: ManagedAccount) {
+  return `${providerLabel(account.provider)} ${accountNoticeLabel(account)}`;
 }
 
 function activationSuccessMessage(account: ManagedAccount) {
-  const label = accountDisplayLabel(account);
+  const label = accountActionLabel(account);
   if (account.provider === "codex") {
     return `已启用 ${label}，请重启 Codex 相关产品`;
   }
@@ -345,7 +357,13 @@ function activationSuccessMessage(account: ManagedAccount) {
 
 function refreshFailureMessage(account: ManagedAccount) {
   const reason = account.status?.reason ?? account.quota?.error;
-  return reason ? `刷新 ${accountDisplayLabel(account)} 失败：${reason}` : `刷新 ${accountDisplayLabel(account)} 失败`;
+  return reason ? `刷新 ${accountActionLabel(account)} 失败：${reason}` : `刷新 ${accountActionLabel(account)} 失败`;
+}
+
+function batchDeleteDescription(accounts: ManagedAccount[]) {
+  const providers = Array.from(new Set(accounts.map((account) => providerLabel(account.provider))));
+  const scope = providers.length === 1 ? `${providers[0]} ` : "";
+  return `共 ${scope}${accounts.length} 个账号将被移除`;
 }
 
 function isRefreshUnavailable(account: ManagedAccount) {
@@ -1167,7 +1185,6 @@ function App() {
   const [isImportBusy, setIsImportBusy] = useState(false);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
   const [switchingAccountId, setSwitchingAccountId] = useState<string | null>(null);
-  const [refreshingActionAccountId, setRefreshingActionAccountId] = useState<string | null>(null);
   const [isFileImporting, setIsFileImporting] = useState(false);
   const [refreshingAccountIds, setRefreshingAccountIds] = useState<Set<string>>(() => new Set());
   const [refreshingProviders, setRefreshingProviders] = useState<Set<Provider>>(() => new Set());
@@ -1232,8 +1249,8 @@ function App() {
     return filteredAccounts.slice(start, start + ACCOUNT_PAGE_SIZE);
   }, [filteredAccounts, currentAccountPage]);
   const isActiveProviderRefreshing = useMemo(
-    () => refreshingProviders.has(activeProvider) || filteredAccounts.some((account) => refreshingAccountIds.has(account.id)),
-    [activeProvider, filteredAccounts, refreshingAccountIds, refreshingProviders],
+    () => refreshingProviders.has(activeProvider),
+    [activeProvider, refreshingProviders],
   );
 
   const counts = useMemo(
@@ -1299,15 +1316,17 @@ function App() {
     showNotice("error", `${prefix}：${normalizeUserError(error)}`);
   }, [showNotice]);
 
-  const stopApiServiceForUpdate = useCallback(async () => {
-    if (!isTauri() || !apiServiceRunning) return;
+  const prepareForUpdateInstall = useCallback(async () => {
+    if (!isTauri()) return;
     setIsApiServiceBusy(true);
     try {
-      const status = await invoke<ApiServiceStatus>("stop_api_service");
-      setApiService(status);
-      appendAppLog("info", "安装更新前已停止本地 API 服务。");
+      const status = await invoke<ApiServiceStatus>("prepare_for_update_install");
+      if (apiServiceRunning) {
+        setApiService(status);
+        appendAppLog("info", "安装更新前已停止本地 API 服务。");
+      }
     } catch (error) {
-      const message = `停止 API 服务失败，已取消更新安装：${String(error)}`;
+      const message = `安装更新前清理本地进程失败，已取消更新安装：${String(error)}`;
       appendAppLog("error", message);
       throw new Error(message, { cause: error });
     } finally {
@@ -1319,7 +1338,7 @@ function App() {
     appendAppLog,
     showError: (message) => showNotice("error", message),
     sanitize: sanitizeUserFacingText,
-    beforeInstall: stopApiServiceForUpdate,
+    beforeInstall: prepareForUpdateInstall,
   });
 
   const reloadAccountsSoon = useCallback((delay = 1800) => {
@@ -1800,8 +1819,7 @@ function App() {
   };
 
   const handleRefreshAccount = async (account: ManagedAccount) => {
-    if (refreshingActionAccountId) return;
-    setRefreshingActionAccountId(account.id);
+    if (refreshingAccountIds.has(account.id) || refreshingProviders.has(account.provider)) return;
     setRefreshingAccountIds((current) => new Set(current).add(account.id));
     try {
       const refreshed = await invoke<ManagedAccount>("refresh_account", { accountId: account.id });
@@ -1809,7 +1827,7 @@ function App() {
       if (isRefreshUnavailable(refreshed)) {
         showNotice("error", refreshFailureMessage(refreshed));
       } else {
-        showNotice("success", `已刷新 ${accountDisplayLabel(refreshed)}`);
+        showNotice("success", `已刷新 ${accountActionLabel(refreshed)}`);
       }
     } catch (error) {
       showNormalizedError("刷新账号失败", error);
@@ -1819,7 +1837,6 @@ function App() {
         next.delete(account.id);
         return next;
       });
-      setRefreshingActionAccountId(null);
     }
   };
   const handleRefreshVisibleAccounts = async () => {
@@ -1947,7 +1964,9 @@ function App() {
       setAccounts(sortAccountsForView(nextAccounts));
       setSelectedExportIds(new Set());
       setPendingBatchDelete(null);
-      showNotice("success", `已删除 ${targets.length} 个账号`);
+      const providers = Array.from(new Set(targets.map((account) => providerLabel(account.provider))));
+      const scope = providers.length === 1 ? `${providers[0]} ` : "";
+      showNotice("success", `已删除 ${scope}${targets.length} 个账号`);
     } catch (error) {
       showNormalizedError("批量删除失败", error);
     } finally {
@@ -1985,7 +2004,7 @@ function App() {
       const nextAccounts = await invoke<ManagedAccount[]>("delete_account", { accountId: account.id });
       setAccounts(sortAccountsForView(nextAccounts));
       setPendingDeleteAccount(null);
-      showNotice("success", `已删除 ${accountDisplayLabel(account)}`);
+      showNotice("success", `已删除 ${accountActionLabel(account)}`);
     } catch (error) {
       showNormalizedError("删除账号失败", error);
     } finally {
@@ -2446,11 +2465,7 @@ function App() {
                       <AccountStateCorner account={account} />
                       <div className="account-main">
                         <div className="account-title">
-                          {shouldHideAccountDetails(account) ? (
-                            <strong>{publicAccountCode(account, "SUPERAI")}</strong>
-                          ) : (
-                            <strong>{accountTitle(account)}</strong>
-                          )}
+                          <strong>{accountCardTitle(account)}</strong>
                           <AccountPlanBadge account={account} />
                         </div>
                         <div className="account-subtitle">
@@ -2527,7 +2542,6 @@ function App() {
                           onClick={() => handleRefreshAccount(account)}
                           disabled={
                             refreshingAccountIds.has(account.id) ||
-                            refreshingActionAccountId !== null ||
                             refreshingProviders.has(account.provider)
                           }
                         >
@@ -3092,7 +3106,7 @@ function App() {
             </div>
             <div className="confirm-copy">
               <h2>删除账号</h2>
-              <p>{accountDisplayLabel(pendingDeleteAccount)}</p>
+              <p>{accountActionLabel(pendingDeleteAccount)}</p>
             </div>
             <div className="confirm-actions">
               <button className="secondary" onClick={() => setPendingDeleteAccount(null)} disabled={isDeletingAccount}>
@@ -3119,7 +3133,7 @@ function App() {
             </div>
             <div className="confirm-copy">
               <h2>批量删除账号</h2>
-              <p>共 {pendingBatchDelete.length} 个账号将被移除</p>
+              <p>{batchDeleteDescription(pendingBatchDelete)}</p>
             </div>
             <div className="confirm-actions">
               <button className="secondary" onClick={() => setPendingBatchDelete(null)} disabled={isAccountBusy}>
