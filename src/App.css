@@ -2910,6 +2910,17 @@ textarea:focus {
   background: color-mix(in srgb, var(--accent, #2f6df6) 16%, transparent);
 }
 
+.model-select-option-main em.model-badge-free {
+  color: #137a4c;
+  background: color-mix(in srgb, #1ea76a 18%, transparent);
+}
+
+.model-select-option.selected .model-select-option-main em.model-badge-free {
+  color: #0e6b41;
+  background: color-mix(in srgb, #1ea76a 26%, transparent);
+}
+
+
 .model-select-hint {
   font-style: normal;
   font-size: 10.5px;

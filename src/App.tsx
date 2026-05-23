@@ -568,6 +568,8 @@ type ModelFamily = {
   /** 默认 effort；若 efforts 为空可省略。 */
   defaultEffort?: EffortKey;
   knownAvailable?: boolean;
+  /** 标记为免费档位，下拉里多挂一个 Free 角标。 */
+  free?: boolean;
   /**
    * 返回最终 sidecar 模型 id；不可用时返回 null。
    * effort 为 null 表示无 effort（如 codex 单一变体）。
@@ -633,7 +635,17 @@ const MODEL_FAMILIES: ModelFamily[] = [
     aliases: ["Kimi K2.6", "kimi-k2.6", "kimi-k2-6"],
     efforts: [],
     knownAvailable: true,
+    free: true,
     resolveId: () => "kimi-k2-6",
+  },
+  {
+    key: "swe-1.6",
+    label: "SWE 1.6",
+    aliases: ["SWE 1.6", "swe-1-6", "swe-1.6"],
+    efforts: [],
+    knownAvailable: true,
+    free: true,
+    resolveId: () => "swe-1.6",
   },
   {
     key: "glm-5.1",
@@ -678,6 +690,27 @@ const MODEL_FAMILIES: ModelFamily[] = [
       if (effort === "high") return "gemini-3.1-pro-high";
       return "gemini-3.1-pro-low";
     },
+  },
+  {
+    key: "gemini-3.5-flash",
+    label: "Gemini 3.5 Flash",
+    aliases: ["Gemini 3.5 Flash", "gemini-3-5-flash"],
+    efforts: ["minimal", "low", "medium", "high"],
+    defaultEffort: "medium",
+    knownAvailable: true,
+    resolveId: (effort) => {
+      if (!effort || effort === "medium") return "gemini-3.5-flash";
+      if (effort === "xhigh") return null;
+      return `gemini-3.5-flash-${effort}`;
+    },
+  },
+  {
+    key: "deepseek-v4",
+    label: "DeepSeek V4",
+    aliases: ["DeepSeek V4", "deepseek-v4"],
+    efforts: [],
+    knownAvailable: true,
+    resolveId: () => "deepseek-v4",
   },
 ];
 
@@ -866,6 +899,7 @@ function ModelSelect({
               >
                 <span className="model-select-option-main">
                   {family.label}
+                  {family.free && <em className="model-badge-free">Free</em>}
                   {!available && <em>暂未上线</em>}
                 </span>
                 {selected && available && <Check size={14} />}

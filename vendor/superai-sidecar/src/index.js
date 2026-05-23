@@ -104,14 +104,6 @@ async function main() {
       } catch (e) { log.warn(`LS cleanup error (non-fatal): ${e.message}`); }
     }
 
-    // Super AI note: previously we ran this block fire-and-forget so the
-    // HTTP "Server on ..." line printed before LS was ready. The Tauri
-    // wrapper would then forward chat requests immediately; those failed
-    // because LS wasn't up yet and the account pool got marked
-    // "temporarily unavailable" with multi-minute retryAfter values,
-    // poisoning the pool ("账号队列超时: 所有可用账号暂时不可用"). Match
-    // upstream and await readiness here. Tauri side raises its boot
-    // timeout to 60s to accommodate.
     await startLanguageServer({
       binaryPath,
       port: config.lsPort,

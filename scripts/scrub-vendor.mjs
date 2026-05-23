@@ -192,6 +192,144 @@ const modelsPath = join(OUT_DIR, "src", "models.js");
   writeFileSync(modelsPath, replaced);
 }
 
+// 新模型临时收口：前端下拉已经暴露这些 key；在 upstream catalog 正式带上前，
+// 给 sidecar 静态表补齐解析，避免 chat handler 在本地先 400 Unsupported model。
+{
+  const src = readFileSync(modelsPath, "utf8");
+  const modelAnchor =
+    "  'gemini-3.1-pro-high':            { name: 'gemini-3.1-pro-high',            provider: 'google', enumValue: 0,   modelUid: 'gemini-3-1-pro-high', credit: 2 },";
+  const deepseekAnchor =
+    "  'deepseek-r1':                    { name: 'deepseek-r1',                    provider: 'deepseek', enumValue: 206, credit: 1, deprecated: true },";
+  const aliasAnchor = "_lookup.set('minimax-m2-5', 'minimax-m2.5');";
+  if (!src.includes(modelAnchor) || !src.includes(deepseekAnchor) || !src.includes(aliasAnchor)) {
+    console.error("[scrub-vendor] new model patch anchors not found; aborting");
+    process.exit(2);
+  }
+  const modelPatch = `${modelAnchor}
+  'gemini-3.5-flash-minimal':       { name: 'gemini-3.5-flash-minimal',       provider: 'google', enumValue: 0,   modelUid: 'gemini-3-5-flash-minimal', credit: 0.75 },
+  'gemini-3.5-flash-low':           { name: 'gemini-3.5-flash-low',           provider: 'google', enumValue: 0,   modelUid: 'gemini-3-5-flash-low', credit: 1 },
+  'gemini-3.5-flash':               { name: 'gemini-3.5-flash',               provider: 'google', enumValue: 0,   modelUid: 'gemini-3-5-flash-medium', credit: 1 },
+  'gemini-3.5-flash-high':          { name: 'gemini-3.5-flash-high',          provider: 'google', enumValue: 0,   modelUid: 'gemini-3-5-flash-high', credit: 1.75 },`;
+  const deepseekPatch = `${deepseekAnchor}
+  'deepseek-v4':                    { name: 'deepseek-v4',                    provider: 'deepseek', enumValue: 0,   modelUid: 'deepseek-v4', credit: 1 },`;
+  const aliasPatch = `${aliasAnchor}
+_lookup.set('gemini-3-5-flash', 'gemini-3.5-flash');
+_lookup.set('gemini-3-5-flash-medium', 'gemini-3.5-flash');
+_lookup.set('gemini-3-5-flash-minimal', 'gemini-3.5-flash-minimal');
+_lookup.set('gemini-3-5-flash-low', 'gemini-3.5-flash-low');
+_lookup.set('gemini-3-5-flash-high', 'gemini-3.5-flash-high');
+_lookup.set('MODEL_GOOGLE_GEMINI_3_5_FLASH_MEDIUM', 'gemini-3.5-flash');
+_lookup.set('MODEL_GOOGLE_GEMINI_3_5_FLASH_MINIMAL', 'gemini-3.5-flash-minimal');
+_lookup.set('MODEL_GOOGLE_GEMINI_3_5_FLASH_LOW', 'gemini-3.5-flash-low');
+_lookup.set('MODEL_GOOGLE_GEMINI_3_5_FLASH_HIGH', 'gemini-3.5-flash-high');
+_lookup.set('deepseek-v4', 'deepseek-v4');`;
+  const next = src
+    .replace(modelAnchor, modelPatch)
+    .replace(deepseekAnchor, deepseekPatch)
+    .replace(aliasAnchor, aliasPatch);
+  writeFileSync(modelsPath, next);
+}
+
+// SWE 1.6 在当前 LS 里有 enum 420，但 direct requested_model_uid 会被拒绝
+// （MODEL_SWE_1_6 / cognition-swe-1.6 都返回 unknown model UID）。保留 enum
+// 路径，不发送 UID；同时让 probe 实测覆盖 GetUserStatus 的旧 allowlist。
+{
+  const authPath = join(OUT_DIR, "src", "auth.js");
+  const modelSrc = readFileSync(modelsPath, "utf8");
+  const uidNeedle = "modelUid: 'MODEL_SWE_1_6'";
+  if (!modelSrc.includes(uidNeedle)) {
+    console.error("[scrub-vendor] SWE 1.6 modelUid anchor not found; aborting");
+    process.exit(2);
+  }
+  writeFileSync(modelsPath, modelSrc.replace(`${uidNeedle}, `, ""));
+
+  const src = readFileSync(authPath, "utf8");
+  const probeAnchor = "  'gemini-3.0-flash',\n];";
+  const capAnchor = "if (!prev || prev.reason !== 'success') {";
+  const allowedAnchor = "if (cap?.reason === 'user_status' || cap?.reason === 'not_entitled') {\n      return cap.ok === true;\n    }";
+  const canaryCascadeAnchor = "const useCascade = !!info.modelUid;";
+  const availableAnchor = "      if (cap?.reason === 'user_status' && cap.ok === true) allowed.push(key);";
+  const skipNotEntitledAnchor = "      if (cap && cap.reason === 'not_entitled') return false;";
+  if (!src.includes(probeAnchor) || !src.includes(capAnchor) || !src.includes(allowedAnchor) || !src.includes(canaryCascadeAnchor) || !src.includes(availableAnchor) || !src.includes(skipNotEntitledAnchor)) {
+    console.error("[scrub-vendor] SWE 1.6 probe anchors not found; aborting");
+    process.exit(2);
+  }
+  const next = src
+    .replace(probeAnchor, "  'gemini-3.0-flash',\n  'swe-1.6',\n];")
+    .replace(capAnchor, "if (!prev || (prev.reason !== 'success' && prev.reason !== 'cloud_probe')) {")
+    .replace(allowedAnchor, "if (cap?.ok === true && (cap.reason === 'success' || cap.reason === 'cloud_probe' || cap.reason === 'user_status')) {\n      return true;\n    }\n    if (cap?.reason === 'not_entitled') {\n      return false;\n    }")
+    .replace(canaryCascadeAnchor, "const useCascade = !!info.modelUid || modelKey === 'swe-1.6';")
+    .replace(availableAnchor, "      if (cap?.ok === true && (cap.reason === 'user_status' || cap.reason === 'success' || cap.reason === 'cloud_probe')) allowed.push(key);")
+    .replace(skipNotEntitledAnchor, "      if (cap && cap.reason === 'not_entitled' && key !== 'swe-1.6') return false;");
+  writeFileSync(authPath, next);
+}
+
+// SWE 1.6 更接近官方 Cascade 原生路径：有工具时默认走 native bridge，
+// 避免在 NO_TOOL 模式下塞长 toolPreamble 导致 planner 行为偏离编辑器。
+{
+  const bridgePath = join(OUT_DIR, "src", "cascade-native-bridge.js");
+  const src = readFileSync(bridgePath, "utf8");
+  const nativeBridgeEnv = `${legacyProject.toUpperCase()}_NATIVE_TOOL_BRIDGE`;
+  const needle = `  const explicitOn = process.env.${nativeBridgeEnv} === '1';`;
+  if (!src.includes(needle)) {
+    console.error("[scrub-vendor] native bridge anchor not found; aborting");
+    process.exit(2);
+  }
+  const next = src.replace(
+    needle,
+    `  const explicitOn = process.env.${nativeBridgeEnv} === '1' || modelKey === 'swe-1.6';`,
+  );
+  writeFileSync(bridgePath, next);
+}
+
+// 远端模型表是新模型的权威来源。原 upstream mergeCloudModels 只 add 不 update，
+// 如果本地已有 swe-1.6 就看不到云端真实 modelUid。这里打印 SWE 相关远端
+// 配置，并允许 cloud entry 覆盖本地同 key / 同 UID 的静态配置。
+{
+  const authPath = join(OUT_DIR, "src", "auth.js");
+  const src = readFileSync(authPath, "utf8");
+  const needle = "    const added = mergeCloudModels(configs);\n    log.info(`Model catalog: ${configs.length} cloud models, ${added} new entries merged`);";
+  if (!src.includes(needle)) {
+    console.error("[scrub-vendor] model catalog log anchor not found; aborting");
+    process.exit(2);
+  }
+  const replacement = `    const sweConfigs = configs.filter((m) => /swe/i.test(String(m.modelUid || m.label || m.name || '')));
+    for (const m of sweConfigs) {
+      log.info(\`Model catalog SWE: uid=\${m.modelUid || ''} label=\${m.label || m.name || ''} provider=\${m.provider || ''} credit=\${m.creditMultiplier || ''}\`);
+    }
+    const added = mergeCloudModels(configs);
+    log.info(\`Model catalog: \${configs.length} cloud models, \${added} new entries merged\`);`;
+  writeFileSync(authPath, src.replace(needle, replacement));
+}
+
+{
+  const src = readFileSync(modelsPath, "utf8");
+  const needle = "    // Already in catalog?\n    if (_lookup.has(uid) || _lookup.has(uid.toLowerCase())) continue;\n\n    const key = uid.toLowerCase().replace(/_/g, '-');\n    if (MODELS[key]) continue;\n\n    const provider = providerMap[m.provider] || m.provider?.toLowerCase()?.replace('model_provider_', '') || 'unknown';\n    MODELS[key] = {";
+  if (!src.includes(needle)) {
+    console.error("[scrub-vendor] mergeCloudModels anchor not found; aborting");
+    process.exit(2);
+  }
+  const replacement = `    const provider = providerMap[m.provider] || m.provider?.toLowerCase()?.replace('model_provider_', '') || 'unknown';
+    const key = uid.toLowerCase().replace(/_/g, '-');
+    const existingKey = _lookup.get(uid) || _lookup.get(uid.toLowerCase()) || (MODELS[key] ? key : null);
+    if (existingKey && MODELS[existingKey]) {
+      if (/swe/i.test(uid) || /swe/i.test(existingKey)) {
+        MODELS[existingKey] = {
+          ...MODELS[existingKey],
+          provider,
+          modelUid: uid,
+          credit: m.creditMultiplier || MODELS[existingKey].credit || 1,
+        };
+        _lookup.set(uid, existingKey);
+        _lookup.set(uid.toLowerCase(), existingKey);
+      }
+      continue;
+    }
+
+    MODELS[key] = {`;
+  writeFileSync(modelsPath, src.replace(needle, replacement));
+}
+
 // dashboard/logger.js：落盘 JSONL 前再 sanitize 一次。运行时上游 5xx body
 // 之类的字符串会经 log.error 进入 entry.msg / entry.ctx，正则替换搞不定。
 const loggerPath = join(OUT_DIR, "src", "dashboard", "logger.js");
