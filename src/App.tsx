@@ -697,7 +697,6 @@ const MODEL_FAMILIES: ModelFamily[] = [
     aliases: ["Gemini 3.5 Flash", "gemini-3-5-flash"],
     efforts: ["minimal", "low", "medium", "high"],
     defaultEffort: "medium",
-    knownAvailable: true,
     resolveId: (effort) => {
       if (!effort || effort === "medium") return "gemini-3.5-flash";
       if (effort === "xhigh") return null;
@@ -709,7 +708,6 @@ const MODEL_FAMILIES: ModelFamily[] = [
     label: "DeepSeek V4",
     aliases: ["DeepSeek V4", "deepseek-v4"],
     efforts: [],
-    knownAvailable: true,
     resolveId: () => "deepseek-v4",
   },
 ];
@@ -2113,6 +2111,38 @@ function App() {
       cancelled = true;
     };
   }, [apiServiceRunning, apiServiceActualPort]);
+
+  useEffect(() => {
+    if (!isTauri() || !apiServiceRunning || apiServiceModels.length === 0) return;
+    const availableSet = new Set(apiServiceModels.map((model) => model.id));
+    const selectedFamily = MODEL_FAMILIES.find((family) => family.key === apiPref.family);
+    if (selectedFamily && isFamilyAvailable(selectedFamily, availableSet)) return;
+
+    const fallbackFamily = MODEL_FAMILIES.find((family) => isFamilyAvailable(family, availableSet));
+    if (!fallbackFamily) return;
+    const timer = window.setTimeout(() => {
+      setApiPrefState((prev) => {
+        if (prev.family === fallbackFamily.key) return prev;
+        const next = {
+          family: fallbackFamily.key,
+          effort: fallbackFamily.efforts.length === 0
+            ? null
+            : fallbackFamily.defaultEffort ?? fallbackFamily.efforts[0],
+        };
+        persistApiPref(next);
+        const modelId = resolveModelId(next) ?? "";
+        invoke("set_api_service_default_model", { model: modelId })
+          .then(() => {
+            setApiService((status) => status ? { ...status, defaultModel: modelId } : status);
+          })
+          .catch((error) => {
+            showNormalizedError("设置默认模型失败", error);
+          });
+        return next;
+      });
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [apiPref.family, apiServiceModels, apiServiceRunning, showNormalizedError]);
 
   useEffect(() => {
     if (!isTauri() || !apiServiceRunning) return undefined;
