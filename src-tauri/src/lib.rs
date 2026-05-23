@@ -9153,6 +9153,9 @@ fn prepare_for_update_install_impl(
     app: tauri::AppHandle,
 ) -> Result<api_service::ApiServiceStatus, String> {
     api_service::stop()?;
+    api_service::cleanup_update_blockers();
+    #[cfg(target_os = "windows")]
+    std::thread::sleep(std::time::Duration::from_millis(1200));
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
     Ok(api_service::current_status(

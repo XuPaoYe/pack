@@ -224,7 +224,11 @@ pub fn current_status(
     api_key: &str,
     default_model: &str,
 ) -> ApiServiceStatus {
-    let guard = lock();
+    let mut guard = lock();
+    if sidecar_runtime_unhealthy(guard.as_ref()) {
+        let _ = guard.take();
+    }
+
     if let Some(runtime) = guard.as_ref() {
         let address = build_address(&runtime.bind_host, runtime.actual_port);
         let default_model = runtime
@@ -254,6 +258,33 @@ pub fn current_status(
             last_error: None,
         }
     }
+}
+
+fn sidecar_runtime_unhealthy(runtime: Option<&Runtime>) -> bool {
+    let Some(runtime) = runtime else {
+        return false;
+    };
+    let Some(target) = runtime.proxy_target.as_ref() else {
+        return false;
+    };
+
+    !sidecar_is_reachable(target)
+}
+
+fn sidecar_is_reachable(target: &ProxyTarget) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    else {
+        return false;
+    };
+
+    client
+        .get(format!("{}/v1/models", target.base_url))
+        .header("Authorization", format!("Bearer {}", target.inner_key))
+        .send()
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false)
 }
 
 fn build_address(host: &str, port: u16) -> String {
@@ -406,7 +437,91 @@ fn cleanup_language_server_processes(ls_bin: &Path) {
 }
 
 #[cfg(not(unix))]
-fn cleanup_language_server_processes(_ls_bin: &Path) {}
+fn cleanup_language_server_processes(ls_bin: &Path) {
+    cleanup_windows_process_image(ls_bin);
+}
+
+#[cfg(unix)]
+fn cleanup_sidecar_processes(sidecar_bin: &Path) {
+    let Ok(sidecar_bin) = sidecar_bin.canonicalize() else {
+        return;
+    };
+    let sidecar_name = sidecar_bin
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("superai-api");
+    let Ok(output) = Command::new("ps").args(["-e", "-o", "pid=,args="]).output() else {
+        return;
+    };
+
+    let current_pid = std::process::id() as libc::pid_t;
+    let mut matched_pids = Vec::new();
+    let text = String::from_utf8_lossy(&output.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((pid_text, argv)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid_text.trim().parse::<libc::pid_t>() else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        let argv0 = argv.split_whitespace().next().unwrap_or("");
+        if argv0.is_empty() {
+            continue;
+        }
+        let argv0_matches = Path::new(argv0)
+            .canonicalize()
+            .map(|argv0_path| argv0_path == sidecar_bin)
+            .unwrap_or(false);
+        if !argv0_matches && !argv.contains(sidecar_name) {
+            continue;
+        }
+        unsafe {
+            let _ = libc::kill(pid, libc::SIGTERM);
+        }
+        matched_pids.push(pid);
+    }
+    if matched_pids.is_empty() {
+        return;
+    }
+    thread::sleep(Duration::from_millis(300));
+    for pid in matched_pids {
+        unsafe {
+            if libc::kill(pid, 0) == 0 {
+                let _ = libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn cleanup_sidecar_processes(sidecar_bin: &Path) {
+    cleanup_windows_process_image(sidecar_bin);
+}
+
+#[cfg(windows)]
+fn cleanup_windows_process_image(image_path: &Path) {
+    use std::os::windows::process::CommandExt;
+
+    let Some(image_name) = image_path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/IM", image_name])
+        .creation_flags(0x0800_0000)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    thread::sleep(Duration::from_millis(500));
+}
+
+#[cfg(all(not(windows), not(unix)))]
+fn cleanup_windows_process_image(_image_path: &Path) {}
 
 #[cfg(target_os = "macos")]
 fn repair_macos_binary(path: &Path) {
@@ -495,6 +610,7 @@ fn spawn_sidecar(
     let http_port = pick_free_port()?;
     let ls_port = pick_free_port()?;
 
+    cleanup_sidecar_processes(sidecar_bin);
     cleanup_language_server_processes(ls_bin);
     repair_macos_binary(sidecar_bin);
     repair_macos_binary(ls_bin);
@@ -1133,6 +1249,15 @@ pub fn stop() -> Result<(), String> {
     // sidecar 在 Drop 中被 kill + wait
     drop(runtime.sidecar.take());
     Ok(())
+}
+
+pub fn cleanup_update_blockers() {
+    if let Some(sidecar_bin) = resolve_bundled_binary("superai-api") {
+        cleanup_sidecar_processes(&sidecar_bin);
+    }
+    if let Some(ls_bin) = resolve_bundled_binary("language_server") {
+        cleanup_language_server_processes(&ls_bin);
+    }
 }
 
 // ---------- 请求路由 ----------
