@@ -645,7 +645,8 @@ const MODEL_FAMILIES: ModelFamily[] = [
     efforts: [],
     knownAvailable: true,
     free: true,
-    resolveId: () => "swe-1.6",
+    resolveId: () => "swe-1-6",
+
   },
   {
     key: "glm-5.1",
