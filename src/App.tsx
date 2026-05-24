@@ -710,6 +710,24 @@ const MODEL_FAMILIES: ModelFamily[] = [
     efforts: [],
     resolveId: () => "deepseek-v4",
   },
+  {
+    key: "grok-3",
+    label: "XAI Grok-3",
+    aliases: ["XAI Grok-3", "Grok-3", "grok-3"],
+    efforts: [],
+    resolveId: () => "grok-3",
+  },
+  {
+    key: "grok-3-mini-thinking",
+    label: "XAI Grok-3 mini Thinking",
+    aliases: [
+      "XAI Grok-3 mini Thinking",
+      "Grok-3 mini Thinking",
+      "grok-3-mini-thinking",
+    ],
+    efforts: [],
+    resolveId: () => "grok-3-mini-thinking",
+  },
 ];
 
 const FALLBACK_FAMILY_KEY = "gpt-5.5";
