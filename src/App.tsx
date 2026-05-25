@@ -639,16 +639,6 @@ const MODEL_FAMILIES: ModelFamily[] = [
     resolveId: () => "kimi-k2-6",
   },
   {
-    key: "swe-1.6",
-    label: "SWE 1.6",
-    aliases: ["SWE 1.6", "swe-1-6", "swe-1.6"],
-    efforts: [],
-    knownAvailable: true,
-    free: true,
-    resolveId: () => "swe-1-6",
-
-  },
-  {
     key: "glm-5.1",
     label: "GLM 5.1",
     aliases: ["GLM 5.1", "glm-5-1"],
@@ -698,6 +688,7 @@ const MODEL_FAMILIES: ModelFamily[] = [
     aliases: ["Gemini 3.5 Flash", "gemini-3-5-flash"],
     efforts: ["minimal", "low", "medium", "high"],
     defaultEffort: "medium",
+    knownAvailable: true,
     resolveId: (effort) => {
       if (!effort || effort === "medium") return "gemini-3.5-flash";
       if (effort === "xhigh") return null;
@@ -709,6 +700,7 @@ const MODEL_FAMILIES: ModelFamily[] = [
     label: "DeepSeek V4",
     aliases: ["DeepSeek V4", "deepseek-v4"],
     efforts: [],
+    knownAvailable: true,
     resolveId: () => "deepseek-v4",
   },
   {
