@@ -1145,7 +1145,7 @@ function ApiServiceConfigPanel({
       <section className="api-config-row">
         <div className="api-config-copy">
           <strong>Codex 配置</strong>
-          <p>把当前地址、密钥写入 ~/.codex/，或回滚到接管前的备份</p>
+          <p>把当前 API 服务的地址、密钥和默认模型写入 ~/.codex/，或回滚到接管前的备份</p>
         </div>
         <div className="api-config-actions">
           <button
@@ -1153,7 +1153,7 @@ function ApiServiceConfigPanel({
             className="superai-api-secondary"
             onClick={onConfigureCodex}
             disabled={!running || configuringCodex || restoringCodex}
-            title={running ? "写入 / 同步 ~/.codex/config.toml + auth.json" : "请先启动 API 服务"}
+            title={running ? "把当前 API 服务地址、密钥和默认模型同步到 ~/.codex/config.toml + auth.json" : "请先启动 API 服务"}
           >
             <CodexIcon size={14} />
             {configuringCodex ? "配置中…" : "配置 Codex"}

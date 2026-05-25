@@ -9069,7 +9069,7 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
         next.push('\n');
     }
     write_string_atomic(&config_path, &next)?;
-    // config.toml 含明文 bearer key，仅当前用户可读。
+    // config.toml 包含目标地址与模型配置，仅当前用户可读。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

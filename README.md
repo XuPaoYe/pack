@@ -106,6 +106,48 @@ npm run check
 npm run lint
 ```
 
+## Codex 接入本地 API 服务
+
+如果需要让本机 Codex 直接走 SuperAI 暴露的 OpenAI 兼容入口，最稳的方式是只配置 `~/.codex/auth.json` 和 `~/.codex/config.toml` 这两个文件。
+
+`~/.codex/auth.json`：
+
+```json
+{
+  "OPENAI_API_KEY": "你的 API 服务密钥"
+}
+```
+
+`~/.codex/config.toml`：
+
+```toml
+model_provider = "superai"
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+network_access = "enabled"
+disable_response_storage = true
+
+personality = "pragmatic"
+service_tier = "fast"
+
+[model_providers.superai]
+name = "Super AI"
+base_url = "http://127.0.0.1:你的端口/v1"
+wire_api = "responses"
+requires_openai_auth = true
+```
+
+注意：
+
+- 不要写 `env_key = "OPENAI_API_KEY"`。Codex 会把它当成"强制从环境变量取值"，不会再回退到 `auth.json` 读 key。
+- `model_provider` 和 `[model_providers.superai]` 都用小写 `superai`，不要写成 `SuperAI`。
+- `auth.json` 里只保留 `OPENAI_API_KEY`，不要额外放 `tokens`、`last_refresh` 之类字段。
+- `base_url` 需要填可访问的 OpenAI 兼容根地址；如果你的本地代理实际监听的是 `http://127.0.0.1:12345`，这里就写 `http://127.0.0.1:12345/v1`。
+- 如果已经在 App 里启动了 API 服务，优先使用界面的“配置 Codex”按钮。应用会自动改写这两个文件，并在首次接管前备份原始配置。
+
 ## 远程升级
 
 项目已接入 Tauri 2 updater。生产环境启动时会检测新版本；如果远程存在新版本，界面会显示强制升级弹窗，升级完成后自动重启 App。
