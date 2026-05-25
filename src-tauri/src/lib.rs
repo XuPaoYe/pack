@@ -997,25 +997,6 @@ fn load_account_from_db(conn: &Connection, account_id: &str) -> Result<ManagedAc
 fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), String> {
     let mut account_to_write = account.clone();
 
-    // (provider, email) 维度的兜底去重：parse_*_account 算出来的 id 只要 fallback 链
-    // 沾上短期变化字段（access_token 等）就会让同账号反复入库。这里在 INSERT 前先按
-    // (provider, email) 查一下，如果已有不同 id 的同账号，就改写 id 触发 ON CONFLICT 替换。
-    // windsurf 的 email 列存的是 id 而不是真 email，跳过；其它三家 email 列就是真 email。
-    if account_to_write.provider != "windsurf" && !account_to_write.email.trim().is_empty() {
-        let stored_provider = redact_provider_to_storage(&account_to_write.provider);
-        let existing: Option<(String, i64)> = conn
-            .query_row(
-                "SELECT id, created_at FROM accounts WHERE provider = ?1 AND email = ?2 AND id != ?3 LIMIT 1",
-                params![stored_provider, account_to_write.email, account_to_write.id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .ok();
-        if let Some((existing_id, existing_created_at)) = existing {
-            account_to_write.id = existing_id;
-            account_to_write.created_at = existing_created_at;
-        }
-    }
-
     if account_to_write.auth_payload.is_none() {
         if let Ok(existing) = load_account_from_db(conn, &account_to_write.id) {
             if existing.provider == account_to_write.provider {
@@ -2102,14 +2083,19 @@ fn parse_antigravity_account(value: &Value, source: &str) -> Option<ManagedAccou
 
     Some(ManagedAccount {
         id: string_field(obj.get("id")).unwrap_or_else(|| {
-            // 同 parse_gemini_account：access_token 每次刷新都变，会让同账号反复入库。
-            // 改成 auth_id → email，保证 (provider, email) 维度的 id 稳定。
+            // 优先用稳定身份字段：auth_id；缺失时退到 refresh_token（只在重新授权/
+            // 吊销时变），最后才用 email。access_token / id_token 每次刷新都变，
+            // 不能进 fallback 链——否则同一个账号刷一次 token 就会生成不同 id、
+            // 在 DB 里堆出重复账号。同邮箱不同账号的区分靠 refresh_token 兜住。
             format!(
                 "antigravity_{}",
                 stable_hash(&format!(
                     "{}::{}",
                     email.to_lowercase(),
-                    auth_id.clone().unwrap_or_else(|| email.to_lowercase())
+                    auth_id
+                        .clone()
+                        .or_else(|| refresh_token.clone())
+                        .unwrap_or_else(|| email.to_lowercase())
                 ))
             )
         }),
@@ -2177,15 +2163,19 @@ fn parse_gemini_account(value: &Value, source: &str) -> Option<ManagedAccount> {
 
     Some(ManagedAccount {
         id: string_field(obj.get("id")).unwrap_or_else(|| {
-            // 旧版 fallback 链是 auth_id → access_token → email；access_token 每次刷新都变，
-            // 同一 Google 账号的 ~/.gemini/oauth_creds.json 经常没有 id_token（刷新后不返回），
-            // 导致每次导入生成不同 id、DB 里堆出重复账号。改成 auth_id → email 保证稳定。
+            // 优先用稳定身份字段：auth_id；缺失时退到 refresh_token（只在重新授权/
+            // 吊销时变），最后才用 email。access_token / id_token 每次刷新都变，
+            // 不能进 fallback 链——否则同一个账号刷一次 token 就会生成不同 id、
+            // 在 DB 里堆出重复账号。同邮箱不同账号的区分靠 refresh_token 兜住。
             format!(
                 "gemini_{}",
                 stable_hash(&format!(
                     "{}::{}",
                     email.to_lowercase(),
-                    auth_id.clone().unwrap_or_else(|| email.to_lowercase())
+                    auth_id
+                        .clone()
+                        .or_else(|| refresh_token.clone())
+                        .unwrap_or_else(|| email.to_lowercase())
                 ))
             )
         }),
@@ -7988,54 +7978,52 @@ fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
     set_account_current_state(&conn, &account.provider, &account.id).map(accounts_for_frontend)
 }
 
-fn activate_windsurf_account_for_api(
-    app: &tauri::AppHandle,
-    account: &ManagedAccount,
-) -> Result<(), String> {
+fn activate_windsurf_account_for_api(app: &tauri::AppHandle, account: &ManagedAccount) -> Result<(), String> {
     if !api_service::is_running_with_sidecar() {
         return Ok(());
     }
 
-    match api_service::activate_account_by_email(&account.email) {
+    match api_service::activate_account_by_label(&superai_sidecar_label(account)) {
         Ok(()) => Ok(()),
         Err(first_error) => {
             sync_superai_accounts_to_api(app.clone())?;
-            api_service::activate_account_by_email(&account.email).map_err(|second_error| {
+            api_service::activate_account_by_label(&superai_sidecar_label(account)).map_err(|second_error| {
                 format!("启用 API 账号失败: {second_error}; 同步前错误: {first_error}")
             })
         }
     }
 }
 
-fn sync_windsurf_current_account_by_email(
-    conn: &Connection,
-    email: &str,
-) -> Result<Vec<ManagedAccount>, String> {
-    let Some(account) = read_accounts_from_conn(conn)?.into_iter().find(|account| {
-        account.provider == "windsurf" && account.email.eq_ignore_ascii_case(email)
-    }) else {
+fn sync_windsurf_current_account_by_label(conn: &Connection, label: &str) -> Result<Vec<ManagedAccount>, String> {
+    let Some(account_id) = label
+        .strip_prefix("superai-account-")
+        .and_then(|value| value.strip_suffix("@local"))
+    else {
         return Ok(Vec::new());
     };
-    set_account_current_state(conn, "windsurf", &account.id)
+    if !account_exists(conn, account_id)? {
+        return Ok(Vec::new());
+    }
+    set_account_current_state(conn, "windsurf", account_id)
 }
 
 #[tauri::command]
 fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
-    let Some(email) = api_service::last_used_account_email() else {
+    let Some(label) = api_service::last_used_account_label() else {
         return Ok(Vec::new());
     };
     // 幂等短路：sidecar 上次挑的还是这个号 → 我们已经把 "当前" 标签打过，
     // 不必再开 sqlite + AES 解密 + 全表 upsert。前端 setInterval 3s 也几乎零开销。
-    if api_service::last_synced_active_email()
+    if api_service::last_synced_active_label()
         .as_deref()
-        .map(|prev| prev.eq_ignore_ascii_case(&email))
+        .map(|prev| prev.eq_ignore_ascii_case(&label))
         .unwrap_or(false)
     {
         return Ok(Vec::new());
     }
     let conn = open_app_db(&app)?;
-    let result = sync_windsurf_current_account_by_email(&conn, &email).map(accounts_for_frontend)?;
-    api_service::record_synced_active_email(email.to_ascii_lowercase());
+    let result = sync_windsurf_current_account_by_label(&conn, &label).map(accounts_for_frontend)?;
+    api_service::record_synced_active_label(label.to_ascii_lowercase());
     Ok(result)
 }
 
@@ -8682,11 +8670,7 @@ fn windsurf_account_to_sidecar_payload(account: &ManagedAccount) -> Option<serde
     if public_usage_is_exhausted(account) {
         return None;
     }
-    let label = if !account.email.is_empty() {
-        account.email.clone()
-    } else {
-        account.id.clone()
-    };
+    let label = superai_sidecar_label(account);
     if let Some(token) = windsurf_payload_string(account, "api_key") {
         return Some(serde_json::json!({ "api_key": token, "label": label }));
     }
@@ -8697,6 +8681,10 @@ fn windsurf_account_to_sidecar_payload(account: &ManagedAccount) -> Option<serde
         return Some(serde_json::json!({ "token": token, "label": label }));
     }
     None
+}
+
+fn superai_sidecar_label(account: &ManagedAccount) -> String {
+    format!("superai-account-{}@local", account.id)
 }
 
 #[tauri::command]
@@ -8779,6 +8767,8 @@ struct CodexAppSetupResult {
     config_path: String,
     base_url: String,
     model_id: String,
+    /// 若动到了 `~/.codex/config.toml`，这里是原文件的备份路径。
+    config_backup_path: Option<String>,
     /// 若动到了 `~/.codex/auth.json`，这里是原文件的备份路径。
     auth_backup_path: Option<String>,
     /// 为 true 表示我们把 auth.json 的 ChatGPT tokens 清空了（只保留 API key 模式），
@@ -9014,6 +9004,31 @@ fn neutralize_codex_auth_json(
     Ok((backup_path, true))
 }
 
+/// 备份用户原始 `config.toml`（仅首次）。
+///
+/// - 文件不存在：返回 None，说明用户之前没有显式配置 codex。
+/// - 已经是 SuperAI 接管配置：不再备份，避免把我们的托管配置当成"用户原配置"。
+/// - 备份文件已存在：直接复用原有备份路径，保证恢复永远回到最早那份。
+fn backup_codex_config_once(codex_home: &Path) -> Result<Option<String>, String> {
+    let config_path = codex_home.join("config.toml");
+    let backup_path_buf = codex_home.join("config.toml.superai-bak");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+    if backup_path_buf.exists() {
+        return Ok(Some(backup_path_buf.display().to_string()));
+    }
+
+    let existing = read_to_string(&config_path)?;
+    if config_is_superai_owned(&existing) {
+        return Ok(None);
+    }
+
+    fs::copy(&config_path, &backup_path_buf)
+        .map_err(|error| format!("备份 {} 失败: {error}", config_path.display()))?;
+    Ok(Some(backup_path_buf.display().to_string()))
+}
+
 #[tauri::command]
 fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, String> {
     let mut settings = read_settings_record(&app)?;
@@ -9045,9 +9060,10 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
         .map_err(|error| format!("创建目录失败 {}: {error}", codex_home.display()))?;
 
     let config_path = codex_home.join("config.toml");
+    let config_backup_path = backup_codex_config_once(&codex_home)?;
 
-    // config.toml 完全由 SuperAI 接管：直接整文件覆盖，不做任何备份。
-    // 多次点"配置 Codex"也不会丢东西 —— 真有过用户原配置，也只会在最早那一次被覆盖。
+    // config.toml 由 SuperAI 接管，但首次覆盖前要把用户原配置留一份一次性备份，
+    // 这样"恢复 Codex"才能真正回到原 provider / 原 base_url，而不是只删文件。
     let mut next = build_superai_managed_block(&base_url, &model_id, &api_key);
     if !next.ends_with('\n') {
         next.push('\n');
@@ -9069,6 +9085,7 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
         config_path: config_path.display().to_string(),
         base_url,
         model_id,
+        config_backup_path,
         auth_backup_path,
         auth_neutralized,
     })
@@ -9081,32 +9098,49 @@ pub struct CodexAppRestoreResult {
     pub steps: Vec<String>,
     /// 是否真的把 auth.json 从 `.superai-bak` 备份恢复回来了。
     pub auth_restored_from_backup: bool,
-    /// 是否把 SuperAI 自己写的 config.toml 删掉，让 codex 回到默认。
+    /// 是否真的把 config.toml 从 `.superai-bak` 备份恢复回来了。
+    pub config_restored_from_backup: bool,
+    /// 在没有备份时，是否删除了 SuperAI 托管的 config.toml，让 codex 回到默认。
     pub config_removed: bool,
 }
 
 /// 把 `~/.codex` 还原成 SuperAI 接管之前的样子。
 ///
 /// 现在的策略很简单：
-/// - **`config.toml`**：完全由 SuperAI 写入，没备份；恢复时只要这份文件是
-///   SuperAI 自己写的（同时含顶层 `model_provider = "superai"` 和
-///   `[model_providers.superai]`），直接删掉，codex 回到默认行为。
-///   不是 SuperAI 写的就保留 —— 我们没碰过用户自己手写的内容。
+/// - **`config.toml`**：首次配置前若存在用户原文件，会备份到
+///   `config.toml.superai-bak`。恢复时优先把备份写回；只有"没有备份且当前文件是
+///   SuperAI 自己写的"这种场景，才删除当前文件让 codex 回到默认行为。
 /// - **`auth.json`**：有 `.superai-bak` 备份就 cp 回去；没备份就跳过（我们写的
 ///   "仅 OPENAI_API_KEY" 形态没法机械反推 ChatGPT 登录态）。
 #[tauri::command]
 fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, String> {
     let codex_home = codex_home_dir()?;
     let config_path = codex_home.join("config.toml");
+    let config_bak = codex_home.join("config.toml.superai-bak");
     let auth_path = codex_home.join("auth.json");
     let auth_bak = codex_home.join("auth.json.superai-bak");
 
     let mut steps: Vec<String> = Vec::new();
     let mut auth_restored_from_backup = false;
+    let mut config_restored_from_backup = false;
     let mut config_removed = false;
 
-    // ---- config.toml：是 SuperAI 写的就删 ----
-    if config_path.exists() {
+    // ---- config.toml：优先恢复首次备份；没有备份时再决定是否删除托管文件 ----
+    if config_bak.exists() {
+        fs::copy(&config_bak, &config_path)
+            .map_err(|error| format!("恢复 config.toml 失败: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600));
+        }
+        steps.push(format!(
+            "已用 {} 覆盖回 {}",
+            config_bak.display(),
+            config_path.display(),
+        ));
+        config_restored_from_backup = true;
+    } else if config_path.exists() {
         let existing = read_to_string(&config_path)?;
         if config_is_superai_owned(&existing) {
             fs::remove_file(&config_path)
@@ -9150,6 +9184,7 @@ fn restore_codex_app(_app: tauri::AppHandle) -> Result<CodexAppRestoreResult, St
     Ok(CodexAppRestoreResult {
         steps,
         auth_restored_from_backup,
+        config_restored_from_backup,
         config_removed,
     })
 }
@@ -9544,6 +9579,56 @@ mod tests {
     }
 
     #[test]
+    fn config_is_superai_owned_requires_top_and_section() {
+        assert!(config_is_superai_owned(
+            "model_provider = \"superai\"\n[model_providers.superai]\n"
+        ));
+        assert!(!config_is_superai_owned("model_provider = \"superai\"\n"));
+        assert!(!config_is_superai_owned("[model_providers.superai]\n"));
+    }
+
+    #[test]
+    fn backup_codex_config_once_preserves_original_user_config() {
+        let codex_home = &std::env::temp_dir().join(format!("superai-codex-test-{}", rand::random::<u64>()));
+        fs::create_dir_all(codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        let original = "model_provider = \"ylscode\"\n";
+        write_string_atomic(&config_path, original).unwrap();
+
+        let backup = backup_codex_config_once(codex_home).unwrap();
+        let backup_path = codex_home.join("config.toml.superai-bak");
+
+        assert_eq!(backup.as_deref(), Some(backup_path.to_string_lossy().as_ref()));
+        assert_eq!(read_to_string(&backup_path).unwrap(), original);
+
+        write_string_atomic(&config_path, "model_provider = \"superai\"\n[model_providers.superai]\n")
+            .unwrap();
+        let backup_again = backup_codex_config_once(codex_home).unwrap();
+
+        assert_eq!(backup_again.as_deref(), Some(backup_path.to_string_lossy().as_ref()));
+        assert_eq!(read_to_string(&backup_path).unwrap(), original);
+        let _ = fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
+    fn backup_codex_config_once_skips_existing_superai_config() {
+        let codex_home = &std::env::temp_dir().join(format!("superai-codex-test-{}", rand::random::<u64>()));
+        fs::create_dir_all(codex_home).unwrap();
+        let config_path = codex_home.join("config.toml");
+        write_string_atomic(
+            &config_path,
+            "model_provider = \"superai\"\n[model_providers.superai]\n",
+        )
+        .unwrap();
+
+        let backup = backup_codex_config_once(codex_home).unwrap();
+
+        assert!(backup.is_none());
+        assert!(!codex_home.join("config.toml.superai-bak").exists());
+        let _ = fs::remove_dir_all(codex_home);
+    }
+
+    #[test]
     fn public_windsurf_export_returns_original_batch_key() {
         let batch_key = "v2:imported-encrypted-batch-key";
         let account = ManagedAccount {
@@ -9631,7 +9716,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_windsurf_current_account_by_email_keeps_only_one_current_account() {
+    fn sync_windsurf_current_account_by_label_keeps_only_one_current_account() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         init_app_db(&conn).expect("init db");
 
@@ -9640,8 +9725,8 @@ mod tests {
         upsert_account(&conn, &older).expect("insert older");
         upsert_account(&conn, &newer).expect("insert newer");
 
-        let changed = sync_windsurf_current_account_by_email(&conn, "a@example.com")
-            .expect("sync active account by email");
+        let changed = sync_windsurf_current_account_by_label(&conn, "superai-account-superai-a@local")
+            .expect("sync active account by label");
         let current_ids = changed
             .iter()
             .filter(|account| is_current_status(&account.status))
@@ -9659,7 +9744,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_windsurf_current_account_by_email_noops_for_unknown_email() {
+    fn sync_windsurf_current_account_by_label_noops_for_unknown_label() {
         let conn = Connection::open_in_memory().expect("open sqlite");
         init_app_db(&conn).expect("init db");
 
@@ -9677,8 +9762,8 @@ mod tests {
         upsert_account(&conn, &current).expect("insert current");
         upsert_account(&conn, &available).expect("insert available");
 
-        let changed = sync_windsurf_current_account_by_email(&conn, "missing@example.com")
-            .expect("sync unknown email");
+        let changed = sync_windsurf_current_account_by_label(&conn, "superai-account-missing@local")
+            .expect("sync unknown label");
         assert!(changed.is_empty());
 
         let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");
@@ -9688,5 +9773,31 @@ mod tests {
             .map(|account| account.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(persisted_current_ids, vec!["superai-a"]);
+    }
+
+    #[test]
+    fn upsert_account_keeps_same_provider_same_email_different_ids() {
+        let conn = Connection::open_in_memory().expect("open sqlite");
+        init_app_db(&conn).expect("init db");
+
+        let first = test_account("codex-a", "codex", "same@example.com", 10);
+        let second = ManagedAccount {
+            id: "codex-b".to_string(),
+            updated_at: 20,
+            created_at: 20,
+            ..test_account("codex-b", "codex", "same@example.com", 20)
+        };
+        upsert_account(&conn, &first).expect("insert first");
+        upsert_account(&conn, &second).expect("insert second");
+
+        let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");
+        let ids = all_accounts
+            .iter()
+            .filter(|account| account.provider == "codex")
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"codex-a"));
+        assert!(ids.contains(&"codex-b"));
     }
 }

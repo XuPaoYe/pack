@@ -125,12 +125,12 @@ struct Runtime {
 }
 
 static RUNTIME: LazyLock<Mutex<Option<Runtime>>> = LazyLock::new(|| Mutex::new(None));
-static LAST_USED_ACCOUNT_EMAIL: LazyLock<Mutex<Option<String>>> =
+static LAST_USED_ACCOUNT_LABEL: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
-/// `sync_api_service_active_account` 上次成功打过"当前"标签的 email。
+/// `sync_api_service_active_account` 上次成功打过"当前"标签的 sidecar label。
 /// 命中时直接返回空 vec，跳过 sqlite 解密 + 全表 upsert。前端 setInterval
 /// 调到 3s 也几乎零开销。start/stop 时清空，避免跨服务生命周期串号。
-static LAST_SYNCED_ACTIVE_EMAIL: LazyLock<Mutex<Option<String>>> =
+static LAST_SYNCED_ACTIVE_LABEL: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
 static LAST_USED_ACCOUNT_PROBE_AT: LazyLock<Mutex<Option<Instant>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -139,40 +139,40 @@ fn lock() -> std::sync::MutexGuard<'static, Option<Runtime>> {
     RUNTIME.lock().expect("SuperAI API 运行态锁失败")
 }
 
-pub fn last_used_account_email() -> Option<String> {
-    LAST_USED_ACCOUNT_EMAIL
+pub fn last_used_account_label() -> Option<String> {
+    LAST_USED_ACCOUNT_LABEL
         .lock()
         .ok()
-        .and_then(|email| email.clone())
+        .and_then(|label| label.clone())
 }
 
-fn set_last_used_account_email(email: String) {
-    if let Ok(mut current) = LAST_USED_ACCOUNT_EMAIL.lock() {
-        *current = Some(email);
+fn set_last_used_account_label(label: String) {
+    if let Ok(mut current) = LAST_USED_ACCOUNT_LABEL.lock() {
+        *current = Some(label);
     }
 }
 
-/// 取上次同步过的 email；命令端用它做幂等短路。
-pub fn last_synced_active_email() -> Option<String> {
-    LAST_SYNCED_ACTIVE_EMAIL
+/// 取上次同步过的 label；命令端用它做幂等短路。
+pub fn last_synced_active_label() -> Option<String> {
+    LAST_SYNCED_ACTIVE_LABEL
         .lock()
         .ok()
-        .and_then(|email| email.clone())
+        .and_then(|label| label.clone())
 }
 
-/// 标记本轮同步完成的 email。
-pub fn record_synced_active_email(email: String) {
-    if let Ok(mut current) = LAST_SYNCED_ACTIVE_EMAIL.lock() {
-        *current = Some(email);
+/// 标记本轮同步完成的 label。
+pub fn record_synced_active_label(label: String) {
+    if let Ok(mut current) = LAST_SYNCED_ACTIVE_LABEL.lock() {
+        *current = Some(label);
     }
 }
 
-/// 服务启停时清掉 active email 缓存，避免新一轮启动后用陈旧值短路。
-pub fn clear_synced_active_email() {
-    if let Ok(mut current) = LAST_SYNCED_ACTIVE_EMAIL.lock() {
+/// 服务启停时清掉 active label 缓存，避免新一轮启动后用陈旧值短路。
+pub fn clear_synced_active_label() {
+    if let Ok(mut current) = LAST_SYNCED_ACTIVE_LABEL.lock() {
         *current = None;
     }
-    if let Ok(mut current) = LAST_USED_ACCOUNT_EMAIL.lock() {
+    if let Ok(mut current) = LAST_USED_ACCOUNT_LABEL.lock() {
         *current = None;
     }
     if let Ok(mut current) = LAST_USED_ACCOUNT_PROBE_AT.lock() {
@@ -837,7 +837,7 @@ pub fn start(
         return Err("API Key 为空，无法启动".to_string());
     }
     stop()?;
-    clear_synced_active_email();
+    clear_synced_active_label();
 
     let sidecar_bin = resolve_bundled_binary("superai-api").ok_or_else(|| {
         format!(
@@ -1006,7 +1006,7 @@ fn build_inner_client() -> Result<reqwest::blocking::Client, String> {
 /// - sidecar 已有但传入没有 → DELETE
 /// - 传入有 sidecar 没有 → POST /auth/login
 ///
-/// 用 `label`（即我们的账号 email）做匹配。空 label 的项跳过远端 diff，只 POST。
+/// 用 `label` 做匹配。空 label 的项跳过远端 diff，只 POST。
 pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
     let target = clone_target()?;
     let client = build_inner_client()?;
@@ -1032,22 +1032,22 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
         .cloned()
         .unwrap_or_default();
 
-    // email -> sidecar id（小写归一化）
+    // label -> sidecar id（小写归一化）
     let mut existing: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for entry in &current {
         let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
-        let email = entry
+        let label = entry
             .get("email")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_ascii_lowercase();
-        if !id.is_empty() && !email.is_empty() {
-            existing.insert(email, id.to_string());
+        if !id.is_empty() && !label.is_empty() {
+            existing.insert(label, id.to_string());
         }
     }
 
-    // 期望 email 集合
-    let desired_emails: std::collections::HashSet<String> = desired
+    // 期望 label 集合
+    let desired_labels: std::collections::HashSet<String> = desired
         .iter()
         .filter_map(|p| p.get("label").and_then(Value::as_str))
         .map(|s| s.to_ascii_lowercase())
@@ -1056,8 +1056,8 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
     // 2) 删除 sidecar 多出来的
     let mut removed = 0usize;
     let mut failed_to_remove: Vec<Value> = Vec::new();
-    for (email, id) in &existing {
-        if !desired_emails.contains(email) {
+    for (label, id) in &existing {
+        if !desired_labels.contains(label) {
             match client
                 .delete(format!("{}/auth/accounts/{}", target.base_url, id))
                 .header("Authorization", format!("Bearer {}", target.inner_key))
@@ -1068,13 +1068,13 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
                 }
                 Ok(resp) => {
                     failed_to_remove.push(json!({
-                        "email": email,
+                        "label": label,
                         "status": resp.status().as_u16(),
                     }));
                 }
                 Err(error) => {
                     failed_to_remove.push(json!({
-                        "email": email,
+                        "label": label,
                         "error": error.to_string(),
                     }));
                 }
@@ -1082,7 +1082,7 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
         }
     }
 
-    // 3) 添加缺失的（sidecar 内部按 apiKey/email 去重，不会重复）
+    // 3) 添加缺失的（sidecar 内部按 apiKey 去重，不会重复）
     let to_add: Vec<Value> = desired
         .into_iter()
         .filter(|p| {
@@ -1170,10 +1170,10 @@ fn post_sidecar_dashboard_api(
     }
 }
 
-pub fn activate_account_by_email(email: &str) -> Result<(), String> {
-    let wanted_email = email.trim().to_ascii_lowercase();
-    if wanted_email.is_empty() {
-        return Err("SuperAI 账号缺少 email，无法同步 API 启用状态".to_string());
+pub fn activate_account_by_label(label: &str) -> Result<(), String> {
+    let wanted_label = label.trim().to_ascii_lowercase();
+    if wanted_label.is_empty() {
+        return Err("SuperAI 账号缺少 sidecar 标识，无法同步 API 启用状态".to_string());
     }
 
     let target = clone_target()?;
@@ -1197,12 +1197,12 @@ pub fn activate_account_by_email(email: &str) -> Result<(), String> {
         .and_then(Value::as_array)
         .and_then(|accounts| {
             accounts.iter().find_map(|account| {
-                let sidecar_email = account
+                let sidecar_label = account
                     .get("email")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if sidecar_email == wanted_email {
+                if sidecar_label == wanted_label {
                     account
                         .get("id")
                         .and_then(Value::as_str)
@@ -1212,7 +1212,7 @@ pub fn activate_account_by_email(email: &str) -> Result<(), String> {
                 }
             })
         })
-        .ok_or_else(|| format!("API 服务中未找到 SuperAI 账号: {email}"))?;
+        .ok_or_else(|| format!("API 服务中未找到 SuperAI 账号: {label}"))?;
 
     let resp = client
         .patch(format!(
@@ -1238,7 +1238,7 @@ pub fn activate_account_by_email(email: &str) -> Result<(), String> {
 
 /// 停止服务（幂等）。
 pub fn stop() -> Result<(), String> {
-    clear_synced_active_email();
+    clear_synced_active_label();
     let runtime = { lock().take() };
     let Some(mut runtime) = runtime else {
         return Ok(());
@@ -1691,8 +1691,8 @@ fn update_last_used_account_from_sidecar(client: &reqwest::blocking::Client, tar
         }
     }
 
-    if let Some((email, _)) = latest {
-        set_last_used_account_email(email.to_ascii_lowercase());
+    if let Some((label, _)) = latest {
+        set_last_used_account_label(label.to_ascii_lowercase());
     }
 }
 
