@@ -88,6 +88,7 @@ type AppSettings = {
   theme: ThemeMode;
   autoLaunch: boolean;
   maskSensitive: boolean;
+  apiServiceEnabled: boolean;
   apiServiceHost: string;
   apiServicePort: number;
   apiServiceDefaultModel: string;
@@ -968,6 +969,7 @@ type CodexAppRestoreResult = {
 function ApiServiceCard({
   status,
   busy,
+  starting,
   pref,
   onToggleService,
   onCopy,
@@ -975,12 +977,14 @@ function ApiServiceCard({
 }: {
   status: ApiServiceStatus | null;
   busy: boolean;
+  starting: boolean;
   pref: ApiModelPref;
   onToggleService: () => void;
   onCopy: (text: string, label: string) => void;
   onOpenConfig: () => void;
 }) {
   const running = Boolean(status?.running);
+  const stateClass = starting ? "starting" : running ? "running" : "idle";
   const address = status?.address ?? "—";
   const apiKey = status?.apiKey ?? "";
   const families = MODEL_FAMILIES;
@@ -991,7 +995,7 @@ function ApiServiceCard({
   ].filter(Boolean).join(" · ");
 
   return (
-    <article className={clsx("account-row superai-api-card", running && "running")}>
+    <article className={clsx("account-row superai-api-card", stateClass)}>
       <div className="superai-api-head">
         <div className="superai-api-icon">
           <Server size={22} strokeWidth={1.8} />
@@ -1000,7 +1004,7 @@ function ApiServiceCard({
           <strong>API 服务</strong>
           <span>支持本机与局域网调用</span>
         </div>
-        <div className={clsx("superai-api-status-dot", running && "running")} />
+        <div className={clsx("superai-api-status-dot", stateClass)} />
       </div>
 
       <dl className="superai-api-grid">
@@ -1056,17 +1060,19 @@ function ApiServiceCard({
         <div className="superai-api-actions">
           <button
             type="button"
-            className={clsx("superai-api-toggle", running ? "off" : "on")}
+            className={clsx("superai-api-toggle", starting ? "on" : running ? "off" : "on")}
             onClick={onToggleService}
-            disabled={busy}
+            disabled={busy || starting}
           >
             <Power size={14} />
-            {running ? "停止服务" : "启动服务"}
+            {starting ? "启动中" : running ? "停止服务" : "启动服务"}
           </button>
         </div>
 
         <p className="superai-api-hint">
-          {running
+          {starting
+            ? "API 服务正在后台启动，请稍候，启动完成后会自动刷新状态。"
+            : running
             ? `API 服务运行中。账号池会按 ${APP_NAME} 账号可用额度自动轮询请求。`
             : "启动 API 服务后，你可以通过上方地址和密钥在 IDE 或其他工具中调用。"}
         </p>
@@ -1235,11 +1241,14 @@ function App() {
   const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
   const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
   const [apiService, setApiService] = useState<ApiServiceStatus | null>(null);
+  const [apiServiceEnabled, setApiServiceEnabled] = useState(false);
+  const [isApiServiceStarting, setIsApiServiceStarting] = useState(false);
   const [isApiServiceBusy, setIsApiServiceBusy] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({
     theme: "system",
     autoLaunch: false,
     maskSensitive: false,
+    apiServiceEnabled: false,
     apiServiceHost: "0.0.0.0",
     apiServicePort: DEFAULT_API_SERVICE_PORT,
     apiServiceDefaultModel: "gpt-5.5",
@@ -1255,6 +1264,8 @@ function App() {
   const oauthPollTimers = useRef<Partial<Record<OAuthProvider, number>>>({});
   const hasStartedStartupRefresh = useRef(false);
   const activeAccountRefreshInFlight = useRef<string | null>(null);
+  const apiServiceEnabledRef = useRef(apiServiceEnabled);
+  const apiServiceRunningRef = useRef(false);
   const [accountScrollbar, setAccountScrollbar] = useState({
     visible: false,
     top: 0,
@@ -1274,6 +1285,15 @@ function App() {
   }, []);
   const apiServiceRunning = Boolean(apiService?.running);
   const apiServiceActualPort = apiService?.actualPort ?? null;
+
+  useEffect(() => {
+    apiServiceEnabledRef.current = apiServiceEnabled;
+  }, [apiServiceEnabled]);
+
+  useEffect(() => {
+    apiServiceRunningRef.current = apiServiceRunning;
+  }, [apiServiceRunning]);
+
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
     return sortAccountsForView(accounts.filter((account) => {
@@ -2074,6 +2094,10 @@ function App() {
       .then((storedSettings) => {
         if (storedSettings) {
           setSettings(storedSettings);
+          setApiServiceEnabled(Boolean(storedSettings.apiServiceEnabled));
+          setIsApiServiceStarting(
+            Boolean(storedSettings.apiServiceEnabled) && !apiServiceRunningRef.current,
+          );
           setApiServiceHostInput(storedSettings.apiServiceHost);
           setApiServicePortInput(String(storedSettings.apiServicePort));
         }
@@ -2103,7 +2127,15 @@ function App() {
   useEffect(() => {
     if (!isTauri()) return;
     invoke<ApiServiceStatus>("get_api_service_status")
-      .then((status) => setApiService(status))
+      .then((status) => {
+        setApiService(status);
+        if (status.running) {
+          setApiServiceEnabled(true);
+          setIsApiServiceStarting(false);
+        } else if (!apiServiceEnabledRef.current) {
+          setIsApiServiceStarting(false);
+        }
+      })
       .catch(() => undefined);
   }, []);
 
@@ -2183,6 +2215,7 @@ function App() {
     if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
     void listen<{ phase?: string; message?: string }>("api-service-error", (event) => {
+      setIsApiServiceStarting(false);
       const message = event.payload?.message ?? "未知错误";
       showNotice("error", `${APP_NAME} API 服务异常：${message}`);
     }).then((fn) => {
@@ -2199,6 +2232,8 @@ function App() {
     void listen<ApiServiceStatus>("api-service-status-changed", (event) => {
       if (event.payload) {
         setApiService(event.payload);
+        setIsApiServiceStarting(false);
+        setApiServiceEnabled(Boolean(event.payload.running));
       }
     }).then((fn) => {
       unlisten = fn;
@@ -2258,22 +2293,28 @@ function App() {
   }, [showNotice, showNormalizedError]);
 
   const toggleApiService = useCallback(async () => {
-    if (isApiServiceBusy) return;
+    if (isApiServiceBusy || isApiServiceStarting) return;
     setIsApiServiceBusy(true);
     try {
       const command = apiServiceRunning ? "stop_api_service" : "start_api_service";
+      if (command === "start_api_service") {
+        setIsApiServiceStarting(true);
+      }
       const status = await invoke<ApiServiceStatus>(command);
       setApiService(status);
+      setApiServiceEnabled(Boolean(status.running));
+      setIsApiServiceStarting(false);
       showNotice(
         "success",
         status.running ? `已启动 API 服务${status.address ? "：" + status.address : ""}` : "已停用 API 服务",
       );
     } catch (error) {
+      setIsApiServiceStarting(false);
       showNormalizedError("操作 API 服务失败", error);
     } finally {
       setIsApiServiceBusy(false);
     }
-  }, [isApiServiceBusy, showNormalizedError, apiServiceRunning, showNotice]);
+  }, [isApiServiceBusy, isApiServiceStarting, showNormalizedError, apiServiceRunning, showNotice]);
 
   const applyApiPref = useCallback(
     (updater: (prev: ApiModelPref) => ApiModelPref) => {
@@ -2501,6 +2542,7 @@ function App() {
                     <ApiServiceCard
                       status={apiService}
                       busy={isApiServiceBusy}
+                      starting={isApiServiceStarting}
                       pref={apiPref}
                       onToggleService={() => void toggleApiService()}
                       onCopy={(text, label) => void copyApiServiceText(text, label)}
@@ -2888,7 +2930,7 @@ function App() {
           onClose={() => setIsApiConfigOpen(false)}
         >
           <ApiServiceConfigPanel
-            running={Boolean(apiService?.running)}
+            running={Boolean(apiService?.running) || isApiServiceStarting}
             models={apiServiceModels}
             pref={apiPref}
             onChangeFamily={handleChangeFamily}
@@ -2959,7 +3001,7 @@ function App() {
                   <div>
                     <strong>API 服务监听</strong>
                     <p>
-                      {apiService?.running
+                      {apiService?.running || isApiServiceStarting
                         ? "API 服务运行中时不允许修改端口；请先停止服务。"
                         : "地址 0.0.0.0 同时监听本机与局域网；端口限制在 51000-59999。"}
                     </p>
@@ -2981,7 +3023,7 @@ function App() {
                       }}
                       aria-invalid={parseApiServiceHost(apiServiceHostInput) === null}
                       placeholder="0.0.0.0"
-                      disabled={Boolean(apiService?.running)}
+                      disabled={Boolean(apiService?.running) || isApiServiceStarting}
                     />
                   </label>
                   <label className="setting-inline-field">
@@ -2999,7 +3041,7 @@ function App() {
                       }}
                       aria-invalid={parseApiServicePort(apiServicePortInput) === null}
                       placeholder={String(DEFAULT_API_SERVICE_PORT)}
-                      disabled={Boolean(apiService?.running)}
+                      disabled={Boolean(apiService?.running) || isApiServiceStarting}
                     />
                   </label>
                 </div>

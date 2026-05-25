@@ -14,6 +14,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
@@ -8714,13 +8715,33 @@ fn sync_superai_accounts_to_api(app: tauri::AppHandle) -> Result<usize, String> 
     Ok(count)
 }
 
+static WINDSURF_SYNC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 /// 后台线程触发同步，避免阻塞 Tauri 命令。
 fn schedule_windsurf_sync(app: tauri::AppHandle) {
     if !api_service::is_running_with_sidecar() {
         return;
     }
+    if WINDSURF_SYNC_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
     std::thread::spawn(move || {
-        if let Err(error) = sync_superai_accounts_to_api(app) {
+        let result = sync_superai_accounts_to_api(app.clone());
+        WINDSURF_SYNC_IN_FLIGHT.store(false, Ordering::Release);
+        if let Ok(mut settings) = read_settings_record(&app) {
+            let _ = ensure_api_service_key(&app, &mut settings);
+            let status = api_service::current_status(
+                &settings.api_service_host,
+                effective_api_service_port(settings.api_service_port),
+                &settings.api_service_key,
+                &effective_api_service_model(&settings.api_service_default_model),
+            );
+            emit_api_service_status_changed(&app, &status);
+        }
+        if let Err(error) = result {
             eprintln!("[SuperAI API] 后台同步失败: {error}");
         }
     });

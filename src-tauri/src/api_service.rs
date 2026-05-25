@@ -818,6 +818,9 @@ fn should_suppress_sidecar_log_line(line: &str) -> bool {
         || lower.starts_with("| github.com/")
         || lower.starts_with("|       ")
         || lower.starts_with("wraps: ")
+        || lower.contains("no accounts configured. add via")
+        || lower.contains("post /auth/login {\"token\":\"...\"}")
+        || lower.contains("post /auth/login {\"api_key\":\"...\"}")
 }
 
 // ---------- 启停 ----------
@@ -1104,11 +1107,11 @@ pub fn reconcile_accounts(desired: Vec<Value>) -> Result<Value, String> {
         }
     }
 
-    // probe-all 只在账号池真正有增删时跑。前端每 15s 的 refresh_account 会
-    // 通过后台账号同步调上来，若每次都触发 probe-all，sidecar 就会
-    // 对所有账号反复跑 GetUserStatus + Dynamic cloud probe，把 gemini canary
-    // 配额烧光也把日志刷爆。账号能力的"漂移"由 sidecar 自带的 6 小时定时
-    // re-probe 兜底，纯同步刷新不必参与。
+    // 这里只做账号同步与额度刷新，不再主动打 sidecar 的 probe-all。
+    // sidecar 账号池是内存态，应用重启后会把 DB 里的账号重新 /auth/login 一遍；
+    // 如果这里顺手触发 probe-all，就会在每次启动时额外跑一轮能力探测，
+    // 产生无意义的上游流量并刷爆日志。能力探测交给 sidecar 自己的按需
+    // 路径或内部定时 re-probe，不由宿主层强推。
     let refresh = if add_count > 0 || removed > 0 {
         refresh_sidecar_account_capabilities(&client, &target)
     } else {
@@ -1129,10 +1132,8 @@ fn refresh_sidecar_account_capabilities(
     target: &ProxyTarget,
 ) -> Value {
     let credits = post_sidecar_dashboard_api(client, target, "/accounts/refresh-credits");
-    let probe = post_sidecar_dashboard_api(client, target, "/accounts/probe-all");
     json!({
         "credits": credits,
-        "probe": probe,
     })
 }
 
