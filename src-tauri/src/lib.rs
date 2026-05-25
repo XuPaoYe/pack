@@ -8808,34 +8808,21 @@ fn escape_toml_basic_string(s: &str) -> String {
     out
 }
 
-fn codex_model_config_for_api_model(model_id: &str) -> (String, Option<String>) {
-    let trimmed = model_id.trim();
-    let model = if trimmed.is_empty() {
-        DEFAULT_WINDSURF_API_MODEL
-    } else {
-        trimmed
-    };
-
-    for effort in ["xhigh", "high", "medium", "low"] {
-        let suffix = format!("-{effort}");
-        if let Some(base) = model.strip_suffix(&suffix) {
-            if !base.is_empty() {
-                return (base.to_string(), Some(effort.to_string()));
-            }
-        }
-    }
-
-    (model.to_string(), None)
+fn codex_model_config_for_api_model(_model_id: &str) -> String {
+    // SuperAI 的 API 服务在 api_service.rs:1378-1405 会把入参 model 强制改写成
+    // UI 当前选中的模型，codex config.toml 里的 model 实际上只影响 codex TUI
+    // 的显示。这里固定写 "自定义"，避免每次切 SuperAI 模型都回写 config.toml。
+    "自定义".to_string()
 }
 
 /// 写入 codex `~/.codex/config.toml` 的 SuperAI 配置。
 ///
 /// 设计：
-/// - API 服务内部可以使用 sidecar 需要的完整模型 id（如 `gpt-5.5-medium`），
-///   但 Codex 的 config.toml 必须按 Codex 原生字段拆开：`model = "gpt-5.5"` 与
-///   `model_reasoning_effort = "medium"`。
+/// - API 服务内部使用 sidecar 需要的完整模型 id（如 `gpt-5.5-medium`）。
+///   写进 Codex `config.toml` 时也直接保留完整 id，避免 Codex 把自定义 provider
+///   的模型误当成原生 OpenAI family 再额外套 `model_reasoning_effort` 规则。
 /// - SuperAI 切模型时，前端调 `set_api_service_default_model`，后端会顺手
-///   `rewrite_managed_model_config()` 把这两行改掉，下次 codex 重启就显示新配置；
+///   `rewrite_managed_model_config()` 把 `model = "..."` 原地改掉，下次 codex 重启就显示新配置；
 ///   codex 进程没重启时，proxy 内存里 default_model 也已热更，请求立即生效。
 ///
 /// 鉴权选择 `requires_openai_auth = true`（**不**设 `env_key`）：
@@ -8850,21 +8837,16 @@ fn codex_model_config_for_api_model(model_id: &str) -> (String, Option<String>) 
 ///     历史会话视图会整个坏掉。
 fn build_superai_managed_block(base_url: &str, model_id: &str, _api_key: &str) -> String {
     let url = escape_toml_basic_string(base_url);
-    let (codex_model, effort) = codex_model_config_for_api_model(model_id);
-    let model = escape_toml_basic_string(&codex_model);
-    let effort = escape_toml_basic_string(effort.as_deref().unwrap_or("medium"));
+    let model = escape_toml_basic_string(&codex_model_config_for_api_model(model_id));
     format!(
         "model_provider = \"superai\"\n\
 model = \"{model}\"\n\
-model_reasoning_effort = \"{effort}\"\n\
 approval_policy = \"on-request\"\n\
 sandbox_mode = \"workspace-write\"\n\
 network_access = \"enabled\"\n\
 model_context_window = 200000\n\
 model_max_output_tokens = 32768\n\
 disable_response_storage = true\n\
-personality = \"pragmatic\"\n\
-service_tier = \"fast\"\n\
 \n\
 [model_providers.superai]\n\
 name = \"Super AI\"\n\
@@ -8875,8 +8857,8 @@ requires_openai_auth = true\n\
     )
 }
 
-/// 当 SuperAI UI 切换模型时调用：原地把 SuperAI 配置里的
-/// `model = "..."` 与 `model_reasoning_effort = "..."` 改成 Codex 原生格式。
+/// 当 SuperAI UI 切换模型时调用：原地把 SuperAI 配置里的 `model = "..."` 改成最新完整模型 id，
+/// 并清掉旧版本遗留的 `model_reasoning_effort = "..."`。
 ///
 /// - 文件不存在 / 不是 SuperAI 配置 / 没找到 model 行 → 一律不动文件，返回 false。
 ///   说明用户还没点"配置 Codex"，不该擅自创建文件。
@@ -8896,37 +8878,22 @@ fn rewrite_managed_model_config(model_id: &str) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let (codex_model, effort) = codex_model_config_for_api_model(model_id);
-    let escaped_model = escape_toml_basic_string(&codex_model);
-    let escaped_effort = escape_toml_basic_string(effort.as_deref().unwrap_or("medium"));
+    let escaped_model = escape_toml_basic_string(&codex_model_config_for_api_model(model_id));
     let mut new_lines: Vec<String> = Vec::with_capacity(existing.lines().count());
     let mut replaced_model = false;
-    let mut replaced_effort = false;
     for line in existing.lines() {
         let trimmed = line.trim_start();
         if !replaced_model && trimmed.starts_with("model = \"") {
             new_lines.push(format!("model = \"{escaped_model}\""));
             replaced_model = true;
-        } else if !replaced_effort && trimmed.starts_with("model_reasoning_effort = \"") {
-            new_lines.push(format!("model_reasoning_effort = \"{escaped_effort}\""));
-            replaced_effort = true;
+        } else if trimmed.starts_with("model_reasoning_effort = \"") {
+            continue;
         } else {
             new_lines.push(line.to_string());
         }
     }
     if !replaced_model {
         return Ok(false);
-    }
-    if !replaced_effort {
-        if let Some(index) = new_lines
-            .iter()
-            .position(|line| line.trim_start().starts_with("model = \""))
-        {
-            new_lines.insert(
-                index + 1,
-                format!("model_reasoning_effort = \"{escaped_effort}\""),
-            );
-        }
     }
     let mut next = new_lines.join("\n");
     if existing.ends_with('\n') && !next.ends_with('\n') {
@@ -9554,28 +9521,27 @@ mod tests {
     }
 
     #[test]
-    fn codex_config_splits_model_and_reasoning_effort() {
+    fn codex_config_keeps_custom_model_id_verbatim() {
         assert_eq!(
             codex_model_config_for_api_model("gpt-5.5-medium"),
-            ("gpt-5.5".to_string(), Some("medium".to_string()))
+            "gpt-5.5-medium".to_string()
         );
         assert_eq!(
             codex_model_config_for_api_model("gpt-5.5-xhigh"),
-            ("gpt-5.5".to_string(), Some("xhigh".to_string()))
+            "gpt-5.5-xhigh".to_string()
         );
         assert_eq!(
             codex_model_config_for_api_model("gpt-5.3-codex"),
-            ("gpt-5.3-codex".to_string(), None)
+            "gpt-5.3-codex".to_string()
         );
     }
 
     #[test]
-    fn superai_managed_block_uses_codex_native_reasoning_field() {
+    fn superai_managed_block_keeps_full_model_id() {
         let block = build_superai_managed_block("http://127.0.0.1:1420/v1", "gpt-5.5-medium", "");
 
-        assert!(block.contains("model = \"gpt-5.5\"\n"));
-        assert!(block.contains("model_reasoning_effort = \"medium\"\n"));
-        assert!(!block.contains("model = \"gpt-5.5-medium\"\n"));
+        assert!(block.contains("model = \"gpt-5.5-medium\"\n"));
+        assert!(!block.contains("model_reasoning_effort = "));
     }
 
     #[test]

@@ -122,8 +122,7 @@ npm run lint
 
 ```toml
 model_provider = "superai"
-model = "gpt-5.4"
-model_reasoning_effort = "medium"
+model = "gpt-5.4-medium"
 
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
@@ -144,6 +143,7 @@ requires_openai_auth = true
 
 - 不要写 `env_key = "OPENAI_API_KEY"`。Codex 会把它当成"强制从环境变量取值"，不会再回退到 `auth.json` 读 key。
 - `model_provider` 和 `[model_providers.superai]` 都用小写 `superai`，不要写成 `SuperAI`。
+- `model` 直接写完整自定义模型 id，例如 `gpt-5.4-medium`，不要再拆成 `gpt-5.4` + `model_reasoning_effort`。
 - `auth.json` 里只保留 `OPENAI_API_KEY`，不要额外放 `tokens`、`last_refresh` 之类字段。
 - `base_url` 需要填可访问的 OpenAI 兼容根地址；如果你的本地代理实际监听的是 `http://127.0.0.1:12345`，这里就写 `http://127.0.0.1:12345/v1`。
 - 如果已经在 App 里启动了 API 服务，优先使用界面的“配置 Codex”按钮。应用会自动改写这两个文件，并在首次接管前备份原始配置。
