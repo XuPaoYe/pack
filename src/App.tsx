@@ -1207,7 +1207,7 @@ function ApiServiceConfigPanel({
       <section className="api-config-row">
         <div className="api-config-copy">
           <strong>Claude 配置</strong>
-          <p>把当前 API 服务根地址和密钥写入 ~/.claude/settings.json 的 env，供 Claude Code 直连本地网关；恢复时回滚到接管前备份或移除 SuperAI 注入项。模型仍以 SuperAI 当前默认模型为准。</p>
+          <p>把当前地址和密钥写入 ~/.claude/settings.json，或恢复接管前备份。</p>
         </div>
         <div className="api-config-actions">
           <button
