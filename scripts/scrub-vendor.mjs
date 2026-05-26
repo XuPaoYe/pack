@@ -425,4 +425,30 @@ const langserverPath = join(OUT_DIR, "src", "langserver.js");
   writeFileSync(langserverPath, src.replace(needle, replacement));
 }
 
+// client.js：上游 Cascade warmup 默认把临时 workspace 固定到
+// `/home/user/projects/workspace-<hash>`。在 macOS / Windows 下这个父目录通常
+// 不存在，LS 的 AddTrackedWorkspace 会直接报 `no such file or directory`。
+// SuperAI 启动 sidecar 时已经显式传了可写 DATA_DIR，所以把 stub workspace
+// 放到 `${DATA_DIR}/workspaces/` 下，跨平台且不会污染用户真实项目。
+const clientPath = join(OUT_DIR, "src", "client.js");
+{
+  const src = readFileSync(clientPath, "utf8");
+  const importNeedle = "import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';";
+  const pathNeedle = "import { randomUUID, createHash } from 'crypto';";
+  const workspaceNeedle = "    const workspacePath = `/home/user/projects/workspace-${wsId}`;";
+  if (!src.includes(importNeedle) || !src.includes(pathNeedle) || !src.includes(workspaceNeedle)) {
+    console.error("[scrub-vendor] client.js workspace anchors not found; aborting");
+    process.exit(2);
+  }
+  let next = src.replace(
+    importNeedle,
+    "import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';\nimport { join } from 'path';",
+  );
+  next = next.replace(
+    workspaceNeedle,
+    "    const workspaceRoot = join(process.env.DATA_DIR || process.cwd(), 'workspaces');\n    const workspacePath = join(workspaceRoot, `workspace-${wsId}`);",
+  );
+  writeFileSync(clientPath, next);
+}
+
 console.log(`[scrub-vendor] vendor ready (rewrote ${changed} files)`);

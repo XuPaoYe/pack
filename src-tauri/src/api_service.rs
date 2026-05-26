@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
+use url::Url;
 
 /// 默认监听主机：`0.0.0.0` 表示同时监听本机与局域网。
 pub const DEFAULT_HOST: &str = "0.0.0.0";
@@ -134,6 +135,10 @@ static LAST_SYNCED_ACTIVE_LABEL: LazyLock<Mutex<Option<String>>> =
     LazyLock::new(|| Mutex::new(None));
 static LAST_USED_ACCOUNT_PROBE_AT: LazyLock<Mutex<Option<Instant>>> =
     LazyLock::new(|| Mutex::new(None));
+static LAST_PROBE_PENDING_REFRESH_AT: LazyLock<Mutex<Option<Instant>>> =
+    LazyLock::new(|| Mutex::new(None));
+static LAST_POLICY_BLOCK_LOG: LazyLock<Mutex<Option<(String, Instant)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 fn lock() -> std::sync::MutexGuard<'static, Option<Runtime>> {
     RUNTIME.lock().expect("SuperAI API 运行态锁失败")
@@ -178,6 +183,12 @@ pub fn clear_synced_active_label() {
     if let Ok(mut current) = LAST_USED_ACCOUNT_PROBE_AT.lock() {
         *current = None;
     }
+    if let Ok(mut current) = LAST_PROBE_PENDING_REFRESH_AT.lock() {
+        *current = None;
+    }
+    if let Ok(mut current) = LAST_POLICY_BLOCK_LOG.lock() {
+        *current = None;
+    }
 }
 
 fn should_probe_last_used_account() -> bool {
@@ -185,13 +196,51 @@ fn should_probe_last_used_account() -> bool {
         return true;
     };
     let now = Instant::now();
-    if last_probe
-        .is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(10))
-    {
+    if last_probe.is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(10)) {
         return false;
     }
     *last_probe = Some(now);
     true
+}
+
+fn should_refresh_capabilities_for_probe_pending() -> bool {
+    let Ok(mut last_refresh) = LAST_PROBE_PENDING_REFRESH_AT.lock() else {
+        return true;
+    };
+    let now = Instant::now();
+    if last_refresh.is_some_and(|instant| now.duration_since(instant) < Duration::from_secs(15)) {
+        return false;
+    }
+    *last_refresh = Some(now);
+    true
+}
+
+fn should_suppress_policy_block_log(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("stream error after retries:")
+        || !lower.contains("content policy")
+        || !lower.contains("trace id:")
+    {
+        return false;
+    }
+
+    let normalized = lower
+        .split("(trace id:")
+        .next()
+        .unwrap_or(&lower)
+        .trim()
+        .to_string();
+    let Ok(mut slot) = LAST_POLICY_BLOCK_LOG.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    if let Some((last_text, last_at)) = slot.as_ref() {
+        if last_text == &normalized && now.duration_since(*last_at) < Duration::from_secs(20) {
+            return true;
+        }
+    }
+    *slot = Some((normalized, now));
+    false
 }
 
 /// 生成形如 `agt_superai_xxxxxxxxxxxxxxxx` 的密钥。
@@ -799,7 +848,8 @@ fn should_suppress_sidecar_log_line(line: &str) -> bool {
     // 这些日志经常成片出现，但通常会在几百毫秒后自愈并重新连上，不代表
     // SuperAI API 启动失败。这里仅压掉这组高频已知噪音，真正的 sidecar
     // 启动失败仍由 stdout 超时 / 进程退出路径上抛给 UI。
-    lower.contains("language server listening on fixed port at 42100")
+    should_suppress_policy_block_log(line)
+        || lower.contains("language server listening on fixed port at 42100")
         || lower.contains("child process attempting to acquire lock file")
         || lower.contains("child process acquired lock file")
         || lower.contains("manager process acquired child process lock")
@@ -821,6 +871,7 @@ fn should_suppress_sidecar_log_line(line: &str) -> bool {
         || lower.contains("no accounts configured. add via")
         || lower.contains("post /auth/login {\"token\":\"...\"}")
         || lower.contains("post /auth/login {\"api_key\":\"...\"}")
+        || lower.contains("[meta_tag_audit] unknown xml tags in user message:")
 }
 
 // ---------- 启停 ----------
@@ -1315,6 +1366,31 @@ fn handle_request(mut request: Request, api_key: &str, target: Option<&ProxyTarg
     }
 
     // 反向代理：所有 /v1/* 与 /auth/* 都转发给 sidecar。
+    if request.method() == &Method::Get && wants_anthropic_models_api(&request) {
+        if path == "/v1/models" || path == "/v1/models/" {
+            let _ = request.respond(json_response(200, &anthropic_models_payload()));
+            return;
+        }
+        if let Some(model_id) = path.strip_prefix("/v1/models/") {
+            let decoded_model_id = decode_model_path_segment(model_id);
+            if let Some(payload) = anthropic_model_payload_by_id(&decoded_model_id) {
+                let _ = request.respond(json_response(200, &payload));
+            } else {
+                let _ = request.respond(json_response(
+                    404,
+                    &json!({
+                        "type": "error",
+                        "error": {
+                            "type": "not_found_error",
+                            "message": format!("Model not found: {decoded_model_id}"),
+                        }
+                    }),
+                ));
+            }
+            return;
+        }
+    }
+
     if let Some(target) = target {
         if path.starts_with("/v1/") || path.starts_with("/auth/") || path == "/v1/models" {
             proxy_to_sidecar(request, target, &path, &query);
@@ -1368,38 +1444,30 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
         return;
     }
 
-    // 设计选择：**SuperAI 是模型选择的唯一真相**。
-    // codex / cline / cursor 等客户端发到我们这里的 `model` 一律忽略，
-    // 强制改写成 SuperAI UI 当前选中的模型 + reasoning effort 后缀。
-    // 这样用户只需在 SuperAI 一处切模型，所有上层 UI 自动跟随，
-    // 不会出现"codex TUI 显示 A、实际打 B"或"两处不同步"的混乱。
-    // 每次请求都从共享 RwLock 拿一次最新值，这样 UI 切模型 / 改 effort 后
-    // 下一条上行请求立刻用新模型，不必重启服务。
+    let mut requested_model_for_client: Option<String> = None;
+    if path == "/v1/messages" && !body.is_empty() {
+        if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+            requested_model_for_client = value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|model| model.trim().to_string())
+                .filter(|model| !model.is_empty());
+        }
+    }
+
+    // SuperAI 仍然保留模型选择权：客户端请求体里的 model 仅作为参考，
+    // 真正发给 sidecar 的 model 以 SuperAI 当前配置为准。除此之外不再
+    // 对请求语义做额外改写。
     let current_default_model = target.default_model_snapshot();
-    let mut forced_model: Option<String> = None;
     if !current_default_model.is_empty()
         && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/responses")
         && !body.is_empty()
     {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
             if let Some(obj) = value.as_object_mut() {
-                let requested_model = obj
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<missing>")
-                    .to_string();
-                obj.insert(
-                    "model".to_string(),
-                    Value::String(current_default_model.clone()),
-                );
+                obj.insert("model".to_string(), Value::String(current_default_model));
                 if let Ok(new_body) = serde_json::to_vec(&value) {
                     body = new_body;
-                    forced_model = Some(current_default_model.clone());
-                    if requested_model != current_default_model {
-                        eprintln!(
-                            "[SuperAI API] model override: {requested_model} -> {current_default_model}"
-                        );
-                    }
                 }
             }
         }
@@ -1475,6 +1543,7 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
         &url,
         target,
         &passthrough_headers,
+        requested_model_for_client.as_deref(),
         body.clone(),
     ) {
         Ok(r) => r,
@@ -1488,7 +1557,7 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
     };
 
     if is_chat_path(path) && upstream_resp.status().as_u16() == 403 {
-        let first_headers = response_headers(&upstream_resp, forced_model.as_deref());
+        let first_headers = response_headers(&upstream_resp);
         let first_status = upstream_resp.status().as_u16();
         let first_body = upstream_resp
             .bytes()
@@ -1496,11 +1565,17 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
             .unwrap_or_default();
 
         if is_probe_pending_error(&first_body) {
-            if let Ok(inner_client) = build_inner_client() {
-                let refresh = refresh_sidecar_account_capabilities(&inner_client, target);
+            if should_refresh_capabilities_for_probe_pending() {
+                if let Ok(inner_client) = build_inner_client() {
+                    let refresh = refresh_sidecar_account_capabilities(&inner_client, target);
+                    eprintln!(
+                        "[SuperAI API] account capability check triggered by probe_pending: {}",
+                        sanitize_sidecar_log_line(&refresh.to_string())
+                    );
+                }
+            } else {
                 eprintln!(
-                    "[SuperAI API] account capability check triggered by probe_pending: {}",
-                    sanitize_sidecar_log_line(&refresh.to_string())
+                    "[SuperAI API] skipped duplicate capability check for probe_pending within 15s window"
                 );
             }
 
@@ -1510,11 +1585,12 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
                 &url,
                 target,
                 &passthrough_headers,
+                requested_model_for_client.as_deref(),
                 body.clone(),
             ) {
                 Ok(retried) => {
                     if retried.status().as_u16() == first_status {
-                        let retried_headers = response_headers(&retried, forced_model.as_deref());
+                        let retried_headers = response_headers(&retried);
                         let retried_body = retried
                             .bytes()
                             .map(|bytes| bytes.to_vec())
@@ -1573,7 +1649,7 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
 
     // 收集响应头（除 hop-by-hop 与 Content-Length；body 长度让 tiny_http 自行决定）。
     let status = upstream_resp.status().as_u16();
-    let headers = response_headers(&upstream_resp, forced_model.as_deref());
+    let headers = response_headers(&upstream_resp);
 
     let response = Response::new(StatusCode(status), headers, upstream_resp, None, None);
     let _ = request.respond(response);
@@ -1585,6 +1661,7 @@ fn send_sidecar_proxy_request(
     url: &str,
     target: &ProxyTarget,
     passthrough_headers: &[(String, String)],
+    requested_model_for_client: Option<&str>,
     body: Vec<u8>,
 ) -> Result<reqwest::blocking::Response, reqwest::Error> {
     let mut builder = client
@@ -1594,16 +1671,16 @@ fn send_sidecar_proxy_request(
     for (name, value) in passthrough_headers {
         builder = builder.header(name, value);
     }
+    if let Some(model) = requested_model_for_client {
+        builder = builder.header("x-superai-requested-model", model);
+    }
     if !body.is_empty() {
         builder = builder.body(body);
     }
     builder.send()
 }
 
-fn response_headers(
-    upstream_resp: &reqwest::blocking::Response,
-    forced_model: Option<&str>,
-) -> Vec<Header> {
+fn response_headers(upstream_resp: &reqwest::blocking::Response) -> Vec<Header> {
     let mut headers: Vec<Header> = Vec::new();
     for (k, v) in upstream_resp.headers().iter() {
         let name_lower = k.as_str().to_ascii_lowercase();
@@ -1630,11 +1707,6 @@ fn response_headers(
     // 始终带 CORS
     for h in cors_headers(None) {
         headers.push(h);
-    }
-    if let Some(model) = forced_model {
-        if let Ok(h) = Header::from_bytes(&b"x-super-ai-model"[..], model.as_bytes()) {
-            headers.push(h);
-        }
     }
     headers
 }
@@ -1712,6 +1784,109 @@ fn is_authorized(request: &Request, api_key: &str) -> bool {
         }
         false
     })
+}
+
+fn wants_anthropic_models_api(request: &Request) -> bool {
+    request
+        .headers()
+        .iter()
+        .any(|h| h.field.equiv("anthropic-version"))
+}
+
+fn anthropic_model_entries() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        ("claude-opus-4-7", "Claude Opus 4.7", "2026-02-19T00:00:00Z"),
+        (
+            "claude-opus-4-7[1m]",
+            "Claude Opus 4.7 (1M context)",
+            "2026-02-19T00:00:00Z",
+        ),
+        ("claude-opus-4.7", "Claude Opus 4.7", "2026-02-19T00:00:00Z"),
+        (
+            "claude-sonnet-4-6",
+            "Claude Sonnet 4.6",
+            "2025-08-01T00:00:00Z",
+        ),
+        (
+            "claude-sonnet-4.6",
+            "Claude Sonnet 4.6",
+            "2025-08-01T00:00:00Z",
+        ),
+        (
+            "claude-sonnet-4-6[1m]",
+            "Claude Sonnet 4.6 (1M context)",
+            "2025-08-01T00:00:00Z",
+        ),
+        (
+            "claude-sonnet-4.6[1m]",
+            "Claude Sonnet 4.6 (1M context)",
+            "2025-08-01T00:00:00Z",
+        ),
+        (
+            "claude-haiku-4-5",
+            "Claude Haiku 4.5",
+            "2025-10-01T00:00:00Z",
+        ),
+        (
+            "claude-haiku-4.5",
+            "Claude Haiku 4.5",
+            "2025-10-01T00:00:00Z",
+        ),
+    ]
+}
+
+fn anthropic_models_payload() -> Value {
+    let data: Vec<Value> = anthropic_model_entries()
+        .iter()
+        .map(|(id, display_name, created_at)| {
+            json!({
+                "created_at": created_at,
+                "display_name": display_name,
+                "id": id,
+                "type": "model",
+            })
+        })
+        .collect();
+    let first_id = data
+        .first()
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let last_id = data
+        .last()
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    json!({
+        "data": data,
+        "first_id": first_id,
+        "has_more": false,
+        "last_id": last_id,
+    })
+}
+
+fn anthropic_model_payload_by_id(model_id: &str) -> Option<Value> {
+    anthropic_model_entries()
+        .into_iter()
+        .find(|(id, _, _)| *id == model_id)
+        .map(|(id, display_name, created_at)| {
+            json!({
+                "created_at": created_at,
+                "display_name": display_name,
+                "id": id,
+                "type": "model",
+            })
+        })
+}
+
+fn decode_model_path_segment(segment: &str) -> String {
+    Url::parse(&format!("http://localhost/v1/models/{segment}"))
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back().map(str::to_string))
+        })
+        .unwrap_or_else(|| segment.to_string())
 }
 
 fn json_response(code: u16, value: &Value) -> Response<Cursor<Vec<u8>>> {

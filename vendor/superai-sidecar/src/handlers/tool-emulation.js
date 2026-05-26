@@ -111,7 +111,7 @@ export function buildToolPreamble(tools, toolChoice = 'auto', modelKey = null, p
   // vocabulary (banned by feedback_tool_preamble_rules) — keep it
   // matter-of-fact and short.
   const antiRefusal = dialect === 'gpt_native'
-    ? `The functions are available; if you need to read a file or run a command, call the function rather than asking the user to paste content.`
+    ? `The functions ARE available; if you need to read a file or run a command, call the function — never reply "please paste the file" or "I do not have access".`
     : '';
   return `Tools available this turn: ${names.join(', ')}. To call one, emit a single-line block: ${emit}.${antiRefusal ? ' ' + antiRefusal : ''} ${hints.join(' ')} ${WORKSPACE_PATH_HINT} Otherwise answer directly in plain text. After the last call, stop generating; the caller returns results in the next turn as <tool_result tool_call_id="...">...</tool_result>.`;
 }
@@ -197,21 +197,21 @@ Rules:
     // command-output guessing and forbids it. Rule 5 forces the model
     // to call the function for ANY shell-style request, removing the
     // "if the answer is short I'll just guess it" escape hatch.
-    gpt_native: `You have access to the following functions. They are real callable tools — the caller (a separate process on the user's actual machine) will execute them and return results in the next turn.
+    gpt_native: `You have access to the following functions. They are REAL callable tools — the caller (a separate process on the user's actual machine) will execute them and return results in the next turn.
 
-To call a function, output ONE valid JSON object on a single line — starting with "{" and ending with "}". No markdown code fence. No prose before or after. No leading commentary.
+To call a function, output ONE valid JSON object on a single line — starting with "{" and ending with "}". NO markdown code fence. NO prose before or after. NO leading commentary.
 
 Use this exact shape:
 {"function_call":{"name":"<function_name>","arguments":{<param>:<value>,...}}}
 
 Rules:
-1. Output only the JSON object. No \`\`\`json fence. No "Here you go:" prefix. No trailing explanation.
+1. Output ONLY the JSON object. NO \`\`\`json fence. NO "Here you go:" prefix. NO trailing explanation.
 2. "arguments" must be a JSON object whose keys match the function's parameter schema.
-3. The functions are available. When the user's request needs file access, command execution, or similar live data, call the function rather than saying you cannot do it.
-4. Do not invent function results. Do not guess timestamps, file contents, command outputs, search results, or any other data that a function would have produced. If the user asks for the output of \`echo $(date +%s)\`, \`ls\`, \`cat README.md\`, or anything similar, you cannot know the answer without calling the function; emit the function_call JSON instead.
-5. If the user's request describes any action a function could perform — running a shell command, reading a file, searching the web, applying a patch — call that function rather than answering from memory.
-6. After emitting one function_call JSON object, stop generating immediately. The caller will run the function and feed the result back as a "tool" message.
-7. To call multiple functions in parallel, emit multiple JSON objects, one per line. Each line stands on its own.
+3. The functions ARE available. DO NOT respond with "I cannot read files", "I don't have direct access", "please paste the file", or any similar refusal — those phrases are forbidden. Call the function instead.
+4. **NEVER FABRICATE OUTPUT.** Do NOT guess the result of a function call. Do NOT invent timestamps, file contents, command outputs, search results, or any other data that a function would have produced. If the user asks for the output of \`echo $(date +%s)\`, \`ls\`, \`cat README.md\`, or anything similar, you have NO way to know the answer — you MUST call the function. Hallucinated outputs are worse than refusing; the only correct response is the function_call JSON.
+5. If the user's request describes ANY action a function could perform — running a shell command, reading a file, searching the web, applying a patch — call that function. Do not "answer from memory" for these requests; memory cannot produce live data.
+6. After emitting one function_call JSON object, STOP generating immediately. The caller will run the function and feed the result back as a "tool" message.
+7. To call MULTIPLE functions in parallel, emit MULTIPLE JSON objects, one per line. Each line stands on its own.
 8. If — and only if — the user is plainly chatting (e.g. "hello", "thanks", "explain X concept") and no function is relevant, respond with plain text. Never mix plain text with JSON in the same response.
 9. The function-call result will arrive as a normal user/tool turn; you can call additional functions on subsequent turns until the task is done.`,
   };

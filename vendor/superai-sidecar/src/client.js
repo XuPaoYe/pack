@@ -113,26 +113,11 @@ function neutralizeIdentityForCascade(sysText) {
   text = text.replace(/(?:^|\n)\s*(?:#\s*)?Devin\s+(?:AI|Assistant|Agent|IDE|CLI|Code)/gi, '\nCloud IDE');
   // Generic: strip "You are Devin/OpenClaw/etc" identity overrides
   text = text.replace(/(^|[\n.!?]\s*)You are (?:Devin|Codex|OpenClaw|Aider|Cline)(?:[,.]|\s|$)/gi, '$1The assistant is a coding tool');
-  // SuperAI rebrand: also neutralize caller-supplied Cascade/Codeium/Windsurf
-  // identity overrides so they don't fight with the SuperAI [Context: ...]
-  // block appended later. Without this, a caller prompt that says
-  // "You are Cascade, made by Windsurf" survives as "The assistant is Cascade"
-  // (the generic "You are " → "The assistant is " sweep at the bottom only
-  // rewrites the verb, not the noun), and the model sees conflicting
-  // identity signals — caller still names Cascade, SuperAI Context forbids
-  // mentioning it. Strip the noun too, same shape as the Devin/Codex line.
-  text = text.replace(/(^|[\n.!?]\s*)You are (?:Cascade|Codeium|Windsurf)(?:[,.]|\s|$)/gi, '$1The assistant is an AI assistant');
-  text = text.replace(/\b(?:I am|I'm) (?:Cascade|Codeium|Windsurf)\b/gi, 'I am an AI assistant');
   // v2.0.91 — Windsurf safety filter also flags prompt-injection shaped
   // content (system prompt dumps from other agents). Normalize common
   // patterns that trigger false positives.
   text = text.replace(/\b(?:prompt[_-]?injection|jailbreak|ignore (?:all |previous |above )?instructions)\b/gi, 'malformed-input');
   text = text.replace(/\b(?:bypass|override) (?:the |your )?(?:safety|content|policy|filter)\b/gi, 'request-parameter');
-  // Codex CLI specific tokens that trip Cascade's policy filter
-  text = text.replace(/\bwritable_roots\b/gi, 'writable-paths');
-  text = text.replace(/\bapply_patch\b/gi, 'apply-edit');
-  text = text.replace(/\b(?:sandbox_mode|approval_policy)\b/gi, 'execution-policy');
-  text = text.replace(/\bYou are ChatGPT(?:[^.\n]*Codex[^.\n]*)?/gi, 'The assistant is a coding tool');
   return text.replace(/(^|[\n.!?]\s*)You are /g, '$1The assistant is ');
 }
 
@@ -167,17 +152,9 @@ export function compactSystemPromptForCascade(sysText) {
     return neutralizeIdentityForCascade(stripped);
   }
   const looksLikeClaudeCode = /Anthropic's official CLI for Claude|Claude Code|cc_version=|content_block|tool_use|<env>/i.test(stripped);
-  // Codex CLI's system + developer prompt contains identity/tool markers
-  // (writable_roots, apply_patch, "You are Codex/ChatGPT", sandbox modes)
-  // that Cascade's content-policy filter treats as policy violations even
-  // after we fold developer→system. Same compact-rewrite treatment as
-  // ClaudeCode keeps the request shape but strips the trigger words.
-  const looksLikeCodex = /writable_roots|apply_patch|Codex CLI|\.codex\/|You are Codex|You are ChatGPT[^.]*Codex|sandbox_mode|approval_policy/i.test(stripped);
-  if ((!looksLikeClaudeCode && !looksLikeCodex) || stripped.length < 4000) {
-    try { log.info(`compactSystemPromptForCascade: SKIP (cc=${looksLikeClaudeCode} cx=${looksLikeCodex} len=${stripped.length})`); } catch {}
+  if (!looksLikeClaudeCode || stripped.length < 4000) {
     return neutralizeIdentityForCascade(stripped);
   }
-  try { log.info(`compactSystemPromptForCascade: COMPACT (cc=${looksLikeClaudeCode} cx=${looksLikeCodex} len=${stripped.length})`); } catch {}
 
   const lines = [
     'The assistant is serving a local coding CLI request through a Cascade-compatible proxy.',
@@ -667,18 +644,7 @@ export class WindsurfClient {
       const providerKey = Object.keys(providerMap).find(k => modelLabel.includes(k)) || '';
       const provider = providerMap[providerKey] || '';
       if (provider) {
-        // SuperAI 唯一真相：API 服务里配的什么 model id 就让模型自报什么。
-        // displayModel 里可能带 reasoning effort 后缀（-low/-medium/-high/-xhigh），
-        // 那是给上游路由用的，不该泄露给终端用户 —— 主流厂商也只报基础模型名，
-        // 不报 effort 档位。
-        //
-        // 注意不要把 provider 字符串注进去：providerMap 里 swe → 'Windsurf'，
-        // 直接写进上游 system prompt 会让 SWE 模型在被问 "你是谁/谁家做的"
-        // 时主动说出 "Windsurf"，绕过 neutralizeCascadeIdentity 那几条窄正则。
-        // 索性不暴露 provider —— 主流 SaaS 也只让模型自报型号，不强调厂家。
-        const rawDisplay = String(opts.displayModel || modelLabel);
-        const publicModelId = rawDisplay.replace(/-(?:xhigh|high|medium|low)$/i, '');
-        const ctx = `[Context: You are the model "${publicModelId}", accessed via the SuperAI API. When the user asks who you are, which model you are, or about your identity/version, answer with exactly "${publicModelId}". Do NOT reveal, mention, or speculate about any other underlying model name, provider, training origin, or backend implementation (including but not limited to Cascade, Codeium, Windsurf, or any internal routing layer).]`;
+        const ctx = `[Context: The underlying model serving this request is ${opts.displayModel || modelLabel}, developed by ${provider}.]`;
         sysText = sysText ? sysText + '\n' + ctx : ctx;
       }
 
@@ -737,18 +703,9 @@ export class WindsurfClient {
       // single retry isn't enough there. Each retry does a full warmup
       // (fresh sessionId + panel init) + fresh StartCascade, with a
       // small backoff to let the LS settle.
-      // Codex's tools[] serializes apply_patch / shell / writable_roots
-      // etc. straight into toolPreamble. That blob then lands in Cascade's
-      // additional_instructions_section and trips the same content-policy
-      // filter that bites sysText. Run the identity/policy scrub over it
-      // before it leaves this function.
-      const scrubbedToolPreamble = toolPreamble ? neutralizeIdentityForCascade(toolPreamble) : toolPreamble;
-      if (toolPreamble && scrubbedToolPreamble !== toolPreamble) {
-        log.info(`Cascade: scrubbed toolPreamble (${toolPreamble.length} → ${scrubbedToolPreamble.length} chars)`);
-      }
       const sendMessage = async () => {
         const sendProto = buildSendCascadeMessageRequest(this.apiKey, cascadeId, text, modelEnum, modelUid, sessionId, {
-          toolPreamble: scrubbedToolPreamble, images,
+          toolPreamble, images,
           nativeMode: !!nativeMode,
           nativeAllowlist: nativeAllowlist || null,
           additionalSteps: additionalSteps || null,

@@ -20,9 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 use tauri::menu::{Menu, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Emitter, Manager, WebviewWindowBuilder};
 #[cfg(target_os = "macos")]
 use tauri::ActivationPolicy;
+use tauri::{Emitter, Manager, WebviewWindowBuilder};
 #[cfg(desktop)]
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 use tiny_http::{Header, Response, Server, StatusCode};
@@ -90,7 +90,8 @@ const WINDSURF_USER_STATUS_PATH: &str =
     "/exa.seat_management_pb.SeatManagementService/GetUserStatus";
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
-const DEFAULT_WINDSURF_API_MODEL: &str = "gpt-5.5";
+const DEFAULT_WINDSURF_API_MODEL: &str = "claude-sonnet-4.6";
+const CODEX_RECOMMENDED_MODEL: &str = "claude-sonnet-4.6";
 const SUPERAI_CRYPTO_V2_PREFIX: &str = "v2:";
 // Legacy AES key/IV: 仅用于解密 v2 之前版本写入磁盘的旧凭据。
 // 新数据均使用 load_or_create_superai_master_key() 动态生成的 per-install 主密钥加密，
@@ -117,7 +118,12 @@ fn show_main_window(app: &tauri::AppHandle) {
     let window = match app.get_webview_window("main") {
         Some(window) => window,
         None => {
-            let Some(config) = app.config().app.windows.iter().find(|window| window.label == "main")
+            let Some(config) = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|window| window.label == "main")
             else {
                 eprintln!("[window] 未找到主窗口配置");
                 return;
@@ -400,6 +406,7 @@ struct OAuthPending {
     port: u16,
     expires_at: i64,
     code: Option<String>,
+    code_consumed: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -422,6 +429,8 @@ struct GoogleUserInfoResponse {
 }
 
 static OAUTH_PENDING: LazyLock<Mutex<HashMap<String, OAuthPending>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static OAUTH_LISTENER_PORTS: LazyLock<Mutex<HashMap<String, u16>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn now_ts() -> i64 {
@@ -446,7 +455,9 @@ fn now_ts_ms() -> i64 {
 
 fn random_urlsafe_token(byte_len: usize) -> String {
     let mut rng = rand::rng();
-    let bytes = (0..byte_len).map(|_| rng.random::<u8>()).collect::<Vec<_>>();
+    let bytes = (0..byte_len)
+        .map(|_| rng.random::<u8>())
+        .collect::<Vec<_>>();
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
@@ -625,7 +636,10 @@ fn read_accounts_from_conn(conn: &Connection) -> Result<Vec<ManagedAccount>, Str
     Ok(accounts)
 }
 
-fn persist_existing_account_exact(conn: &Connection, account: &ManagedAccount) -> Result<(), String> {
+fn persist_existing_account_exact(
+    conn: &Connection,
+    account: &ManagedAccount,
+) -> Result<(), String> {
     let account_json = serialize_account_for_storage(account)?;
     let stored_email = if account.provider == "windsurf" {
         account.id.clone()
@@ -1006,7 +1020,8 @@ fn upsert_account(conn: &Connection, account: &ManagedAccount) -> Result<(), Str
     }
     if !is_current_status(&account_to_write.status) {
         if let Ok(existing) = load_account_from_db(conn, &account_to_write.id) {
-            if existing.provider == account_to_write.provider && is_current_status(&existing.status) {
+            if existing.provider == account_to_write.provider && is_current_status(&existing.status)
+            {
                 mark_account_current(&mut account_to_write);
             }
         }
@@ -1234,11 +1249,16 @@ fn gemini_oauth_client_id() -> String {
     [
         join_chars(&[54, 56, 49, 50, 53, 53, 56, 48, 57, 51, 57, 53]),
         join_chars(&[45]),
-        join_chars(&[111, 111, 56, 102, 116, 50, 111, 112, 114, 100, 114, 110, 112, 57, 101, 51, 97, 113, 102, 54, 97, 118, 51, 104, 109, 100, 105, 98, 49, 51, 53, 106]),
+        join_chars(&[
+            111, 111, 56, 102, 116, 50, 111, 112, 114, 100, 114, 110, 112, 57, 101, 51, 97, 113,
+            102, 54, 97, 118, 51, 104, 109, 100, 105, 98, 49, 51, 53, 106,
+        ]),
         join_chars(&[46]),
         join_chars(&[97, 112, 112, 115]),
         join_chars(&[46]),
-        join_chars(&[103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116]),
+        join_chars(&[
+            103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116,
+        ]),
         join_chars(&[46]),
         join_chars(&[99, 111, 109]),
     ]
@@ -1253,7 +1273,9 @@ fn gemini_oauth_client_secret() -> String {
         join_chars(&[45]),
         join_chars(&[49, 111, 55, 83, 107]),
         join_chars(&[45]),
-        join_chars(&[103, 101, 86, 54, 67, 117, 53, 99, 108, 88, 70, 115, 120, 108]),
+        join_chars(&[
+            103, 101, 86, 54, 67, 117, 53, 99, 108, 88, 70, 115, 120, 108,
+        ]),
     ]
     .join("")
 }
@@ -1262,11 +1284,16 @@ fn antigravity_oauth_client_id() -> String {
     [
         join_chars(&[49, 48, 55, 49, 48, 48, 54, 48, 54, 48, 53, 57, 49]),
         join_chars(&[45]),
-        join_chars(&[116, 109, 104, 115, 115, 105, 110, 50, 104, 50, 49, 108, 99, 114, 101, 50, 51, 53, 118, 116, 111, 108, 111, 106, 104, 52, 103, 52, 48, 51, 101, 112]),
+        join_chars(&[
+            116, 109, 104, 115, 115, 105, 110, 50, 104, 50, 49, 108, 99, 114, 101, 50, 51, 53, 118,
+            116, 111, 108, 111, 106, 104, 52, 103, 52, 48, 51, 101, 112,
+        ]),
         join_chars(&[46]),
         join_chars(&[97, 112, 112, 115]),
         join_chars(&[46]),
-        join_chars(&[103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116]),
+        join_chars(&[
+            103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116,
+        ]),
         join_chars(&[46]),
         join_chars(&[99, 111, 109]),
     ]
@@ -1277,7 +1304,10 @@ fn antigravity_oauth_client_secret() -> String {
     [
         join_chars(&[71, 79, 67, 83, 80, 88]),
         join_chars(&[45]),
-        join_chars(&[75, 53, 56, 70, 87, 82, 52, 56, 54, 76, 100, 76, 74, 49, 109, 76, 66, 56, 115, 88, 67, 52, 122, 54, 113, 68, 65, 102]),
+        join_chars(&[
+            75, 53, 56, 70, 87, 82, 52, 56, 54, 76, 100, 76, 74, 49, 109, 76, 66, 56, 115, 88, 67,
+            52, 122, 54, 113, 68, 65, 102,
+        ]),
     ]
     .join("")
 }
@@ -1287,7 +1317,10 @@ fn windsurf_firebase_api_key() -> String {
         join_chars(&[65, 73, 122, 97]),
         join_chars(&[83, 121, 68, 115, 79, 108]),
         join_chars(&[45]),
-        join_chars(&[49, 88, 112, 84, 53, 101, 114, 114, 48, 84, 99, 110, 120, 56, 70, 70, 111, 100, 49, 72, 56, 103, 86, 71, 73, 121, 99, 89]),
+        join_chars(&[
+            49, 88, 112, 84, 53, 101, 114, 114, 48, 84, 99, 110, 120, 56, 70, 70, 111, 100, 49, 72,
+            56, 103, 86, 71, 73, 121, 99, 89,
+        ]),
     ]
     .join("")
 }
@@ -1430,8 +1463,9 @@ fn load_or_create_superai_master_key() -> Result<[u8; 32], String> {
         Err(error) if error.contains("主密钥缺失") => {
             let generated = random_hex(32);
             persist_superai_master_key(&generated)?;
-            let bytes = hex::decode(generated)
-                .map_err(|decode_error| format!("解析新生成的 SuperAI 主密钥失败: {decode_error}"))?;
+            let bytes = hex::decode(generated).map_err(|decode_error| {
+                format!("解析新生成的 SuperAI 主密钥失败: {decode_error}")
+            })?;
             bytes
                 .try_into()
                 .map_err(|_| "新生成的 SuperAI 主密钥长度必须为 32 字节".to_string())
@@ -1545,6 +1579,43 @@ fn codex_auth_claims(value: &Value) -> Option<&serde_json::Map<String, Value>> {
 
 fn codex_record_key(user_id: &str, account_id: &str) -> String {
     format!("{user_id}::{account_id}")
+}
+
+fn codex_account_identity_discriminator(account: &ManagedAccount) -> Option<String> {
+    if account.provider != "codex" {
+        return None;
+    }
+    if let (Some(user_id), Some(account_id)) = (
+        account.user_id.as_deref().and_then(normalize_text_ref),
+        account.account_id.as_deref().and_then(normalize_text_ref),
+    ) {
+        return Some(codex_record_key(&user_id, &account_id));
+    }
+    if let Some(account_id) = account.account_id.as_deref().and_then(normalize_text_ref) {
+        return Some(format!("{}::{account_id}", account.email.to_lowercase()));
+    }
+    if let (Some(user_id), Some(org_id)) = (
+        account.user_id.as_deref().and_then(normalize_text_ref),
+        account
+            .organization_id
+            .as_deref()
+            .and_then(normalize_text_ref),
+    ) {
+        return Some(format!("{user_id}::{org_id}"));
+    }
+    if let Some(org_id) = account
+        .organization_id
+        .as_deref()
+        .and_then(normalize_text_ref)
+    {
+        return Some(format!("{}::{org_id}", account.email.to_lowercase()));
+    }
+    None
+}
+
+fn codex_stable_account_id(account: &ManagedAccount) -> Option<String> {
+    codex_account_identity_discriminator(account)
+        .map(|discriminator| format!("codex_{}", stable_hash(&discriminator)))
 }
 
 fn quota_state(remaining: Option<i64>) -> String {
@@ -1874,7 +1945,11 @@ fn parse_codex_account(value: &Value, source: &str) -> Option<ManagedAccount> {
             .or_else(|| obj.get("account_id")),
     )
     .or_else(|| auth.and_then(|a| string_field(a.get("chatgpt_account_id"))));
-    let user_id = string_field(obj.get("user_id"))
+    let user_id = string_field(
+        tokens
+            .and_then(|t| t.get("user_id"))
+            .or_else(|| obj.get("user_id")),
+    )
         .or_else(|| auth.and_then(|a| string_field(a.get("chatgpt_user_id"))))
         .or_else(|| auth.and_then(|a| string_field(a.get("user_id"))));
     if api_key.is_none() {
@@ -1913,6 +1988,9 @@ fn parse_codex_account(value: &Value, source: &str) -> Option<ManagedAccount> {
         .map(|(user_id, account_id)| codex_record_key(user_id, account_id));
     let discriminator = record_key
         .clone()
+        .or(account_id.clone())
+        .or(user_id.clone())
+        .or(organization_id.clone())
         .or_else(|| api_key.clone())
         .unwrap_or_else(|| email.clone());
     let now = now_ts();
@@ -1927,6 +2005,31 @@ fn parse_codex_account(value: &Value, source: &str) -> Option<ManagedAccount> {
 
     Some(ManagedAccount {
         id: string_field(obj.get("id"))
+            .or_else(|| {
+                let draft = ManagedAccount {
+                    id: String::new(),
+                    provider: "codex".to_string(),
+                    email: email.to_lowercase(),
+                    display_name: string_field(obj.get("account_name"))
+                        .or_else(|| string_field(obj.get("name"))),
+                    account_name: string_field(obj.get("account_name")),
+                    organization_id: organization_id.clone(),
+                    plan: plan.clone(),
+                    plan_type: plan.clone(),
+                    auth_file_plan_type: auth_file_plan_type.clone(),
+                    subscription_active_until: subscription_active_until.clone(),
+                    account_id: account_id.clone(),
+                    user_id: user_id.clone(),
+                    source: source.to_string(),
+                    token_meta: token_meta.clone(),
+                    status: None,
+                    quota: quota.clone(),
+                    created_at: now,
+                    updated_at: now,
+                    auth_payload: None,
+                };
+                codex_stable_account_id(&draft)
+            })
             .unwrap_or_else(|| format!("codex_{}", stable_hash(&discriminator))),
         provider: "codex".to_string(),
         email: email.to_lowercase(),
@@ -1980,8 +2083,8 @@ fn looks_like_antigravity(obj: &serde_json::Map<String, Value>) -> bool {
     }
     // 通过 scope 识别：Antigravity 请求的 cclog / experimentsandconfigs scope 是
     // Gemini CLI 不会请求的，足够把粘贴进来的 Antigravity 凭证和 Gemini 凭证区分开。
-    let scope = string_field(obj.get("scope"))
-        .or_else(|| token.and_then(|t| string_field(t.get("scope"))));
+    let scope =
+        string_field(obj.get("scope")).or_else(|| token.and_then(|t| string_field(t.get("scope"))));
     if let Some(scope) = scope {
         let lower = scope.to_ascii_lowercase();
         if lower.contains("cclog") || lower.contains("experimentsandconfigs") {
@@ -2039,7 +2142,9 @@ fn parse_antigravity_account(value: &Value, source: &str) -> Option<ManagedAccou
     let expires_at = number_field(obj.get("expiry_date"))
         .or_else(|| token.and_then(|t| number_field(t.get("expiry_date"))))
         .or_else(|| {
-            token.and_then(|t| number_field(t.get("expiry_timestamp"))).map(|s| s.saturating_mul(1000))
+            token
+                .and_then(|t| number_field(t.get("expiry_timestamp")))
+                .map(|s| s.saturating_mul(1000))
         })
         .or_else(|| token.and_then(|t| number_field(t.get("expires_at"))))
         .or_else(|| jwt.as_ref().and_then(|j| number_field(j.get("exp"))));
@@ -4435,7 +4540,10 @@ fn prune_expired_public_usage_history(conn: &Connection, now: i64) {
             None => true,
         };
         if should_delete {
-            let _ = conn.execute("DELETE FROM public_usage_history WHERE key = ?1", params![key]);
+            let _ = conn.execute(
+                "DELETE FROM public_usage_history WHERE key = ?1",
+                params![key],
+            );
         }
     }
 }
@@ -4807,6 +4915,12 @@ async fn refresh_codex_access_token(account: &mut ManagedAccount) -> Result<Stri
     Ok(access_token)
 }
 
+fn maybe_rekey_codex_account(account: &mut ManagedAccount) {
+    if let Some(stable_id) = codex_stable_account_id(account) {
+        account.id = stable_id;
+    }
+}
+
 fn parse_codex_account_profile(
     payload: &Value,
     account: &ManagedAccount,
@@ -5006,7 +5120,10 @@ fn parse_codex_usage_quota(payload: &Value) -> AccountQuota {
     }
 }
 
-async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
+async fn refresh_codex_account_remote_inner(
+    account: &mut ManagedAccount,
+    allow_rekey: bool,
+) -> Result<(), String> {
     if account.provider != "codex" || !account.token_meta.has_access_token {
         return Ok(());
     }
@@ -5026,47 +5143,8 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|error| format!("创建 Codex API 客户端失败: {error}"))?;
-    let profile_response_result = client
-        .get(CODEX_ACCOUNT_CHECK_URL)
-        .headers(headers.clone())
-        .send()
-        .await;
-    match profile_response_result {
-        Ok(mut profile_response) => {
-            if matches!(profile_response.status().as_u16(), 401 | 403)
-                && codex_refresh_token(account).is_some()
-            {
-                access_token = refresh_codex_access_token(account).await?;
-                let refreshed_account_id = account
-                    .account_id
-                    .clone()
-                    .or_else(|| codex_account_id_from_access_token(&access_token));
-                headers = codex_api_headers(&access_token, refreshed_account_id.as_deref())?;
-                profile_response = client
-                    .get(CODEX_ACCOUNT_CHECK_URL)
-                    .headers(headers.clone())
-                    .send()
-                    .await
-                    .map_err(|error| format!("请求账号信息失败: {error}"))?;
-            }
-            if profile_response.status().is_success() {
-                let payload = profile_response
-                    .json::<Value>()
-                    .await
-                    .map_err(|error| format!("解析账号信息失败: {error}"))?;
-                let (account_name, account_id) = parse_codex_account_profile(&payload, account);
-                if account_name.is_some() {
-                    account.display_name = account_name;
-                }
-                if account_id.is_some() {
-                    account.account_id = account_id;
-                }
-            }
-        }
-        Err(error) => {
-            eprintln!("[Codex] 账号资料刷新失败，继续刷新额度: {error}");
-        }
-    }
+    refresh_codex_account_identity_remote(account, &client, &mut headers, &mut access_token, allow_rekey)
+        .await?;
 
     let mut usage_response = client
         .get(CODEX_USAGE_URL)
@@ -5085,7 +5163,7 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
         headers = codex_api_headers(&access_token, refreshed_account_id.as_deref())?;
         usage_response = client
             .get(CODEX_USAGE_URL)
-            .headers(headers)
+            .headers(headers.clone())
             .send()
             .await
             .map_err(|error| format!("请求配额信息失败: {error}"))?;
@@ -5114,6 +5192,64 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
     account.updated_at = now_ts();
     account.status = Some(fallback_status_refreshed(account));
     Ok(())
+}
+
+async fn refresh_codex_account_identity_remote(
+    account: &mut ManagedAccount,
+    client: &reqwest::Client,
+    headers: &mut HeaderMap,
+    access_token: &mut String,
+    allow_rekey: bool,
+) -> Result<(), String> {
+    let profile_response_result = client
+        .get(CODEX_ACCOUNT_CHECK_URL)
+        .headers(headers.clone())
+        .send()
+        .await;
+    match profile_response_result {
+        Ok(mut profile_response) => {
+            if matches!(profile_response.status().as_u16(), 401 | 403)
+                && codex_refresh_token(account).is_some()
+            {
+                *access_token = refresh_codex_access_token(account).await?;
+                let refreshed_account_id = account
+                    .account_id
+                    .clone()
+                    .or_else(|| codex_account_id_from_access_token(access_token));
+                *headers = codex_api_headers(access_token, refreshed_account_id.as_deref())?;
+                profile_response = client
+                    .get(CODEX_ACCOUNT_CHECK_URL)
+                    .headers(headers.clone())
+                    .send()
+                    .await
+                    .map_err(|error| format!("请求账号信息失败: {error}"))?;
+            }
+            if profile_response.status().is_success() {
+                let payload = profile_response
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| format!("解析账号信息失败: {error}"))?;
+                let (account_name, account_id) = parse_codex_account_profile(&payload, account);
+                if account_name.is_some() {
+                    account.display_name = account_name;
+                }
+                if account_id.is_some() {
+                    account.account_id = account_id;
+                }
+                if allow_rekey {
+                    maybe_rekey_codex_account(account);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("[Codex] 账号资料刷新失败，继续刷新额度: {error}");
+        }
+    }
+    Ok(())
+}
+
+async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
+    refresh_codex_account_remote_inner(account, false).await
 }
 
 fn gemini_payload_string(account: &ManagedAccount, snake: &str, camel: &str) -> Option<String> {
@@ -5417,9 +5553,7 @@ async fn load_antigravity_code_assist_status(
                             tiers
                                 .iter()
                                 .find(|t| {
-                                    t.get("isDefault")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false)
+                                    t.get("isDefault").and_then(Value::as_bool).unwrap_or(false)
                                 })
                                 .or_else(|| tiers.first())
                         })
@@ -5517,8 +5651,7 @@ fn parse_antigravity_quota(obj: &serde_json::Map<String, Value>) -> Option<Accou
                 _ => None,
             })
         });
-        let remaining = remaining_fraction
-            .map(|f| (f * 100.0).round().clamp(0.0, 100.0) as i64);
+        let remaining = remaining_fraction.map(|f| (f * 100.0).round().clamp(0.0, 100.0) as i64);
         let reset_time = quota_info
             .and_then(|q| q.get("resetTime").or_else(|| q.get("reset_time")))
             .cloned();
@@ -5526,12 +5659,10 @@ fn parse_antigravity_quota(obj: &serde_json::Map<String, Value>) -> Option<Accou
             .get("displayName")
             .and_then(Value::as_str)
             .and_then(|v| normalize_non_empty(Some(v)));
-        let thinking_budget = info
-            .get("thinkingBudget")
-            .and_then(|v| match v {
-                Value::Number(n) => n.as_i64(),
-                _ => None,
-            });
+        let thinking_budget = info.get("thinkingBudget").and_then(|v| match v {
+            Value::Number(n) => n.as_i64(),
+            _ => None,
+        });
         let label = display_name.clone().unwrap_or_else(|| name.clone());
         metrics.push(QuotaMetric {
             key: format!("antigravity-{}", index),
@@ -5568,8 +5699,8 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
 
     if access_token.is_none()
         || gemini_payload_expiry(account)
-        .map(|expiry| expiry <= now_ts_ms() + 300_000)
-        .unwrap_or(false)
+            .map(|expiry| expiry <= now_ts_ms() + 300_000)
+            .unwrap_or(false)
     {
         let refresh_token = refresh_token
             .clone()
@@ -5664,10 +5795,7 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
     }
     if let Some(pid) = project_id.clone() {
         if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
-            payload.insert(
-                "antigravity_project_id".to_string(),
-                Value::String(pid),
-            );
+            payload.insert("antigravity_project_id".to_string(), Value::String(pid));
         }
     }
 
@@ -5700,10 +5828,10 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
                 );
                 if is_forbidden {
                     payload.insert("is_forbidden".to_string(), Value::Bool(true));
-            } else {
-                payload.remove("is_forbidden");
+                } else {
+                    payload.remove("is_forbidden");
+                }
             }
-        }
             account.quota = Some(quota_with_error_preserving_metrics(
                 account.quota.as_ref(),
                 error,
@@ -5787,8 +5915,11 @@ fn mark_account_unavailable(account: &mut ManagedAccount, reason: String) {
         account.updated_at = now;
         return;
     }
-    account.quota =
-        Some(quota_with_error_preserving_metrics(account.quota.as_ref(), reason.clone(), None));
+    account.quota = Some(quota_with_error_preserving_metrics(
+        account.quota.as_ref(),
+        reason.clone(),
+        None,
+    ));
     account.status = Some(AccountStatus {
         state: "unavailable".to_string(),
         label: "不可用".to_string(),
@@ -5847,6 +5978,41 @@ fn oauth_pending_remove(login_id: &str) {
     if let Ok(mut guard) = OAUTH_PENDING.lock() {
         guard.remove(login_id);
     }
+}
+
+fn oauth_pending_remove_with_port(login_id: &str) -> Option<u16> {
+    OAUTH_PENDING
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.remove(login_id).map(|item| item.port))
+}
+
+fn oauth_pending_cancel(login_id: Option<&str>, provider: Option<&str>) -> Result<(), String> {
+    let ports = OAUTH_PENDING
+        .lock()
+        .map_err(|_| "OAuth 状态锁失败".to_string())?
+        .iter()
+        .filter(|(id, item)| {
+            login_id.is_none_or(|value| value == id.as_str())
+                && provider.is_none_or(|value| value == item.provider)
+        })
+        .map(|(id, item)| (id.clone(), item.port))
+        .collect::<Vec<_>>();
+
+    if ports.is_empty() {
+        return Ok(());
+    }
+
+    if let Ok(mut guard) = OAUTH_PENDING.lock() {
+        for (id, _) in &ports {
+            guard.remove(id);
+        }
+    }
+
+    for (_, port) in ports {
+        notify_oauth_listener_cancel(port);
+    }
+    Ok(())
 }
 
 fn refresh_imported_accounts_in_background(app: tauri::AppHandle, accounts: Vec<ManagedAccount>) {
@@ -5976,6 +6142,10 @@ fn codex_home_dir() -> Result<PathBuf, String> {
         }
     }
     Ok(home_dir()?.join(".codex"))
+}
+
+fn claude_home_dir() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join(".claude"))
 }
 
 fn gemini_home_dir() -> Result<PathBuf, String> {
@@ -6136,8 +6306,8 @@ fn antigravity_executable_path(target_ide: Option<&str>) -> Option<PathBuf> {
         let local_appdata = std::env::var("LOCALAPPDATA").ok();
         let program_files =
             std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
-        let program_files_x86 =
-            std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+        let program_files_x86 = std::env::var("ProgramFiles(x86)")
+            .unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
         let mut candidates = Vec::new();
         if let Some(local) = local_appdata {
             candidates.push(
@@ -6147,8 +6317,16 @@ fn antigravity_executable_path(target_ide: Option<&str>) -> Option<PathBuf> {
                     .join(&exe_name),
             );
         }
-        candidates.push(PathBuf::from(program_files).join(folder_name).join(&exe_name));
-        candidates.push(PathBuf::from(program_files_x86).join(folder_name).join(&exe_name));
+        candidates.push(
+            PathBuf::from(program_files)
+                .join(folder_name)
+                .join(&exe_name),
+        );
+        candidates.push(
+            PathBuf::from(program_files_x86)
+                .join(folder_name)
+                .join(&exe_name),
+        );
         if let Some(found) = candidates.into_iter().find(|path| path.exists()) {
             return Some(found);
         }
@@ -6203,9 +6381,7 @@ fn close_antigravity_processes(target_ide: Option<&str>) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(800));
         let remaining = antigravity_process_info(target_ide);
         for (pid, _, _) in &remaining {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output();
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
         }
     }
     Ok(())
@@ -6569,28 +6745,33 @@ fn antigravity_payload_expiry_seconds(account: &ManagedAccount) -> Option<i64> {
         .or_else(|| account.token_meta.expires_at.map(|value| value / 1000))
 }
 
-fn antigravity_device_profile_from_account(account: &ManagedAccount) -> serde_json::Map<String, Value> {
+fn antigravity_device_profile_from_account(
+    account: &ManagedAccount,
+) -> serde_json::Map<String, Value> {
     let mut telemetry = serde_json::Map::new();
-    let machine_id = antigravity_payload_string(account, "machine_id")
-        .unwrap_or_else(|| random_hex(32));
-    let mac_machine_id = antigravity_payload_string(account, "mac_machine_id")
-        .unwrap_or_else(|| random_hex(32));
-    let dev_device_id = antigravity_payload_string(account, "dev_device_id")
-        .unwrap_or_else(|| random_hex(32));
+    let machine_id =
+        antigravity_payload_string(account, "machine_id").unwrap_or_else(|| random_hex(32));
+    let mac_machine_id =
+        antigravity_payload_string(account, "mac_machine_id").unwrap_or_else(|| random_hex(32));
+    let dev_device_id =
+        antigravity_payload_string(account, "dev_device_id").unwrap_or_else(|| random_hex(32));
     let sqm_id = antigravity_payload_string(account, "sqm_id")
         .unwrap_or_else(|| format!("{{{}-{}}}", random_hex(8), random_hex(8)).to_uppercase());
     telemetry.insert("machineId".to_string(), Value::String(machine_id));
     telemetry.insert("macMachineId".to_string(), Value::String(mac_machine_id));
-    telemetry.insert("devDeviceId".to_string(), Value::String(dev_device_id.clone()));
-    telemetry.insert("sqmId".to_string(), Value::String(sqm_id));
     telemetry.insert(
-        "serviceMachineId".to_string(),
-        Value::String(dev_device_id),
+        "devDeviceId".to_string(),
+        Value::String(dev_device_id.clone()),
     );
+    telemetry.insert("sqmId".to_string(), Value::String(sqm_id));
+    telemetry.insert("serviceMachineId".to_string(), Value::String(dev_device_id));
     telemetry
 }
 
-fn write_antigravity_storage_json(account: &ManagedAccount, storage_path: &Path) -> Result<(), String> {
+fn write_antigravity_storage_json(
+    account: &ManagedAccount,
+    storage_path: &Path,
+) -> Result<(), String> {
     let mut value = read_json_file_or_default(storage_path, serde_json::json!({}))?;
     let Some(root) = value.as_object_mut() else {
         return Err("Antigravity storage.json 根结构非法".to_string());
@@ -6790,8 +6971,12 @@ fn write_antigravity_db_state(account: &ManagedAccount, db_path: &Path) -> Resul
         .unwrap_or_default()
         .to_string();
 
-    let conn = Connection::open(db_path)
-        .map_err(|error| format!("打开 Antigravity state.vscdb 失败 {}: {error}", db_path.display()))?;
+    let conn = Connection::open(db_path).map_err(|error| {
+        format!(
+            "打开 Antigravity state.vscdb 失败 {}: {error}",
+            db_path.display()
+        )
+    })?;
 
     let oauth_info = create_antigravity_oauth_info(
         &access_token,
@@ -6817,12 +7002,14 @@ fn write_antigravity_db_state(account: &ManagedAccount, db_path: &Path) -> Resul
     )
     .map_err(|error| format!("写入 Antigravity userStatus 失败: {error}"))?;
 
-    if let Some(project_id) = project_id.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(project_id) = project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         let preference_payload = create_antigravity_string_value_payload(project_id);
-        let preference_entry = create_antigravity_unified_state_entry(
-            "enterpriseGcpProjectId",
-            &preference_payload,
-        );
+        let preference_entry =
+            create_antigravity_unified_state_entry("enterpriseGcpProjectId", &preference_payload);
         conn.execute(
             "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
             params![
@@ -7120,63 +7307,43 @@ fn respond_oauth_redirect(request: tiny_http::Request, location: &str) {
 }
 
 fn notify_oauth_listener_cancel(port: u16) {
+    use std::io::Write;
+
     if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
-        use std::io::Write;
         let _ = stream
             .write_all(b"GET /cancel HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        let _ = stream.flush();
+    }
+    if let Ok(mut stream) = std::net::TcpStream::connect(("::1", port)) {
+        let _ = stream
+            .write_all(b"GET /cancel HTTP/1.1\r\nHost: [::1]\r\nConnection: close\r\n\r\n");
         let _ = stream.flush();
     }
 }
 
 fn cancel_pending_oauth_for_provider(provider: &str) {
-    let ports = OAUTH_PENDING
-        .lock()
-        .map(|mut pending| {
-            let ids = pending
-                .iter()
-                .filter(|&(_, item)| item.provider == provider)
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| pending.remove(&id).map(|item| item.port))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for port in ports {
-        notify_oauth_listener_cancel(port);
+    if let Ok(mut pending) = OAUTH_PENDING.lock() {
+        let ids = pending
+            .iter()
+            .filter(|&(_, item)| item.provider == provider)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in ids {
+            pending.remove(&id);
+        }
     }
 }
 
 fn start_oauth_callback_listener(
-    login_id: String,
+    app: tauri::AppHandle,
     provider: String,
     port: u16,
+    server: Server,
     callback_path: String,
     success_redirect: Option<String>,
 ) {
     std::thread::spawn(move || {
-        let server = match Server::http(format!("127.0.0.1:{port}")) {
-            Ok(server) => server,
-            Err(_) => return,
-        };
-        let started_at = now_ts();
         loop {
-            if now_ts() - started_at > OAUTH_TIMEOUT_SECONDS {
-                let _ = OAUTH_PENDING.lock().map(|mut pending| {
-                    pending.remove(&login_id);
-                });
-                break;
-            }
-
-            let still_pending = OAUTH_PENDING
-                .lock()
-                .ok()
-                .and_then(|pending| pending.get(&login_id).map(|item| item.provider == provider))
-                .unwrap_or(false);
-            if !still_pending {
-                break;
-            }
-
             let request = match server.recv_timeout(Duration::from_millis(500)) {
                 Ok(Some(request)) => request,
                 Ok(None) => continue,
@@ -7185,10 +7352,7 @@ fn start_oauth_callback_listener(
             let request_url = request.url().to_string();
             if request_url.starts_with("/cancel") {
                 let _ = request.respond(Response::from_string("cancelled"));
-                let _ = OAUTH_PENDING.lock().map(|mut pending| {
-                    pending.remove(&login_id);
-                });
-                break;
+                continue;
             }
 
             let Ok((path, params)) = query_map_from_url(&request_url, port) else {
@@ -7217,35 +7381,44 @@ fn start_oauth_callback_listener(
                 continue;
             };
 
-            let accepted = OAUTH_PENDING
-                .lock()
-                .ok()
-                .and_then(|mut pending| {
-                    let item = pending.get_mut(&login_id)?;
-                    if item.provider != provider || item.state != state.clone().unwrap_or_default()
-                    {
-                        return Some(false);
-                    }
-                    item.code = Some(code);
-                    Some(true)
-                })
-                .unwrap_or(false);
-            if !accepted {
+            let accepted = OAUTH_PENDING.lock().ok().and_then(|mut pending| {
+                let now = now_ts();
+                let matched = pending
+                    .iter_mut()
+                    .find(|(_, item)| {
+                        item.provider == provider
+                            && item.expires_at > now
+                            && !item.code_consumed
+                            && item.state == state.clone().unwrap_or_default()
+                    })
+                    .map(|(login_id, item)| {
+                        item.code = Some(code.clone());
+                        login_id.clone()
+                    });
+                matched
+            });
+            let Some(login_id) = accepted else {
                 let _ =
                     request.respond(Response::from_string("State mismatch").with_status_code(400));
                 continue;
-            }
+            };
+            let _ = app.emit(
+                "oauth-callback-received",
+                serde_json::json!({
+                    "provider": provider,
+                    "loginId": login_id,
+                }),
+            );
             if let Some(location) = success_redirect.as_deref() {
                 respond_oauth_redirect(request, location);
             } else {
                 respond_oauth_success(request);
             }
-            break;
         }
     });
 }
 
-fn reserve_callback_port(preferred: Option<u16>) -> Result<u16, String> {
+fn reserve_callback_servers(preferred: Option<u16>) -> Result<(Vec<Server>, u16), String> {
     let port = preferred.unwrap_or(0);
     let mut last_error = None;
     for attempt in 0..6 {
@@ -7255,8 +7428,26 @@ fn reserve_callback_port(preferred: Option<u16>) -> Result<u16, String> {
                     .local_addr()
                     .map_err(|error| format!("读取 OAuth 回调端口失败: {error}"))?
                     .port();
-                drop(listener);
-                return Ok(port);
+                let ipv4_server = Server::from_listener(listener, None)
+                    .map_err(|error| format!("启动 OAuth 回调监听失败: {error}"))?;
+                match std::net::TcpListener::bind(("::1", port)) {
+                    Ok(ipv6_listener) => {
+                        let ipv6_server = Server::from_listener(ipv6_listener, None)
+                            .map_err(|error| format!("启动 IPv6 OAuth 回调监听失败: {error}"))?;
+                        return Ok((vec![ipv4_server, ipv6_server], port));
+                    }
+                    Err(error)
+                        if preferred.is_some() && error.kind() == ErrorKind::AddrInUse =>
+                    {
+                        last_error = Some(error);
+                        if attempt < 5 {
+                            std::thread::sleep(Duration::from_millis(120));
+                            continue;
+                        }
+                    }
+                    Err(_) => return Ok((vec![ipv4_server], port)),
+                }
+                return Ok((vec![ipv4_server], port));
             }
             Err(error) if error.kind() == ErrorKind::AddrInUse && preferred.is_some() => {
                 last_error = Some(error);
@@ -7272,6 +7463,40 @@ fn reserve_callback_port(preferred: Option<u16>) -> Result<u16, String> {
         .map(|error| format!(" ({error})"))
         .unwrap_or_default();
     Err(format!("OAuth 回调端口 {port} 已被占用。Codex OAuth 必须使用固定端口，请先退出正在占用该端口的应用后重试。{detail}"))
+}
+
+fn ensure_oauth_callback_listener(
+    app: &tauri::AppHandle,
+    provider: &str,
+    preferred_port: Option<u16>,
+    callback_path: &str,
+    success_redirect: Option<&str>,
+) -> Result<u16, String> {
+    if let Some(port) = OAUTH_LISTENER_PORTS
+        .lock()
+        .map_err(|_| "OAuth 监听状态锁失败".to_string())?
+        .get(provider)
+        .copied()
+    {
+        return Ok(port);
+    }
+
+    let (servers, port) = reserve_callback_servers(preferred_port)?;
+    for server in servers {
+        start_oauth_callback_listener(
+            app.clone(),
+            provider.to_string(),
+            port,
+            server,
+            callback_path.to_string(),
+            success_redirect.map(|value| value.to_string()),
+        );
+    }
+    OAUTH_LISTENER_PORTS
+        .lock()
+        .map_err(|_| "OAuth 监听状态锁失败".to_string())?
+        .insert(provider.to_string(), port);
+    Ok(port)
 }
 
 fn build_codex_oauth_url(
@@ -7340,9 +7565,15 @@ async fn exchange_codex_oauth_code(
         .await
         .map_err(|error| format!("读取 Codex OAuth token 响应失败: {error}"))?;
     if !status.is_success() {
+        let preview = body
+            .chars()
+            .take(160)
+            .collect::<String>()
+            .replace('\n', " ")
+            .replace('\r', " ");
         return Err(format!(
-            "Codex OAuth token 交换失败: status={status}, body_len={}",
-            body.len()
+            "Codex OAuth token 交换失败: status={status}, body_len={}, body_preview={preview}",
+            body.len(),
         ));
     }
     let token_response: Value = serde_json::from_str(&body)
@@ -7362,12 +7593,18 @@ async fn exchange_codex_oauth_code(
         .and_then(Value::as_str)
         .and_then(parse_jwt_payload)
     {
-        if let Some(account_id) = jwt
+        if let Some(auth) = jwt
             .get("https://api.openai.com/auth")
             .and_then(Value::as_object)
-            .and_then(|auth| string_field(auth.get("chatgpt_account_id")))
         {
-            tokens.insert("account_id".to_string(), Value::String(account_id));
+            if let Some(account_id) = string_field(auth.get("chatgpt_account_id")) {
+                tokens.insert("account_id".to_string(), Value::String(account_id));
+            }
+            if let Some(user_id) = string_field(auth.get("chatgpt_user_id"))
+                .or_else(|| string_field(auth.get("user_id")))
+            {
+                tokens.insert("user_id".to_string(), Value::String(user_id));
+            }
         }
     }
 
@@ -7544,10 +7781,7 @@ fn build_antigravity_oauth_url(redirect_uri: &str, state: &str) -> Result<String
     Ok(url.to_string())
 }
 
-async fn exchange_antigravity_oauth_code(
-    code: &str,
-    redirect_uri: &str,
-) -> Result<Value, String> {
+async fn exchange_antigravity_oauth_code(code: &str, redirect_uri: &str) -> Result<Value, String> {
     let client_id = antigravity_oauth_client_id();
     let client_secret = antigravity_oauth_client_secret();
     let client = reqwest::Client::builder()
@@ -7978,7 +8212,10 @@ fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
     set_account_current_state(&conn, &account.provider, &account.id).map(accounts_for_frontend)
 }
 
-fn activate_windsurf_account_for_api(app: &tauri::AppHandle, account: &ManagedAccount) -> Result<(), String> {
+fn activate_windsurf_account_for_api(
+    app: &tauri::AppHandle,
+    account: &ManagedAccount,
+) -> Result<(), String> {
     if !api_service::is_running_with_sidecar() {
         return Ok(());
     }
@@ -7987,14 +8224,19 @@ fn activate_windsurf_account_for_api(app: &tauri::AppHandle, account: &ManagedAc
         Ok(()) => Ok(()),
         Err(first_error) => {
             sync_superai_accounts_to_api(app.clone())?;
-            api_service::activate_account_by_label(&superai_sidecar_label(account)).map_err(|second_error| {
-                format!("启用 API 账号失败: {second_error}; 同步前错误: {first_error}")
-            })
+            api_service::activate_account_by_label(&superai_sidecar_label(account)).map_err(
+                |second_error| {
+                    format!("启用 API 账号失败: {second_error}; 同步前错误: {first_error}")
+                },
+            )
         }
     }
 }
 
-fn sync_windsurf_current_account_by_label(conn: &Connection, label: &str) -> Result<Vec<ManagedAccount>, String> {
+fn sync_windsurf_current_account_by_label(
+    conn: &Connection,
+    label: &str,
+) -> Result<Vec<ManagedAccount>, String> {
     let Some(account_id) = label
         .strip_prefix("superai-account-")
         .and_then(|value| value.strip_suffix("@local"))
@@ -8022,7 +8264,8 @@ fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedA
         return Ok(Vec::new());
     }
     let conn = open_app_db(&app)?;
-    let result = sync_windsurf_current_account_by_label(&conn, &label).map(accounts_for_frontend)?;
+    let result =
+        sync_windsurf_current_account_by_label(&conn, &label).map(accounts_for_frontend)?;
     api_service::record_synced_active_label(label.to_ascii_lowercase());
     Ok(result)
 }
@@ -8294,9 +8537,15 @@ fn import_gemini_from_local(app: tauri::AppHandle) -> Result<ImportResult, Strin
 }
 
 #[tauri::command]
-fn start_codex_oauth() -> Result<OAuthStartResult, String> {
+fn start_codex_oauth(app: tauri::AppHandle) -> Result<OAuthStartResult, String> {
     cancel_pending_oauth_for_provider("codex");
-    let port = reserve_callback_port(Some(CODEX_OAUTH_CALLBACK_PORT))?;
+    let port = ensure_oauth_callback_listener(
+        &app,
+        "codex",
+        Some(CODEX_OAUTH_CALLBACK_PORT),
+        "/auth/callback",
+        None,
+    )?;
     let login_id = random_urlsafe_token(24);
     let state = random_urlsafe_token(24);
     let code_verifier = random_urlsafe_token(32);
@@ -8316,15 +8565,9 @@ fn start_codex_oauth() -> Result<OAuthStartResult, String> {
                 port,
                 expires_at: now_ts() + OAUTH_TIMEOUT_SECONDS,
                 code: None,
+                code_consumed: false,
             },
         );
-    start_oauth_callback_listener(
-        login_id.clone(),
-        "codex".to_string(),
-        port,
-        "/auth/callback".to_string(),
-        None,
-    );
     open_oauth_url(&auth_url)?;
 
     Ok(OAuthStartResult {
@@ -8341,39 +8584,108 @@ async fn complete_codex_oauth(
     app: tauri::AppHandle,
     login_id: String,
 ) -> Result<ImportResult, String> {
-    let Some(pending) = oauth_pending_get(&login_id)? else {
-        return Ok(ImportResult {
-            imported: vec![],
-            failed: vec![],
-        });
+    let pending = {
+        let mut guard = OAUTH_PENDING
+            .lock()
+            .map_err(|_| "OAuth 状态锁失败".to_string())?;
+        let Some(pending) = guard.get_mut(&login_id) else {
+            return Ok(ImportResult {
+                imported: vec![],
+                failed: vec![],
+            });
+        };
+        if pending.provider != "codex" {
+            return Err("无效的 Codex OAuth 会话".to_string());
+        }
+        if pending.expires_at <= now_ts() {
+            guard.remove(&login_id);
+            return Err("Codex OAuth 登录已超时，请重新发起授权".to_string());
+        }
+        if pending.code_consumed {
+            return Ok(ImportResult {
+                imported: vec![],
+                failed: vec![],
+            });
+        }
+        let Some(code) = pending.code.clone() else {
+            return Ok(ImportResult {
+                imported: vec![],
+                failed: vec![],
+            });
+        };
+        let code_verifier = pending
+            .code_verifier
+            .clone()
+            .ok_or_else(|| "Codex OAuth 会话缺少 code_verifier".to_string())?;
+        pending.code_consumed = true;
+        (code, code_verifier, pending.port)
     };
-    if pending.provider != "codex" {
-        return Err("无效的 Codex OAuth 会话".to_string());
-    }
-    if pending.expires_at <= now_ts() {
-        oauth_pending_remove(&login_id);
-        return Err("Codex OAuth 登录已超时，请重新发起授权".to_string());
-    }
-    let Some(code) = pending.code else {
-        return Ok(ImportResult {
-            imported: vec![],
-            failed: vec![],
-        });
+    let (code, code_verifier, port) = pending;
+    let payload = match exchange_codex_oauth_code(&code, &code_verifier, port).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            if let Ok(mut guard) = OAUTH_PENDING.lock() {
+                if let Some(pending) = guard.get_mut(&login_id) {
+                    pending.code_consumed = false;
+                }
+            }
+            return Err(error);
+        }
     };
-    let code_verifier = pending
-        .code_verifier
-        .ok_or_else(|| "Codex OAuth 会话缺少 code_verifier".to_string())?;
-    let payload = exchange_codex_oauth_code(&code, &code_verifier, pending.port).await?;
-    let result = parse_auth_json_content(&payload.to_string(), "oauth", "Codex OAuth");
+    let mut result = parse_auth_json_content(&payload.to_string(), "oauth", "Codex OAuth");
+    for account in &mut result.imported {
+        if account.provider == "codex" {
+            let mut access_token = match codex_access_token(account) {
+                Some(token) => token,
+                None => continue,
+            };
+            let account_id = account
+                .account_id
+                .clone()
+                .or_else(|| codex_account_id_from_access_token(&access_token));
+            let mut headers = match codex_api_headers(&access_token, account_id.as_deref()) {
+                Ok(headers) => headers,
+                Err(_) => continue,
+            };
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+            {
+                Ok(client) => client,
+                Err(_) => continue,
+            };
+            let _ = refresh_codex_account_identity_remote(
+                account,
+                &client,
+                &mut headers,
+                &mut access_token,
+                true,
+            )
+            .await;
+        }
+    }
+    let mut dedup = HashMap::<String, ManagedAccount>::new();
+    for account in result.imported.drain(..) {
+        dedup.insert(account.id.clone(), account);
+    }
+    result.imported = dedup.into_values().collect();
     let result = persist_and_refresh_imported(app, result)?;
-    oauth_pending_remove(&login_id);
+    if let Some(port) = oauth_pending_remove_with_port(&login_id) {
+        notify_oauth_listener_cancel(port);
+    }
     Ok(result)
 }
 
 #[tauri::command]
-fn start_gemini_oauth() -> Result<OAuthStartResult, String> {
+fn start_gemini_oauth(app: tauri::AppHandle) -> Result<OAuthStartResult, String> {
     cancel_pending_oauth_for_provider("gemini");
-    let port = reserve_callback_port(None)?;
+    let port = ensure_oauth_callback_listener(
+        &app,
+        "gemini",
+        None,
+        GEMINI_OAUTH_CALLBACK_PATH,
+        Some("https://developers.google.com/gemini-code-assist/auth_success_gemini"),
+    )?;
     let login_id = random_urlsafe_token(24);
     let state = random_urlsafe_token(24);
     let redirect_uri = format!("http://127.0.0.1:{port}{GEMINI_OAUTH_CALLBACK_PATH}");
@@ -8391,15 +8703,9 @@ fn start_gemini_oauth() -> Result<OAuthStartResult, String> {
                 port,
                 expires_at: now_ts() + OAUTH_TIMEOUT_SECONDS,
                 code: None,
+                code_consumed: false,
             },
         );
-    start_oauth_callback_listener(
-        login_id.clone(),
-        "gemini".to_string(),
-        port,
-        GEMINI_OAUTH_CALLBACK_PATH.to_string(),
-        Some("https://developers.google.com/gemini-code-assist/auth_success_gemini".to_string()),
-    );
     open_oauth_url(&auth_url)?;
 
     Ok(OAuthStartResult {
@@ -8443,9 +8749,15 @@ async fn complete_gemini_oauth(
 }
 
 #[tauri::command]
-fn start_antigravity_oauth() -> Result<OAuthStartResult, String> {
+fn start_antigravity_oauth(app: tauri::AppHandle) -> Result<OAuthStartResult, String> {
     cancel_pending_oauth_for_provider("antigravity");
-    let port = reserve_callback_port(None)?;
+    let port = ensure_oauth_callback_listener(
+        &app,
+        "antigravity",
+        None,
+        ANTIGRAVITY_OAUTH_CALLBACK_PATH,
+        None,
+    )?;
     let login_id = random_urlsafe_token(24);
     let state = random_urlsafe_token(24);
     let redirect_uri = format!("http://127.0.0.1:{port}{ANTIGRAVITY_OAUTH_CALLBACK_PATH}");
@@ -8463,15 +8775,9 @@ fn start_antigravity_oauth() -> Result<OAuthStartResult, String> {
                 port,
                 expires_at: now_ts() + OAUTH_TIMEOUT_SECONDS,
                 code: None,
+                code_consumed: false,
             },
         );
-    start_oauth_callback_listener(
-        login_id.clone(),
-        "antigravity".to_string(),
-        port,
-        ANTIGRAVITY_OAUTH_CALLBACK_PATH.to_string(),
-        None,
-    );
     open_oauth_url(&auth_url)?;
 
     Ok(OAuthStartResult {
@@ -8512,6 +8818,14 @@ async fn complete_antigravity_oauth(
     let result = persist_and_refresh_imported(app, result)?;
     oauth_pending_remove(&login_id);
     Ok(result)
+}
+
+#[tauri::command]
+fn cancel_oauth(
+    provider: String,
+    login_id: Option<String>,
+) -> Result<(), String> {
+    oauth_pending_cancel(login_id.as_deref(), Some(provider.as_str()))
 }
 
 fn read_settings_record(app: &tauri::AppHandle) -> Result<AppSettings, String> {
@@ -8564,9 +8878,7 @@ fn ensure_api_service_key(
 }
 
 #[tauri::command]
-fn get_api_service_status(
-    app: tauri::AppHandle,
-) -> Result<api_service::ApiServiceStatus, String> {
+fn get_api_service_status(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
     Ok(api_service::current_status(
@@ -8578,17 +8890,13 @@ fn get_api_service_status(
 }
 
 #[tauri::command]
-async fn start_api_service(
-    app: tauri::AppHandle,
-) -> Result<api_service::ApiServiceStatus, String> {
+async fn start_api_service(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
     tauri::async_runtime::spawn_blocking(move || start_api_service_impl(app))
         .await
         .map_err(|error| format!("启动 API 服务任务失败: {error}"))?
 }
 
-fn start_api_service_impl(
-    app: tauri::AppHandle,
-) -> Result<api_service::ApiServiceStatus, String> {
+fn start_api_service_impl(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
     let data_dir = app
@@ -8624,10 +8932,7 @@ fn start_api_service_impl(
     Ok(status)
 }
 
-fn emit_api_service_status_changed(
-    app: &tauri::AppHandle,
-    status: &api_service::ApiServiceStatus,
-) {
+fn emit_api_service_status_changed(app: &tauri::AppHandle, status: &api_service::ApiServiceStatus) {
     let _ = app.emit("api-service-status-changed", status);
 }
 
@@ -8736,9 +9041,7 @@ fn schedule_windsurf_sync(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
-async fn stop_api_service(
-    app: tauri::AppHandle,
-) -> Result<api_service::ApiServiceStatus, String> {
+async fn stop_api_service(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
     tauri::async_runtime::spawn_blocking(move || stop_api_service_impl(app))
         .await
         .map_err(|error| format!("停止 API 服务任务失败: {error}"))?
@@ -8767,6 +9070,7 @@ struct CodexAppSetupResult {
     config_path: String,
     base_url: String,
     model_id: String,
+    effective_model_id: String,
     /// 若动到了 `~/.codex/config.toml`，这里是原文件的备份路径。
     config_backup_path: Option<String>,
     /// 若动到了 `~/.codex/auth.json`，这里是原文件的备份路径。
@@ -8774,6 +9078,15 @@ struct CodexAppSetupResult {
     /// 为 true 表示我们把 auth.json 的 ChatGPT tokens 清空了（只保留 API key 模式），
     /// 这样官方 Codex 客户端不会再显示 ChatGPT 额度，引导用户到 SuperAI 查看。
     auth_neutralized: bool,
+}
+
+fn codex_preferred_model(model_id: &str) -> String {
+    let trimmed = model_id.trim();
+    if trimmed.starts_with("claude-") {
+        trimmed.to_string()
+    } else {
+        CODEX_RECOMMENDED_MODEL.to_string()
+    }
 }
 
 /// 判断这份 `config.toml` 是不是 SuperAI 写的。
@@ -8808,21 +9121,41 @@ fn escape_toml_basic_string(s: &str) -> String {
     out
 }
 
-fn codex_model_config_for_api_model(_model_id: &str) -> String {
-    // SuperAI 的 API 服务在 api_service.rs:1378-1405 会把入参 model 强制改写成
-    // UI 当前选中的模型，codex config.toml 里的 model 实际上只影响 codex TUI
-    // 的显示。这里固定写 "自定义"，避免每次切 SuperAI 模型都回写 config.toml。
-    "自定义".to_string()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexModelConfig {
+    model: String,
+    reasoning_effort: Option<&'static str>,
+}
+
+fn codex_model_config_for_api_model(model_id: &str) -> CodexModelConfig {
+    for effort in ["minimal", "low", "medium", "high", "xhigh"] {
+        let suffix = format!("-{effort}");
+        if let Some(base) = model_id.strip_suffix(&suffix) {
+            if !base.is_empty() {
+                return CodexModelConfig {
+                    model: base.to_string(),
+                    reasoning_effort: Some(effort),
+                };
+            }
+        }
+    }
+
+    CodexModelConfig {
+        model: model_id.to_string(),
+        reasoning_effort: None,
+    }
 }
 
 /// 写入 codex `~/.codex/config.toml` 的 SuperAI 配置。
 ///
 /// 设计：
 /// - API 服务内部使用 sidecar 需要的完整模型 id（如 `gpt-5.5-medium`）。
-///   写进 Codex `config.toml` 时也直接保留完整 id，避免 Codex 把自定义 provider
-///   的模型误当成原生 OpenAI family 再额外套 `model_reasoning_effort` 规则。
+///   写进 Codex `config.toml` 时，若模型名带有我们支持的 effort 后缀，
+///   就拆成 `model = "gpt-5.5"` + `model_reasoning_effort = "medium"`；
+///   其余模型保持原样写进 `model`。
 /// - SuperAI 切模型时，前端调 `set_api_service_default_model`，后端会顺手
-///   `rewrite_managed_model_config()` 把 `model = "..."` 原地改掉，下次 codex 重启就显示新配置；
+///   `rewrite_managed_model_config()` 原地改掉 `model` / `model_reasoning_effort`，
+///   下次 codex 重启就显示新配置；
 ///   codex 进程没重启时，proxy 内存里 default_model 也已热更，请求立即生效。
 ///
 /// 鉴权选择 `requires_openai_auth = true`（**不**设 `env_key`）：
@@ -8837,10 +9170,16 @@ fn codex_model_config_for_api_model(_model_id: &str) -> String {
 ///     历史会话视图会整个坏掉。
 fn build_superai_managed_block(base_url: &str, model_id: &str, _api_key: &str) -> String {
     let url = escape_toml_basic_string(base_url);
-    let model = escape_toml_basic_string(&codex_model_config_for_api_model(model_id));
+    let codex_model = codex_model_config_for_api_model(model_id);
+    let model = escape_toml_basic_string(&codex_model.model);
+    let reasoning_effort_line = codex_model
+        .reasoning_effort
+        .map(|effort| format!("model_reasoning_effort = \"{effort}\"\n"))
+        .unwrap_or_default();
     format!(
         "model_provider = \"superai\"\n\
 model = \"{model}\"\n\
+{reasoning_effort_line}\
 approval_policy = \"on-request\"\n\
 sandbox_mode = \"workspace-write\"\n\
 network_access = \"enabled\"\n\
@@ -8857,8 +9196,8 @@ requires_openai_auth = true\n\
     )
 }
 
-/// 当 SuperAI UI 切换模型时调用：原地把 SuperAI 配置里的 `model = "..."` 改成最新完整模型 id，
-/// 并清掉旧版本遗留的 `model_reasoning_effort = "..."`。
+/// 当 SuperAI UI 切换模型时调用：原地把 SuperAI 配置里的 `model = "..."` /
+/// `model_reasoning_effort = "..."` 改成最新配置。
 ///
 /// - 文件不存在 / 不是 SuperAI 配置 / 没找到 model 行 → 一律不动文件，返回 false。
 ///   说明用户还没点"配置 Codex"，不该擅自创建文件。
@@ -8878,13 +9217,17 @@ fn rewrite_managed_model_config(model_id: &str) -> Result<bool, String> {
         return Ok(false);
     }
 
-    let escaped_model = escape_toml_basic_string(&codex_model_config_for_api_model(model_id));
+    let codex_model = codex_model_config_for_api_model(model_id);
+    let escaped_model = escape_toml_basic_string(&codex_model.model);
     let mut new_lines: Vec<String> = Vec::with_capacity(existing.lines().count());
     let mut replaced_model = false;
     for line in existing.lines() {
         let trimmed = line.trim_start();
         if !replaced_model && trimmed.starts_with("model = \"") {
             new_lines.push(format!("model = \"{escaped_model}\""));
+            if let Some(effort) = codex_model.reasoning_effort {
+                new_lines.push(format!("model_reasoning_effort = \"{effort}\""));
+            }
             replaced_model = true;
         } else if trimmed.starts_with("model_reasoning_effort = \"") {
             continue;
@@ -9021,6 +9364,7 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
     if model_id.is_empty() {
         return Err("尚未选择默认模型，请先在 API 服务配置里挑一个".to_string());
     }
+    let effective_model_id = codex_preferred_model(&model_id);
 
     let codex_home = codex_home_dir()?;
     fs::create_dir_all(&codex_home)
@@ -9031,7 +9375,7 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
 
     // config.toml 由 SuperAI 接管，但首次覆盖前要把用户原配置留一份一次性备份，
     // 这样"恢复 Codex"才能真正回到原 provider / 原 base_url，而不是只删文件。
-    let mut next = build_superai_managed_block(&base_url, &model_id, &api_key);
+    let mut next = build_superai_managed_block(&base_url, &effective_model_id, &api_key);
     if !next.ends_with('\n') {
         next.push('\n');
     }
@@ -9052,9 +9396,214 @@ fn configure_codex_app(app: tauri::AppHandle) -> Result<CodexAppSetupResult, Str
         config_path: config_path.display().to_string(),
         base_url,
         model_id,
+        effective_model_id,
         config_backup_path,
         auth_backup_path,
         auth_neutralized,
+    })
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeAppSetupResult {
+    settings_path: String,
+    base_url: String,
+    model_id: String,
+    settings_backup_path: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeAppRestoreResult {
+    steps: Vec<String>,
+    settings_restored_from_backup: bool,
+    settings_removed: bool,
+}
+
+fn claude_settings_superai_marker(value: &Value) -> bool {
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    if root.len() != 3 {
+        return false;
+    }
+    let Some(env) = root.get("env").and_then(|env| env.as_object()) else {
+        return false;
+    };
+    let Some(permissions) = root.get("permissions").and_then(|value| value.as_object()) else {
+        return false;
+    };
+    let Some(api_key_helper) = root.get("apiKeyHelper").and_then(|value| value.as_str()) else {
+        return false;
+    };
+
+    if env.len() != 3 {
+        return false;
+    }
+    let has_expected_env = matches!(
+        (
+            env.get("ANTHROPIC_API_KEY").and_then(|value| value.as_str()),
+            env.get("ANTHROPIC_BASE_URL").and_then(|value| value.as_str()),
+            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+                .and_then(|value| value.as_str()),
+        ),
+        (Some(_), Some(_), Some("1"))
+    );
+    if !has_expected_env {
+        return false;
+    }
+
+    let allow_empty = permissions
+        .get("allow")
+        .and_then(|value| value.as_array())
+        .map(|items| items.is_empty())
+        .unwrap_or(false);
+    let deny_empty = permissions
+        .get("deny")
+        .and_then(|value| value.as_array())
+        .map(|items| items.is_empty())
+        .unwrap_or(false);
+    if !allow_empty || !deny_empty || permissions.len() != 2 {
+        return false;
+    }
+
+    api_key_helper.starts_with("echo '") && api_key_helper.ends_with('\'')
+}
+
+fn backup_claude_settings_once(claude_home: &Path) -> Result<Option<String>, String> {
+    let settings_path = claude_home.join("settings.json");
+    let backup_path = claude_home.join("settings.json.superai-bak");
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+    if backup_path.exists() {
+        return Ok(Some(backup_path.display().to_string()));
+    }
+    let existing = read_json_file_or_default(&settings_path, serde_json::json!({}))?;
+    if claude_settings_superai_marker(&existing) {
+        return Ok(None);
+    }
+    fs::copy(&settings_path, &backup_path)
+        .map_err(|error| format!("备份 {} 失败: {error}", settings_path.display()))?;
+    Ok(Some(backup_path.display().to_string()))
+}
+
+fn build_superai_claude_settings(
+    _existing: Value,
+    base_url: &str,
+    api_key: &str,
+) -> Result<String, String> {
+    let claude_base_url = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .to_string();
+    let root = serde_json::json!({
+        "env": {
+            "ANTHROPIC_API_KEY": api_key,
+            "ANTHROPIC_BASE_URL": claude_base_url,
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        },
+        "permissions": {
+            "allow": [],
+            "deny": [],
+        },
+        "apiKeyHelper": format!("echo '{api_key}'"),
+    });
+    serde_json::to_string_pretty(&root)
+        .map_err(|error| format!("序列化 Claude settings.json 失败: {error}"))
+}
+
+#[tauri::command]
+fn configure_claude_app(app: tauri::AppHandle) -> Result<ClaudeAppSetupResult, String> {
+    let mut settings = read_settings_record(&app)?;
+    ensure_api_service_key(&app, &mut settings)?;
+    let status = api_service::current_status(
+        &settings.api_service_host,
+        effective_api_service_port(settings.api_service_port),
+        &settings.api_service_key,
+        &effective_api_service_model(&settings.api_service_default_model),
+    );
+    if !status.running {
+        return Err("API 服务未运行，请先启动服务再一键配置 Claude".to_string());
+    }
+    let base_url = status
+        .address
+        .clone()
+        .ok_or_else(|| "API 服务未提供监听地址".to_string())?;
+    let claude_base_url = base_url
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
+        .to_string();
+    let api_key = status.api_key.clone();
+    if api_key.trim().is_empty() {
+        return Err("API 服务密钥为空，无法配置 Claude".to_string());
+    }
+    let model_id = status.default_model.trim().to_string();
+    if model_id.is_empty() {
+        return Err("尚未选择默认模型，请先在 API 服务配置里挑一个".to_string());
+    }
+
+    let claude_home = claude_home_dir()?;
+    fs::create_dir_all(&claude_home)
+        .map_err(|error| format!("创建目录失败 {}: {error}", claude_home.display()))?;
+    let settings_path = claude_home.join("settings.json");
+    let settings_backup_path = backup_claude_settings_once(&claude_home)?;
+    let existing = read_json_file_or_default(&settings_path, serde_json::json!({}))?;
+    let payload = build_superai_claude_settings(existing, &claude_base_url, &api_key)?;
+    write_string_atomic(&settings_path, &payload)?;
+
+    Ok(ClaudeAppSetupResult {
+        settings_path: settings_path.display().to_string(),
+        base_url: claude_base_url,
+        model_id,
+        settings_backup_path,
+    })
+}
+
+#[tauri::command]
+fn restore_claude_app(_app: tauri::AppHandle) -> Result<ClaudeAppRestoreResult, String> {
+    let claude_home = claude_home_dir()?;
+    let settings_path = claude_home.join("settings.json");
+    let backup_path = claude_home.join("settings.json.superai-bak");
+    let mut steps = Vec::new();
+    let mut settings_restored_from_backup = false;
+    let mut settings_removed = false;
+
+    if backup_path.exists() {
+        fs::copy(&backup_path, &settings_path)
+            .map_err(|error| format!("恢复 Claude settings.json 失败: {error}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600));
+        }
+        steps.push(format!(
+            "已用 {} 覆盖回 {}",
+            backup_path.display(),
+            settings_path.display(),
+        ));
+        settings_restored_from_backup = true;
+    } else if settings_path.exists() {
+        let existing = read_json_file_or_default(&settings_path, serde_json::json!({}))?;
+        if claude_settings_superai_marker(&existing) {
+            fs::remove_file(&settings_path)
+                .map_err(|error| format!("删除 Claude settings.json 失败: {error}"))?;
+            steps.push(format!("已删除 SuperAI 写的 {}", settings_path.display()));
+            settings_removed = true;
+        } else {
+            steps.push(format!(
+                "Claude settings.json 非 SuperAI 接管，原样保留（{}）",
+                settings_path.display(),
+            ));
+        }
+    } else {
+        steps.push("没有 ~/.claude/settings.json，无需处理".to_string());
+    }
+
+    Ok(ClaudeAppRestoreResult {
+        steps,
+        settings_restored_from_backup,
+        settings_removed,
     })
 }
 
@@ -9226,6 +9775,7 @@ pub fn run() {
             import_gemini_from_local,
             start_codex_oauth,
             complete_codex_oauth,
+            cancel_oauth,
             start_gemini_oauth,
             complete_gemini_oauth,
             start_antigravity_oauth,
@@ -9243,6 +9793,8 @@ pub fn run() {
             set_api_service_default_model,
             configure_codex_app,
             restore_codex_app,
+            configure_claude_app,
+            restore_claude_app,
         ])
         .on_window_event(|window, event| {
             if window.label() != "main" {
@@ -9345,20 +9897,6 @@ pub fn run() {
 
             if let Ok(mut settings) = read_settings_record(&handle) {
                 let _ = ensure_api_service_key(&handle, &mut settings);
-                if settings.api_service_enabled {
-                    tauri::async_runtime::spawn_blocking(move || {
-                        match start_api_service_impl(handle.clone()) {
-                            Ok(status) => emit_api_service_status_changed(&handle, &status),
-                            Err(error) => {
-                                eprintln!("[SuperAI API] 自启失败: {error}");
-                                let _ = handle.emit(
-                                    "api-service-error",
-                                    serde_json::json!({"phase": "auto_start", "message": error}),
-                                );
-                            }
-                        }
-                    });
-                }
             }
 
             let startup_window_handle = app.handle().clone();
@@ -9379,15 +9917,15 @@ pub fn run() {
     }
 
     app.run(|_handle, event| match event {
-            #[cfg(target_os = "macos")]
-            tauri::RunEvent::Reopen { .. } => {
-                show_main_window(_handle);
-            }
-            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-                let _ = api_service::stop();
-            }
-            _ => {}
-        });
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen { .. } => {
+            show_main_window(_handle);
+        }
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+            let _ = api_service::stop();
+        }
+        _ => {}
+    });
 }
 
 #[cfg(test)]
@@ -9468,6 +10006,38 @@ mod tests {
     }
 
     #[test]
+    fn codex_rekeys_oauth_account_after_profile_resolution() {
+        let mut account = ManagedAccount {
+            id: format!("codex_{}", stable_hash("user-1::acct_token")),
+            account_id: Some("acct_token".to_string()),
+            user_id: Some("user-1".to_string()),
+            ..test_account("codex-a", "codex", "same@example.com", 10)
+        };
+        let payload = serde_json::json!({
+            "account_ordering": ["acct_workspace"],
+            "accounts": {
+                "workspace": { "account": { "account_id": "acct_workspace", "name": "Workspace B" } }
+            }
+        });
+
+        let (account_name, account_id) = parse_codex_account_profile(&payload, &account);
+        if account_name.is_some() {
+            account.display_name = account_name;
+        }
+        if account_id.is_some() {
+            account.account_id = account_id;
+        }
+        maybe_rekey_codex_account(&mut account);
+
+        assert_eq!(account.display_name.as_deref(), Some("Workspace B"));
+        assert_eq!(account.account_id.as_deref(), Some("acct_workspace"));
+        assert_eq!(
+            account.id,
+            format!("codex_{}", stable_hash("user-1::acct_workspace"))
+        );
+    }
+
+    #[test]
     fn codex_headers_allow_missing_account_id() {
         let headers = codex_api_headers("access-token", None).unwrap();
 
@@ -9521,26 +10091,43 @@ mod tests {
     }
 
     #[test]
-    fn codex_config_keeps_custom_model_id_verbatim() {
+    fn codex_config_splits_known_effort_suffixes() {
         assert_eq!(
             codex_model_config_for_api_model("gpt-5.5-medium"),
-            "gpt-5.5-medium".to_string()
+            CodexModelConfig {
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Some("medium"),
+            }
         );
         assert_eq!(
             codex_model_config_for_api_model("gpt-5.5-xhigh"),
-            "gpt-5.5-xhigh".to_string()
+            CodexModelConfig {
+                model: "gpt-5.5".to_string(),
+                reasoning_effort: Some("xhigh"),
+            }
         );
         assert_eq!(
             codex_model_config_for_api_model("gpt-5.3-codex"),
-            "gpt-5.3-codex".to_string()
+            CodexModelConfig {
+                model: "gpt-5.3-codex".to_string(),
+                reasoning_effort: None,
+            }
         );
     }
 
     #[test]
-    fn superai_managed_block_keeps_full_model_id() {
+    fn superai_managed_block_writes_reasoning_effort_for_known_suffix() {
         let block = build_superai_managed_block("http://127.0.0.1:1420/v1", "gpt-5.5-medium", "");
 
-        assert!(block.contains("model = \"gpt-5.5-medium\"\n"));
+        assert!(block.contains("model = \"gpt-5.5\"\n"));
+        assert!(block.contains("model_reasoning_effort = \"medium\"\n"));
+    }
+
+    #[test]
+    fn superai_managed_block_keeps_full_model_for_unknown_suffix() {
+        let block = build_superai_managed_block("http://127.0.0.1:1420/v1", "gpt-5.3-codex", "");
+
+        assert!(block.contains("model = \"gpt-5.3-codex\"\n"));
         assert!(!block.contains("model_reasoning_effort = "));
     }
 
@@ -9555,7 +10142,8 @@ mod tests {
 
     #[test]
     fn backup_codex_config_once_preserves_original_user_config() {
-        let codex_home = &std::env::temp_dir().join(format!("superai-codex-test-{}", rand::random::<u64>()));
+        let codex_home =
+            &std::env::temp_dir().join(format!("superai-codex-test-{}", rand::random::<u64>()));
         fs::create_dir_all(codex_home).unwrap();
         let config_path = codex_home.join("config.toml");
         let original = "model_provider = \"ylscode\"\n";
@@ -9564,21 +10152,31 @@ mod tests {
         let backup = backup_codex_config_once(codex_home).unwrap();
         let backup_path = codex_home.join("config.toml.superai-bak");
 
-        assert_eq!(backup.as_deref(), Some(backup_path.to_string_lossy().as_ref()));
+        assert_eq!(
+            backup.as_deref(),
+            Some(backup_path.to_string_lossy().as_ref())
+        );
         assert_eq!(read_to_string(&backup_path).unwrap(), original);
 
-        write_string_atomic(&config_path, "model_provider = \"superai\"\n[model_providers.superai]\n")
-            .unwrap();
+        write_string_atomic(
+            &config_path,
+            "model_provider = \"superai\"\n[model_providers.superai]\n",
+        )
+        .unwrap();
         let backup_again = backup_codex_config_once(codex_home).unwrap();
 
-        assert_eq!(backup_again.as_deref(), Some(backup_path.to_string_lossy().as_ref()));
+        assert_eq!(
+            backup_again.as_deref(),
+            Some(backup_path.to_string_lossy().as_ref())
+        );
         assert_eq!(read_to_string(&backup_path).unwrap(), original);
         let _ = fs::remove_dir_all(codex_home);
     }
 
     #[test]
     fn backup_codex_config_once_skips_existing_superai_config() {
-        let codex_home = &std::env::temp_dir().join(format!("superai-codex-test-{}", rand::random::<u64>()));
+        let codex_home =
+            &std::env::temp_dir().join(format!("superai-codex-test-{}", rand::random::<u64>()));
         fs::create_dir_all(codex_home).unwrap();
         let config_path = codex_home.join("config.toml");
         write_string_atomic(
@@ -9675,7 +10273,12 @@ mod tests {
         let available_ids = all_accounts
             .iter()
             .filter(|account| account.provider == "gemini")
-            .filter(|account| account.status.as_ref().is_some_and(|status| status.label == "可用"))
+            .filter(|account| {
+                account
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.label == "可用")
+            })
             .map(|account| account.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(available_ids, vec!["gemini-b"]);
@@ -9691,8 +10294,9 @@ mod tests {
         upsert_account(&conn, &older).expect("insert older");
         upsert_account(&conn, &newer).expect("insert newer");
 
-        let changed = sync_windsurf_current_account_by_label(&conn, "superai-account-superai-a@local")
-            .expect("sync active account by label");
+        let changed =
+            sync_windsurf_current_account_by_label(&conn, "superai-account-superai-a@local")
+                .expect("sync active account by label");
         let current_ids = changed
             .iter()
             .filter(|account| is_current_status(&account.status))
@@ -9728,8 +10332,9 @@ mod tests {
         upsert_account(&conn, &current).expect("insert current");
         upsert_account(&conn, &available).expect("insert available");
 
-        let changed = sync_windsurf_current_account_by_label(&conn, "superai-account-missing@local")
-            .expect("sync unknown label");
+        let changed =
+            sync_windsurf_current_account_by_label(&conn, "superai-account-missing@local")
+                .expect("sync unknown label");
         assert!(changed.is_empty());
 
         let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");

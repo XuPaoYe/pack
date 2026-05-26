@@ -106,6 +106,17 @@ type OAuthStartResult = {
   message: string;
 };
 
+type OAuthCallbackEvent = {
+  provider?: OAuthProvider;
+  loginId?: string;
+};
+
+type CompleteOAuthFn = (
+  provider: OAuthProvider,
+  loginId: string,
+  options?: { silent?: boolean },
+) => Promise<boolean>;
+
 type ApiServiceStatus = {
   running: boolean;
   bindHost: string;
@@ -724,7 +735,7 @@ const MODEL_FAMILIES: ModelFamily[] = [
   },
 ];
 
-const FALLBACK_FAMILY_KEY = "gpt-5.5";
+const FALLBACK_FAMILY_KEY = "claude-sonnet-4.6";
 
 type ApiModelPref = {
   family: string;
@@ -952,18 +963,17 @@ function EffortSegments({
   );
 }
 
-type CodexAppSetupResult = {
-  configPath: string;
+type ClaudeAppSetupResult = {
+  settingsPath: string;
   baseUrl: string;
   modelId: string;
-  authBackupPath: string | null;
-  authNeutralized: boolean;
+  settingsBackupPath: string | null;
 };
 
-type CodexAppRestoreResult = {
+type ClaudeAppRestoreResult = {
   steps: string[];
-  authRestoredFromBackup: boolean;
-  configRemoved: boolean;
+  settingsRestoredFromBackup: boolean;
+  settingsRemoved: boolean;
 };
 
 function ApiServiceCard({
@@ -1087,20 +1097,20 @@ function ApiServiceConfigPanel({
   pref,
   onChangeFamily,
   onChangeEffort,
-  onConfigureCodex,
-  onRestoreCodex,
-  configuringCodex,
-  restoringCodex,
+  onConfigureClaude,
+  onRestoreClaude,
+  configuringClaude,
+  restoringClaude,
 }: {
   running: boolean;
   models: ApiServiceModel[];
   pref: ApiModelPref;
   onChangeFamily: (family: string) => void;
   onChangeEffort: (effort: EffortKey) => void;
-  onConfigureCodex: () => void;
-  onRestoreCodex: () => void;
-  configuringCodex: boolean;
-  restoringCodex: boolean;
+  onConfigureClaude: () => void;
+  onRestoreClaude: () => void;
+  configuringClaude: boolean;
+  restoringClaude: boolean;
 }) {
   const families = MODEL_FAMILIES;
   const family = families.find((f) => f.key === pref.family) ?? families[0];
@@ -1144,29 +1154,29 @@ function ApiServiceConfigPanel({
 
       <section className="api-config-row">
         <div className="api-config-copy">
-          <strong>Codex 配置</strong>
-          <p>把当前 API 服务的地址、密钥和默认模型写入 ~/.codex/，或回滚到接管前的备份</p>
+          <strong>Claude 配置</strong>
+          <p>把当前 API 服务根地址和密钥写入 ~/.claude/settings.json 的 env，供 Claude Code 直连本地网关；恢复时回滚到接管前备份或移除 SuperAI 注入项。模型仍以 SuperAI 当前默认模型为准。</p>
         </div>
         <div className="api-config-actions">
           <button
             type="button"
             className="superai-api-secondary"
-            onClick={onConfigureCodex}
-            disabled={!running || configuringCodex || restoringCodex}
-            title={running ? "把当前 API 服务地址、密钥和默认模型同步到 ~/.codex/config.toml + auth.json" : "请先启动 API 服务"}
+            onClick={onConfigureClaude}
+            disabled={!running || configuringClaude || restoringClaude}
+            title={running ? "把当前 API 服务根地址、密钥同步到 ~/.claude/settings.json" : "请先启动 API 服务"}
           >
             <CodexIcon size={14} />
-            {configuringCodex ? "配置中…" : "配置 Codex"}
+            {configuringClaude ? "配置中…" : "配置 Claude"}
           </button>
           <button
             type="button"
             className="superai-api-secondary"
-            onClick={onRestoreCodex}
-            disabled={configuringCodex || restoringCodex}
+            onClick={onRestoreClaude}
+            disabled={configuringClaude || restoringClaude}
             title={`从 .superai-bak 恢复，没有备份则尽量移除 ${APP_NAME} 痕迹`}
           >
             <RotateCcw size={14} />
-            {restoringCodex ? "恢复中…" : "恢复 Codex"}
+            {restoringClaude ? "恢复中…" : "恢复 Claude"}
           </button>
         </div>
       </section>
@@ -1251,17 +1261,18 @@ function App() {
     apiServiceEnabled: false,
     apiServiceHost: "0.0.0.0",
     apiServicePort: DEFAULT_API_SERVICE_PORT,
-    apiServiceDefaultModel: "gpt-5.5",
+    apiServiceDefaultModel: "claude-sonnet-4.6",
   });
   const [apiServiceHostInput, setApiServiceHostInput] = useState("0.0.0.0");
   const [apiServicePortInput, setApiServicePortInput] = useState(String(DEFAULT_API_SERVICE_PORT));
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
-  const [isConfiguringCodex, setIsConfiguringCodex] = useState(false);
-  const [isRestoringCodex, setIsRestoringCodex] = useState(false);
+  const [isConfiguringClaude, setIsConfiguringClaude] = useState(false);
+  const [isRestoringClaude, setIsRestoringClaude] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const accountListRef = useRef<HTMLDivElement | null>(null);
-  const oauthPollTimers = useRef<Partial<Record<OAuthProvider, number>>>({});
+  const pendingOAuthRef = useRef(pendingOAuth);
+  const completeOAuthRef = useRef<CompleteOAuthFn | null>(null);
   const hasStartedStartupRefresh = useRef(false);
   const activeAccountRefreshInFlight = useRef<string | null>(null);
   const apiServiceEnabledRef = useRef(apiServiceEnabled);
@@ -1293,6 +1304,26 @@ function App() {
   useEffect(() => {
     apiServiceRunningRef.current = apiServiceRunning;
   }, [apiServiceRunning]);
+
+  useEffect(() => {
+    pendingOAuthRef.current = pendingOAuth;
+  }, [pendingOAuth]);
+
+  const cancelPendingOAuth = useCallback(async (provider: OAuthProvider, loginId?: string) => {
+    try {
+      await invoke("cancel_oauth", {
+        provider,
+        loginId: loginId ?? null,
+      });
+    } catch {
+      // 关闭弹窗时取消 OAuth 只是清理动作，不阻断 UI。
+    } finally {
+      setPendingOAuth((current) => {
+        if (!current[provider]) return current;
+        return { ...current, [provider]: undefined };
+      });
+    }
+  }, []);
 
   const filteredAccounts = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -1491,14 +1522,13 @@ function App() {
     })();
   };
 
-  const clearOAuthPoll = (provider: OAuthProvider) => {
-    const timer = oauthPollTimers.current[provider];
-    if (timer) window.clearTimeout(timer);
-    delete oauthPollTimers.current[provider];
-  };
-
   const closeImportModal = () => {
     if (isImportBusy) return;
+    if (activeProvider !== PROVIDER_SUPERAI) {
+      const provider = activeProvider as OAuthProvider;
+      const loginId = pendingOAuthRef.current[provider];
+      if (loginId) void cancelPendingOAuth(provider, loginId);
+    }
     setIsImportModalOpen(false);
     setMode(defaultImportModeForProvider(activeProvider));
     setPasteValue("");
@@ -1639,7 +1669,9 @@ function App() {
     try {
       const result = await invoke<BackendImportResult>(command, { loginId });
       if (result.imported.length === 0) {
-        if (!options.silent) applyImportResult(result, { closeModal: false });
+        if (!options.silent && result.failed.length > 0) {
+          applyImportResult(result, { closeModal: false });
+        }
         return false;
       }
       applyImportResult(
@@ -1647,31 +1679,17 @@ function App() {
         { successText: `${providerLabel(provider)} OAuth 登录成功，已添加 ${result.imported.length} 个账号`, accountsToPersist: [] },
       );
       setPendingOAuth((current) => ({ ...current, [provider]: undefined }));
-      clearOAuthPoll(provider);
       return true;
     } catch (error) {
       if (!options.silent) {
         showNormalizedError(`${providerLabel(provider)} OAuth 完成失败`, error);
+        setPendingOAuth((current) => ({ ...current, [provider]: undefined }));
       }
       return false;
     }
   };
 
-  const scheduleOAuthPoll = (provider: OAuthProvider, loginId: string, attempt = 0) => {
-    clearOAuthPoll(provider);
-    if (attempt >= 90) {
-      showNotice("info", `${providerLabel(provider)} OAuth 仍在等待完成，可再次在浏览器中打开授权。`);
-      return;
-    }
-    oauthPollTimers.current[provider] = window.setTimeout(() => {
-      void completeOAuth(provider, loginId, { silent: true }).then((isComplete) => {
-        if (!isComplete) scheduleOAuthPoll(provider, loginId, attempt + 1);
-      });
-    }, 2000);
-  };
-
   const handleOAuthStart = async (provider: OAuthProvider) => {
-    clearOAuthPoll(provider);
     if (isImportBusy) return;
     setIsImportBusy(true);
     try {
@@ -1681,7 +1699,6 @@ function App() {
         : "start_antigravity_oauth";
       const result = await invoke<OAuthStartResult>(command);
       setPendingOAuth((current) => ({ ...current, [provider]: result.login_id }));
-      scheduleOAuthPoll(provider, result.login_id);
       showNotice("info", result.message);
     } catch (error) {
       showNormalizedError(`${providerLabel(provider)} OAuth 启动失败`, error);
@@ -2095,9 +2112,6 @@ function App() {
         if (storedSettings) {
           setSettings(storedSettings);
           setApiServiceEnabled(Boolean(storedSettings.apiServiceEnabled));
-          setIsApiServiceStarting(
-            Boolean(storedSettings.apiServiceEnabled) && !apiServiceRunningRef.current,
-          );
           setApiServiceHostInput(storedSettings.apiServiceHost);
           setApiServicePortInput(String(storedSettings.apiServicePort));
         }
@@ -2105,12 +2119,7 @@ function App() {
       .catch(() => undefined)
       .finally(() => setIsSettingsLoaded(true));
 
-    return () => {
-      Object.values(oauthPollTimers.current).forEach((timer) => {
-        if (timer) window.clearTimeout(timer);
-      });
-      oauthPollTimers.current = {};
-    };
+    return undefined;
   }, [refreshAllAccountsOnLaunch, showNotice, showNormalizedError]);
 
   useEffect(() => {
@@ -2210,7 +2219,7 @@ function App() {
     };
   }, [apiServiceRunning, apiServiceActualPort]);
 
-  // 自启失败的事件 → toast。
+  // API 服务启动异常事件 → toast。
   useEffect(() => {
     if (!isTauri()) return;
     let unlisten: (() => void) | null = null;
@@ -2292,6 +2301,30 @@ function App() {
     };
   }, [showNotice, showNormalizedError]);
 
+  useEffect(() => {
+    completeOAuthRef.current = completeOAuth;
+  });
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | null = null;
+    void listen<OAuthCallbackEvent>("oauth-callback-received", (event) => {
+      const provider = event.payload?.provider;
+      const loginId = event.payload?.loginId;
+      if (!provider || !loginId) return;
+      if (pendingOAuthRef.current[provider] !== loginId) return;
+      showNotice("info", `${providerLabel(provider)} 已收到授权回调，正在完成登录…`);
+      const runComplete = completeOAuthRef.current;
+      if (!runComplete) return;
+      void runComplete(provider, loginId, { silent: false });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      unlisten?.();
+    };
+  }, [showNotice]);
+
   const toggleApiService = useCallback(async () => {
     if (isApiServiceBusy || isApiServiceStarting) return;
     setIsApiServiceBusy(true);
@@ -2365,7 +2398,7 @@ function App() {
     invoke("set_api_service_default_model", { model: modelId }).catch(() => undefined);
   }, [apiService?.running, apiPref]);
 
-  const configureCodexApp = useCallback(async () => {
+  const configureClaudeApp = useCallback(async () => {
     if (!isTauri()) {
       showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
       return;
@@ -2374,30 +2407,30 @@ function App() {
       showNotice("error", "请先启动 API 服务");
       return;
     }
-    setIsConfiguringCodex(true);
+    setIsConfiguringClaude(true);
     try {
-      await invoke<CodexAppSetupResult>("configure_codex_app");
-      showNotice("success", "Codex 已配置完成，请重启 Codex App / CLI 生效。");
+      const result = await invoke<ClaudeAppSetupResult>("configure_claude_app");
+      showNotice("success", `Claude 已配置完成，请重启 Claude Code 生效。当前走 SuperAI 默认模型 ${result.modelId}。`);
     } catch (error) {
-      showNormalizedError("配置 Codex 失败", error);
+      showNormalizedError("配置 Claude 失败", error);
     } finally {
-      setIsConfiguringCodex(false);
+      setIsConfiguringClaude(false);
     }
   }, [apiService?.running, showNormalizedError, showNotice]);
 
-  const restoreCodexApp = useCallback(async () => {
+  const restoreClaudeApp = useCallback(async () => {
     if (!isTauri()) {
       showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
       return;
     }
-    setIsRestoringCodex(true);
+    setIsRestoringClaude(true);
     try {
-      await invoke<CodexAppRestoreResult>("restore_codex_app");
-      showNotice("success", "Codex 已恢复完成，请重启 Codex App / CLI 生效。");
+      await invoke<ClaudeAppRestoreResult>("restore_claude_app");
+      showNotice("success", "Claude 已恢复完成，请重启 Claude Code 生效。");
     } catch (error) {
-      showNormalizedError("恢复 Codex 配置失败", error);
+      showNormalizedError("恢复 Claude 配置失败", error);
     } finally {
-      setIsRestoringCodex(false);
+      setIsRestoringClaude(false);
     }
   }, [showNormalizedError, showNotice]);
 
@@ -2935,10 +2968,10 @@ function App() {
             pref={apiPref}
             onChangeFamily={handleChangeFamily}
             onChangeEffort={handleChangeEffort}
-            onConfigureCodex={() => void configureCodexApp()}
-            onRestoreCodex={() => void restoreCodexApp()}
-            configuringCodex={isConfiguringCodex}
-            restoringCodex={isRestoringCodex}
+            onConfigureClaude={() => void configureClaudeApp()}
+            onRestoreClaude={() => void restoreClaudeApp()}
+            configuringClaude={isConfiguringClaude}
+            restoringClaude={isRestoringClaude}
           />
         </AppModal>
       )}

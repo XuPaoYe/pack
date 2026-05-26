@@ -273,16 +273,8 @@ export function responsesToChat(body) {
       if (!item || typeof item !== 'object') continue;
       if (item.type === 'message') {
         flushToolCalls.flush();
-        // Responses API has a `developer` role that Chat Completions / Cascade
-        // don't understand. Cascade's history serializer (client.js) tags every
-        // non-user role as <assistant>, so a 20KB developer block ends up
-        // looking like an assistant injecting system instructions — Cascade's
-        // policy filter blocks it. Fold developer into system to match the
-        // shape opencode sends.
-        const rawRole = item.role || 'user';
-        const role = rawRole === 'developer' ? 'system' : rawRole;
         messages.push({
-          role,
+          role: item.role || 'user',
           content: normalizeMessageContent(item.content),
         });
       } else if (item.type === 'function_call') {
