@@ -1178,7 +1178,7 @@ function ApiServiceConfigPanel({
       <section className="api-config-row">
         <div className="api-config-copy">
           <strong>Codex 配置</strong>
-          <p>把当前 API 服务地址和密钥写入 ~/.codex/，或回滚到接管前的备份。</p>
+          <p>把当前地址和密钥写入 ~/.codex/，并切到 Codex 推荐模型。</p>
         </div>
         <div className="api-config-actions">
           <button
@@ -1207,7 +1207,7 @@ function ApiServiceConfigPanel({
       <section className="api-config-row">
         <div className="api-config-copy">
           <strong>Claude 配置</strong>
-          <p>把当前地址和密钥写入 ~/.claude/settings.json，或恢复接管前备份。</p>
+          <p>把当前地址和密钥写入 ~/.claude/settings.json，并切到 Claude 推荐模型。</p>
         </div>
         <div className="api-config-actions">
           <button

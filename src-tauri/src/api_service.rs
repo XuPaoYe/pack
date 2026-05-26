@@ -30,6 +30,8 @@ pub const DEFAULT_HOST: &str = "0.0.0.0";
 pub const DEFAULT_PORT: u16 = 51888;
 /// 默认 API Key 前缀；首次启动会生成 `agt_superai_<随机串>`。
 pub const API_KEY_PREFIX: &str = "agt_superai_";
+const CLAUDE_RECOMMENDED_MODEL: &str = "claude-sonnet-4.6";
+const CODEX_RECOMMENDED_MODEL: &str = "gpt-5.3-codex";
 
 /// sidecar 启动后等待 stdout 报告端口的最长时长。
 /// sidecar 在打印 "Server on http://..." 之前会先 await
@@ -71,6 +73,19 @@ impl ProxyTarget {
             .map(|guard| guard.clone())
             .unwrap_or_default()
     }
+}
+
+fn claude_preferred_model(model_id: &str) -> String {
+    let trimmed = model_id.trim();
+    if trimmed.starts_with("claude-") {
+        trimmed.to_string()
+    } else {
+        CLAUDE_RECOMMENDED_MODEL.to_string()
+    }
+}
+
+fn codex_preferred_model(_model_id: &str) -> String {
+    CODEX_RECOMMENDED_MODEL.to_string()
 }
 
 struct Sidecar {
@@ -1455,17 +1470,24 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
         }
     }
 
-    // SuperAI 仍然保留模型选择权：客户端请求体里的 model 仅作为参考，
-    // 真正发给 sidecar 的 model 以 SuperAI 当前配置为准。除此之外不再
-    // 对请求语义做额外改写。
+    // SuperAI 仍然保留模型选择权，但不同客户端走各自推荐模型：
+    // - /v1/messages  (Claude Code) → Claude 推荐模型
+    // - /v1/responses (Codex CLI)   → Codex 推荐模型
+    // - /v1/chat/completions         → 保持全局默认模型
     let current_default_model = target.default_model_snapshot();
-    if !current_default_model.is_empty()
+    let effective_model_for_path = match path {
+        "/v1/messages" => claude_preferred_model(&current_default_model),
+        "/v1/responses" => codex_preferred_model(&current_default_model),
+        "/v1/chat/completions" => current_default_model.clone(),
+        _ => String::new(),
+    };
+    if !effective_model_for_path.is_empty()
         && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/responses")
         && !body.is_empty()
     {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
             if let Some(obj) = value.as_object_mut() {
-                obj.insert("model".to_string(), Value::String(current_default_model));
+                obj.insert("model".to_string(), Value::String(effective_model_for_path));
                 if let Ok(new_body) = serde_json::to_vec(&value) {
                     body = new_body;
                 }

@@ -91,7 +91,8 @@ const WINDSURF_USER_STATUS_PATH: &str =
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
 const DEFAULT_WINDSURF_API_MODEL: &str = "claude-sonnet-4.6";
-const CODEX_RECOMMENDED_MODEL: &str = "claude-sonnet-4.6";
+const CLAUDE_RECOMMENDED_MODEL: &str = "claude-sonnet-4.6";
+const CODEX_RECOMMENDED_MODEL: &str = "gpt-5.3-codex";
 const SUPERAI_CRYPTO_V2_PREFIX: &str = "v2:";
 // Legacy AES key/IV: 仅用于解密 v2 之前版本写入磁盘的旧凭据。
 // 新数据均使用 load_or_create_superai_master_key() 动态生成的 per-install 主密钥加密，
@@ -8948,10 +8949,12 @@ fn set_api_service_default_model(app: tauri::AppHandle, model: String) -> Result
     write_settings_record(&app, &settings)?;
     // 在跑就立刻热更，不在跑只持久化等下次启动。
     let _ = api_service::update_default_model(&settings.api_service_default_model);
-    // 顺手把 ~/.codex/config.toml 的 model 行原地改写，
-    // 这样 codex 重启后 TUI 顶部 `model:` 跟 SuperAI UI 一致。
+    // 顺手把 ~/.codex/config.toml 的 model 行原地改写，但 Codex 始终按自己的
+    // 推荐模型策略同步：Claude 族保留原值，其他族统一回落到 Claude 默认模型，
+    // 避免用户在全局切到 GPT 后把 Codex 也拖进不稳定链路。
     // 用户没点过"配置Codex"时该函数返回 false，不会擅自创建文件。
-    if let Err(error) = rewrite_managed_model_config(&settings.api_service_default_model) {
+    let codex_model = codex_preferred_model(&settings.api_service_default_model);
+    if let Err(error) = rewrite_managed_model_config(&codex_model) {
         eprintln!("[SuperAI] 改写 codex config.toml model 行失败: {error}");
     }
     Ok(())
@@ -9081,11 +9084,16 @@ struct CodexAppSetupResult {
 }
 
 fn codex_preferred_model(model_id: &str) -> String {
+    let _ = model_id;
+    CODEX_RECOMMENDED_MODEL.to_string()
+}
+
+fn claude_preferred_model(model_id: &str) -> String {
     let trimmed = model_id.trim();
     if trimmed.starts_with("claude-") {
         trimmed.to_string()
     } else {
-        CODEX_RECOMMENDED_MODEL.to_string()
+        CLAUDE_RECOMMENDED_MODEL.to_string()
     }
 }
 
@@ -9542,6 +9550,7 @@ fn configure_claude_app(app: tauri::AppHandle) -> Result<ClaudeAppSetupResult, S
     if model_id.is_empty() {
         return Err("尚未选择默认模型，请先在 API 服务配置里挑一个".to_string());
     }
+    let effective_model_id = claude_preferred_model(&model_id);
 
     let claude_home = claude_home_dir()?;
     fs::create_dir_all(&claude_home)
@@ -9555,7 +9564,7 @@ fn configure_claude_app(app: tauri::AppHandle) -> Result<ClaudeAppSetupResult, S
     Ok(ClaudeAppSetupResult {
         settings_path: settings_path.display().to_string(),
         base_url: claude_base_url,
-        model_id,
+        model_id: effective_model_id,
         settings_backup_path,
     })
 }
