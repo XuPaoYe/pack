@@ -976,21 +976,6 @@ type ClaudeAppRestoreResult = {
   settingsRemoved: boolean;
 };
 
-type CodexAppSetupResult = {
-  configPath: string;
-  authPath: string;
-  configBackupPath: string | null;
-  authBackupPath: string | null;
-  authNeutralized: boolean;
-};
-
-type CodexAppRestoreResult = {
-  steps: string[];
-  authRestoredFromBackup: boolean;
-  configRestoredFromBackup: boolean;
-  configRemoved: boolean;
-};
-
 function ApiServiceCard({
   status,
   busy,
@@ -1112,10 +1097,6 @@ function ApiServiceConfigPanel({
   pref,
   onChangeFamily,
   onChangeEffort,
-  onConfigureCodex,
-  onRestoreCodex,
-  configuringCodex,
-  restoringCodex,
   onConfigureClaude,
   onRestoreClaude,
   configuringClaude,
@@ -1126,10 +1107,6 @@ function ApiServiceConfigPanel({
   pref: ApiModelPref;
   onChangeFamily: (family: string) => void;
   onChangeEffort: (effort: EffortKey) => void;
-  onConfigureCodex: () => void;
-  onRestoreCodex: () => void;
-  configuringCodex: boolean;
-  restoringCodex: boolean;
   onConfigureClaude: () => void;
   onRestoreClaude: () => void;
   configuringClaude: boolean;
@@ -1173,35 +1150,6 @@ function ApiServiceConfigPanel({
             <span className="effort-segment placeholder">不支持</span>
           </div>
         )}
-      </section>
-
-      <section className="api-config-row">
-        <div className="api-config-copy">
-          <strong>Codex 配置</strong>
-          <p>把当前地址和密钥写入 ~/.codex/，并切到 Codex 推荐模型。</p>
-        </div>
-        <div className="api-config-actions">
-          <button
-            type="button"
-            className="superai-api-secondary"
-            onClick={onConfigureCodex}
-            disabled={!running || configuringCodex || restoringCodex}
-            title={running ? "写入 ~/.codex/config.toml 与 auth.json" : "请先启动 API 服务"}
-          >
-            <CodexIcon size={14} />
-            {configuringCodex ? "配置中…" : "配置 Codex"}
-          </button>
-          <button
-            type="button"
-            className="superai-api-secondary"
-            onClick={onRestoreCodex}
-            disabled={configuringCodex || restoringCodex}
-            title={`从 .superai-bak 恢复，没有备份则尽量移除 ${APP_NAME} 痕迹`}
-          >
-            <RotateCcw size={14} />
-            {restoringCodex ? "恢复中…" : "恢复 Codex"}
-          </button>
-        </div>
       </section>
 
       <section className="api-config-row">
@@ -1319,8 +1267,6 @@ function App() {
   const [apiServicePortInput, setApiServicePortInput] = useState(String(DEFAULT_API_SERVICE_PORT));
   const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
-  const [isConfiguringCodex, setIsConfiguringCodex] = useState(false);
-  const [isRestoringCodex, setIsRestoringCodex] = useState(false);
   const [isConfiguringClaude, setIsConfiguringClaude] = useState(false);
   const [isRestoringClaude, setIsRestoringClaude] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -2472,42 +2418,6 @@ function App() {
     }
   }, [apiService?.running, showNormalizedError, showNotice]);
 
-  const configureCodexApp = useCallback(async () => {
-    if (!isTauri()) {
-      showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
-      return;
-    }
-    if (!apiService?.running) {
-      showNotice("error", "请先启动 API 服务");
-      return;
-    }
-    setIsConfiguringCodex(true);
-    try {
-      await invoke<CodexAppSetupResult>("configure_codex_app");
-      showNotice("success", "Codex 已配置完成，请重启 Codex App / CLI 生效。");
-    } catch (error) {
-      showNormalizedError("配置 Codex 失败", error);
-    } finally {
-      setIsConfiguringCodex(false);
-    }
-  }, [apiService?.running, showNormalizedError, showNotice]);
-
-  const restoreCodexApp = useCallback(async () => {
-    if (!isTauri()) {
-      showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
-      return;
-    }
-    setIsRestoringCodex(true);
-    try {
-      await invoke<CodexAppRestoreResult>("restore_codex_app");
-      showNotice("success", "Codex 已恢复完成，请重启 Codex App / CLI 生效。");
-    } catch (error) {
-      showNormalizedError("恢复 Codex 配置失败", error);
-    } finally {
-      setIsRestoringCodex(false);
-    }
-  }, [showNormalizedError, showNotice]);
-
   const restoreClaudeApp = useCallback(async () => {
     if (!isTauri()) {
       showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
@@ -3058,10 +2968,6 @@ function App() {
             pref={apiPref}
             onChangeFamily={handleChangeFamily}
             onChangeEffort={handleChangeEffort}
-            onConfigureCodex={() => void configureCodexApp()}
-            onRestoreCodex={() => void restoreCodexApp()}
-            configuringCodex={isConfiguringCodex}
-            restoringCodex={isRestoringCodex}
             onConfigureClaude={() => void configureClaudeApp()}
             onRestoreClaude={() => void restoreClaudeApp()}
             configuringClaude={isConfiguringClaude}
