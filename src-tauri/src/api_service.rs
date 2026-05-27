@@ -31,7 +31,6 @@ pub const DEFAULT_PORT: u16 = 51888;
 /// 默认 API Key 前缀；首次启动会生成 `agt_superai_<随机串>`。
 pub const API_KEY_PREFIX: &str = "agt_superai_";
 const CLAUDE_RECOMMENDED_MODEL: &str = "claude-sonnet-4.6";
-const CODEX_RECOMMENDED_MODEL: &str = "gpt-5.3-codex";
 
 /// sidecar 启动后等待 stdout 报告端口的最长时长。
 /// sidecar 在打印 "Server on http://..." 之前会先 await
@@ -82,10 +81,6 @@ fn claude_preferred_model(model_id: &str) -> String {
     } else {
         CLAUDE_RECOMMENDED_MODEL.to_string()
     }
-}
-
-fn codex_preferred_model(_model_id: &str) -> String {
-    CODEX_RECOMMENDED_MODEL.to_string()
 }
 
 struct Sidecar {
@@ -1406,6 +1401,19 @@ fn handle_request(mut request: Request, api_key: &str, target: Option<&ProxyTarg
         }
     }
 
+    if path == "/v1/responses" || path == "/v1/response" {
+        let _ = request.respond(json_response(
+            404,
+            &json!({
+                "error": {
+                    "message": "未知路径: /v1/responses",
+                    "type": "not_found",
+                }
+            }),
+        ));
+        return;
+    }
+
     if let Some(target) = target {
         if path.starts_with("/v1/") || path.starts_with("/auth/") || path == "/v1/models" {
             proxy_to_sidecar(request, target, &path, &query);
@@ -1471,18 +1479,16 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
     }
 
     // SuperAI 仍然保留模型选择权，但不同客户端走各自推荐模型：
-    // - /v1/messages  (Claude Code) → Claude 推荐模型
-    // - /v1/responses (Codex CLI)   → Codex 推荐模型
-    // - /v1/chat/completions         → 保持全局默认模型
+    // - /v1/messages          → Claude 推荐模型
+    // - /v1/chat/completions  → 保持全局默认模型
     let current_default_model = target.default_model_snapshot();
     let effective_model_for_path = match path {
         "/v1/messages" => claude_preferred_model(&current_default_model),
-        "/v1/responses" => codex_preferred_model(&current_default_model),
         "/v1/chat/completions" => current_default_model.clone(),
         _ => String::new(),
     };
     if !effective_model_for_path.is_empty()
-        && (path == "/v1/chat/completions" || path == "/v1/messages" || path == "/v1/responses")
+        && (path == "/v1/chat/completions" || path == "/v1/messages")
         && !body.is_empty()
     {
         if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
@@ -1656,7 +1662,7 @@ fn proxy_to_sidecar(mut request: Request, target: &ProxyTarget, path: &str, quer
     // UI 高亮，丢失一次没关系。
     if matches!(
         path,
-        "/v1/chat/completions" | "/v1/messages" | "/v1/responses"
+        "/v1/chat/completions" | "/v1/messages"
     ) && should_probe_last_used_account()
     {
         let target_for_probe = target.clone();
@@ -1734,10 +1740,7 @@ fn response_headers(upstream_resp: &reqwest::blocking::Response) -> Vec<Header> 
 }
 
 fn is_chat_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/chat/completions" | "/v1/messages" | "/v1/responses"
-    )
+    matches!(path, "/v1/chat/completions" | "/v1/messages")
 }
 
 fn is_probe_pending_error(body: &[u8]) -> bool {
