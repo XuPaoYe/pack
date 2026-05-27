@@ -592,25 +592,6 @@ type ModelFamily = {
 
 const MODEL_FAMILIES: ModelFamily[] = [
   {
-    key: "gpt-5.4",
-    label: "GPT-5.4",
-    aliases: ["GPT-5.4"],
-    protocol: "openai",
-    efforts: ["low", "medium", "high", "xhigh"],
-    defaultEffort: "medium",
-    resolveId: (effort) => (effort ? `gpt-5.4-${effort}` : "gpt-5.4-medium"),
-  },
-  {
-    key: "gpt-5.5",
-    label: "GPT-5.5",
-    aliases: ["GPT-5.5", "GPT-5.5 Low Thinking", "GPT-5.5 Medium Thinking", "GPT-5.5 High Thinking"],
-    protocol: "openai",
-    efforts: ["low", "medium", "high", "xhigh"],
-    defaultEffort: "medium",
-    knownAvailable: true,
-    resolveId: (effort) => (effort ? `gpt-5.5-${effort}` : "gpt-5.5-medium"),
-  },
-  {
     key: "claude-opus-4.6",
     label: "Claude Opus 4.6",
     aliases: ["Claude Opus 4.6", "claude-opus-4-6"],
@@ -626,16 +607,6 @@ const MODEL_FAMILIES: ModelFamily[] = [
     efforts: ["low", "medium", "high", "xhigh"],
     defaultEffort: "medium",
     resolveId: (effort) => (effort ? `claude-opus-4.7-${effort}` : "claude-opus-4.7-medium"),
-  },
-  {
-    key: "kimi-k2-6",
-    label: "Kimi K2.6",
-    aliases: ["Kimi K2.6", "kimi-k2.6", "kimi-k2-6"],
-    protocol: "openai",
-    efforts: [],
-    knownAvailable: true,
-    free: true,
-    resolveId: () => "kimi-k2-6",
   },
   {
     key: "gemini-3.0-flash",
@@ -703,7 +674,7 @@ const MODEL_FAMILIES: ModelFamily[] = [
   },
 ];
 
-const FALLBACK_FAMILY_KEY = "gpt-5.4";
+const FALLBACK_FAMILY_KEY = "claude-opus-4.7";
 
 type ApiModelPref = {
   family: string;
@@ -1242,7 +1213,7 @@ function App() {
     apiServiceEnabled: false,
     apiServiceHost: "0.0.0.0",
     apiServicePort: DEFAULT_API_SERVICE_PORT,
-    apiServiceDefaultModel: "gpt-5.4-medium",
+    apiServiceDefaultModel: "claude-opus-4.7-medium",
   });
   const [apiServiceHostInput, setApiServiceHostInput] = useState("0.0.0.0");
   const [apiServicePortInput, setApiServicePortInput] = useState(String(DEFAULT_API_SERVICE_PORT));

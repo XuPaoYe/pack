@@ -1971,8 +1971,6 @@ fn fallback_models_payload() -> Value {
         "claude-3-5-sonnet",
         "claude-3-7-sonnet",
         "claude-sonnet-4",
-        "gpt-4o",
-        "gpt-4.1",
         "gemini-2.5-pro",
     ];
     let data: Vec<Value> = ids
