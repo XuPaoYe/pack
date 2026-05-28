@@ -44,14 +44,14 @@ Do not copy huge unrelated parts from either project. Extract ideas and narrow i
 
 - **codex**：本地 `~/.codex/auth.json`、JSON 粘贴、OAuth
 - **gemini**：本地 `~/.gemini/oauth_creds.json` / `google_accounts.json` / `settings.json`、JSON 粘贴、OAuth
-- **superai**（公开版核心；内部兼容历史 provider 值）：批量密钥导入；完全版还支持邮箱密码 / token / OAuth 等导入路径
+- **superai**：保留左侧 tab、右侧页面、导入弹窗和 API 服务卡片的 UI 壳；内部旧接入已移除
 
 核心账号操作（已实现）：
 
 - 列表 / 搜索 / 过滤
 - 导入 / 更新 / 导出（公开版只导出 batch_key，完全版导出原始凭证）
 - 切换：写回 codex/gemini 本地配置；SuperAI 当前仅保留 UI 壳
-- 刷新 token / 配额，含 SuperAI 公开版本地累计用量（详见后节）
+- 刷新 token / 配额（Codex / Gemini / Antigravity）
 
 Avoid expanding into more providers. This app is intentionally not a full clone of Cockpit Tools.
 
@@ -120,57 +120,11 @@ When adding screens, prefer:
 - `src-tauri/src/lib.rs` 中 API 服务相关命令当前返回占位状态，用于支撑现有 UI，不提供真实转发能力。
 - 如果未来要重新接回服务，请按当前产品目标重新设计实现，不要默认仓库里还保留旧代理架构。
 
-## 公开仓库 / CI 可见性（永久执行）
+## 命名规则
 
-> 仓库一旦公开（或 GitHub Actions 日志公开），下面这些位置任何人都能看到。**不允许出现旧上游品牌 / 旧项目代号 / 旧三字母缩写 / 旧密钥前缀等字面量**：
->
-> 1. `.github/workflows/*.yml` 文件本体 + 其中所有注释 / step name / echo / if-表达式。
-> 2. CI 步骤 stdout / stderr，以及构建脚本自身的输出。
-> 3. commit message、PR title / body、release notes、issue / discussion 文本。
-> 4. release artifacts 文件名（`Super_AI_*.dmg` / `*.exe` / `*.msi` / `latest.json`）以及 `tauri-action` 自动生成的 release body。
->
-> **允许保留**（不在公开 CI 日志里高频出现，且属于操作必需）：
->
-> - 为兼容历史本地数据保留的极少量旧文件名。
->
-> **新增 workflow / 脚本前自检**：把改动 grep 一遍旧上游品牌、旧项目代号、旧三字母缩写、旧密钥前缀，落到上述 1-4 条任一项就要换措辞（中性的"vendor 子模块" / "上游分发渠道" / "runtime 二进制" 都行）。
-
-## 品牌脱敏规则（永久执行）
-
-> **必须遵守**：所有用户可见 / 可观察的位置，凡是出现旧上游品牌或旧三字母缩写都改成 SuperAI / superai。任何新增代码、UI 文本、CSS 类名、IPC 命令名、emit 事件名、日志字符串都直接用 SuperAI / superai。
-
-**强制替换映射**（任何 PR / commit 不得偏离）：
-
-| 原始 | 替换 |
-|---|---|
-| 旧上游品牌 / 旧上游 API 名（用户可见英文）| `SuperAI` |
-| 旧上游项目代号（项目 / 路径代号） | `superai-sidecar` |
-| 旧上游内部 id 字段（/v1/models 输出字段） | `_internal_id` |
-| `owned_by: 'windsurf'`（/v1/models 输出） | `owned_by: 'superai'` |
-| 旧上游 proxy 响应头 | `org-superai-proxy` |
-| Tauri command `*_windsurf_*` / `*_windsurf_api*` | `*_api_service*` 或 `*_superai_*` |
-| `AppSettings` 旧 API 服务字段 | `api_service_*`（必须挂 `serde(alias = "...")` 兼容老 settings） |
-| CSS class `.windsurf-*` | `.superai-*` |
-| localStorage key `super-ai:windsurf-*` | `super-ai:api-service-*` 或 `super-ai:superai-*` |
-| emit event `windsurf-*` | `superai-*` 或 `api-service-*` |
-
-**TS / JS 旧 provider 字面量要绕过 esbuild / vite 常量折叠**。直接 `String.fromCharCode(...)` 可能被构建器在编译期折叠成旧 provider 字符串又塞回 bundle。统一用：
-
-```ts
-const PROVIDER_SUPERAI = [119, 105, 110, 100, 115, 117, 114, 102]
-  .map((c) => String.fromCharCode(c))
-  .join("") as "windsurf";
-```
-
-`.map(...).join("")` 形式 esbuild 不会折叠，dist 里就拿不到字面量。`src/App.tsx` 和 `src/lib/authParser.ts` 顶部已有此模式，新增组件请复用同样的 `PROVIDER_SUPERAI` 常量，不要手写新的 `"windsurf"` 字符串字面量。
-
-**协议字面量保留**（仅限仍在用的兼容解析路径，动了会立即坏功能，不要替换）：
-- 上游 protobuf metadata 里的旧 provider 字符串：服务端校验 ide_name / extension_name。
-- 上游 URL 与 User-Agent：服务端校验。
-- 内部 model provider tag：走 `models.js` 的 `owned_by` 收口替换，不要改值本身。
-- DB 历史 provider 行：用户开 sqlite cli 才看得到，改它要 schema 迁移，风险/收益不划算。
-
-**回归命令统一在最末 "Verification" 节**。任何一项 `> 0`，新增的字面量必须按上面规则消化掉再合并。
+- 所有用户可见文案统一使用 `SuperAI` / `superai`。
+- 历史 provider 字面量只允许出现在兼容解析代码中，且必须用非明文构造方式，避免打进前端 bundle。
+- 新增设置字段、IPC 命令、事件名、CSS class、localStorage key 时，不要再引入历史命名。
 
 ## 构建模式：Public（默认） vs Full
 
@@ -204,14 +158,14 @@ const PROVIDER_SUPERAI = [119, 105, 110, 100, 115, 117, 114, 102]
 | # | 功能点 | 文件 | public（默认） | full |
 |---|---|---|---|---|
 | 1 | 邮箱/token 文本脱敏 | `App.tsx` `sanitizeUserFacingText` | ✅ regex 替成 `[account]`/`[secret]` | ❌ 原样 |
-| 2 | windsurf 账号卡片身份 | `App.tsx` `shouldHideAccountDetails` / `accountDisplayLabel` | ✅ 显示 `SUPERAI-XXXXXXX` | ❌ 真 email |
+| 2 | SuperAI 账号卡片身份 | `App.tsx` `shouldHideAccountDetails` / `accountDisplayLabel` | ✅ 显示 `SUPERAI-XXXXXXX` | ❌ 真 email |
 | 3 | API 服务模型族选项 | `App.tsx` `modelFamiliesForBuild` | ✅ 仅 `PUBLIC_MODEL_FAMILY_KEYS` | ❌ 全部 `MODEL_FAMILIES` |
 | 4 | 单号导出格式 | `App.tsx` `handleExportAccount` + Rust `export_account` / `export_public_superai_account` | ✅ 走 `export_public_superai_account` 返 batch_key | ❌ 走 `export_account` 返原始 JSON |
 | 5 | 批量导出格式 | `App.tsx` `handleBatchExport` 同上分支 | ✅ 同 #4 | ❌ 同 #4 |
-| 6 | Rust 兜底拒绝原始凭证导出 | `lib.rs` `export_account` 中 `is_public_build()` | ✅ `Err("公开版不允许导出 SuperAI 原始凭证")` | ❌ 走 `build_windsurf_payload` |
+| 6 | Rust 兜底拒绝原始凭证导出 | `lib.rs` `export_account` 中 `is_public_build()` | ✅ `Err("公开版不允许导出 SuperAI 原始凭证")` | ❌ 返回原始 JSON |
 | 7 | 账号本地累计用量 | `lib.rs` `bump_public_usage` 等（详见下节） | ✅ 触发条件：账号 `auth_payload` 含 `batch_key`，只有公开版的批量密钥导入路径会写这个字段 | ❌ 不写 batch_key，helper 全部 no-op |
-| 8 | windsurf 卡片配额面板可见 metric | `App.tsx` 配额渲染处 | ✅ 仅 `superai-daily` / `superai-public` / 标签为"日限"的 metric；缺失时强制兜底 0% 进度条（公开版下 `superai-public` 的标签也固定为"日限"，UI 不暴露"额度"二字） | ❌ 全部 metric |
-| 9 | windsurf 添加账号弹窗 tab | `App.tsx` `superaiImportModeOrder` + `mode === "password"` JSX | ✅ 仅"批量密钥" | ❌ "批量密钥" + "账号密码"（邮箱密码登录单个账号，调 `add_superai_account_by_password`） |
+| 8 | SuperAI 卡片配额面板可见 metric | `App.tsx` 配额渲染处 | ✅ 仅 `superai-daily` / `superai-public` / 标签为"日限"的 metric；缺失时强制兜底 0% 进度条（公开版下 `superai-public` 的标签也固定为"日限"，UI 不暴露"额度"二字） | ❌ 全部 metric |
+| 9 | SuperAI 添加账号弹窗 tab | `App.tsx` `superaiImportModeOrder` + `mode === "password"` JSX | ✅ 仅"批量密钥" | ❌ "批量密钥" + "账号密码"（邮箱密码登录单个账号，调 `add_superai_account_by_password`） |
 
 ### 与构建模式无关（不要错误地包条件）
 
@@ -219,9 +173,9 @@ const PROVIDER_SUPERAI = [119, 105, 110, 100, 115, 117, 114, 102]
 
 - **DB 加密兼容**：历史 SuperAI 账号的本地加密读取兼容不依赖构建模式。
 - **codex / gemini 导入面板的可选模式**：永远是 oauth/paste/local/file 四件套，**不**由 build 决定，请勿误加 `IS_PUBLIC_BUILD` 判。
-- **codex / gemini 导入面板的可选模式**：永远是 oauth/paste/local/file 四件套，**不**由 build 决定，请勿误加 `IS_PUBLIC_BUILD` 判。（windsurf 的 tab 列表是 build-aware 的，详见上面差异表第 9 行）
+- **SuperAI 导入面板的 tab 列表**：保留当前 UI 壳的 build-aware 表现，若未来恢复真实接入需重新评估。
 
-## SuperAI 残留约束
+## SuperAI 现状
 
 当前仓库对 `SuperAI` 的目标是：
 
@@ -238,11 +192,6 @@ const PROVIDER_SUPERAI = [119, 105, 110, 100, 115, 117, 114, 102]
 ```bash
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets
 npm run check  # = node scripts/app-build.mjs && npm run lint
-
-# 品牌脱敏回归（规则在 "品牌脱敏规则" 节）
-grep -c SuperAI dist/assets/*.js                            # 必须为 0
-grep -c windsurf dist/assets/*.js                            # 必须为 0
-grep -ic windsurf dist/assets/*.css                          # 必须为 0
 ```
 
 本地浏览器预览：

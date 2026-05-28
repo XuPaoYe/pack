@@ -1,7 +1,7 @@
 import { normalizeUnixSeconds, nowUnixSeconds } from "./time";
 
 // 仍保留历史 payload 识别能力，避免旧数据或粘贴内容直接触发解析报错；
-// UI 侧已经不再暴露 SuperAI 账号入口。
+// UI 侧只保留 SuperAI 壳子，不再依赖旧内部接入链路。
 const PROVIDER_SUPERAI = "superai" as const;
 const __LEGACY_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
   .map((c) => String.fromCharCode(c))

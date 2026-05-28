@@ -73,7 +73,6 @@ const DEFAULT_API_SERVICE_MODEL: &str = "claude-sonnet-4.6";
 const LOCAL_CREDENTIAL_CRYPTO_V2_PREFIX: &str = "v2:";
 // Legacy AES key/IV: 仅用于解密 v2 之前版本写入磁盘的旧凭据。
 // 这里保留以保证老用户升级后历史账号仍可读。请勿用于新增加密。
-// 这里保留以保证老用户升级后历史账号仍可读。请勿用于新增加密。
 const LEGACY_PROVIDER_AES_KEY_HEX: &str =
     "b9c1e79783adb25cdb3667ae62c168e18868438d62a47428abeb7b41491ff2ee";
 const LEGACY_PROVIDER_AES_IV_HEX: &str = "36c38e9f6f27302c0f784f7b6556be95";

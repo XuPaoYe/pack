@@ -1132,9 +1132,8 @@ function App() {
   const [refreshingProviders, setRefreshingProviders] = useState<Set<Provider>>(() => new Set());
   const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
   const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
-  const [apiServiceEnabled, setApiServiceEnabled] = useState(false);
-  const [isApiServiceStarting] = useState(false);
-  const [isApiServiceBusy] = useState(false);
+  const isApiServiceStarting = false;
+  const isApiServiceBusy = false;
   const [settings, setSettings] = useState<AppSettings>({
     theme: "system",
     autoLaunch: false,
@@ -1146,7 +1145,7 @@ function App() {
   });
   const [apiServiceHostInput, setApiServiceHostInput] = useState("0.0.0.0");
   const [apiServicePortInput, setApiServicePortInput] = useState(String(DEFAULT_API_SERVICE_PORT));
-  const [apiServiceModels] = useState<ApiServiceModel[]>([]);
+  const apiServiceModels = useMemo<ApiServiceModel[]>(() => [], []);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
   const [isConfiguringClaude] = useState(false);
   const [isRestoringClaude] = useState(false);
@@ -1156,8 +1155,6 @@ function App() {
   const completeOAuthRef = useRef<CompleteOAuthFn | null>(null);
   const hasStartedStartupRefresh = useRef(false);
   const activeAccountRefreshInFlight = useRef<string | null>(null);
-  const apiServiceEnabledRef = useRef(apiServiceEnabled);
-  const apiServiceRunningRef = useRef(false);
   const [accountScrollbar, setAccountScrollbar] = useState({
     visible: false,
     top: 0,
@@ -1186,13 +1183,6 @@ function App() {
     lastError: null,
   }), [settings.apiServiceHost, settings.apiServicePort, apiPref]);
   const apiServiceRunning = Boolean(apiService.running);
-  useEffect(() => {
-    apiServiceEnabledRef.current = apiServiceEnabled;
-  }, [apiServiceEnabled]);
-
-  useEffect(() => {
-    apiServiceRunningRef.current = apiServiceRunning;
-  }, [apiServiceRunning]);
 
   useEffect(() => {
     pendingOAuthRef.current = pendingOAuth;
@@ -1929,7 +1919,6 @@ function App() {
       .then((storedSettings) => {
         if (storedSettings) {
           setSettings(storedSettings);
-          setApiServiceEnabled(Boolean(storedSettings.apiServiceEnabled));
           setApiServiceHostInput(storedSettings.apiServiceHost);
           setApiServicePortInput(String(storedSettings.apiServicePort));
         }
