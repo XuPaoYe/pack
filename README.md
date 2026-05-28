@@ -62,21 +62,6 @@ npm run build:full
 | Windows x64 | `x86_64-pc-windows-msvc` | `npm run build:win:x64` | `npm run build:win:x64:full` |
 | Windows ARM64 | `aarch64-pc-windows-msvc` | `npm run build:win:arm64` | `npm run build:win:arm64:full` |
 
-mac universal 包需要先准备 universal sidecar：
-
-```bash
-TARGET=universal-apple-darwin npm run build:sidecar
-```
-
-Windows x64 / ARM64 包需要分别准备对应 sidecar，并建议在对应 Windows 构建机或 CI 上打包：
-
-```bash
-TARGET=windows-x64 npm run build:sidecar
-TARGET=windows-arm64 npm run build:sidecar
-```
-
-Windows ARM64 还依赖对应架构的 SuperAI runtime / language server。如果本机无法自动找到，手动设置 `WINDSURF_LS_ARM64_PATH` 指向 ARM64 版本二进制。
-
 打包前需要安装对应 Rust target，例如：
 
 ```bash
@@ -85,14 +70,6 @@ rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
 ```
 
 ## 维护命令
-
-第一次开发或升级 vendor 后先构建 sidecar：
-
-```bash
-npm run build:sidecar
-```
-
-需要 `bun >= 1.3`，并提前安装好对应的本地 IDE 客户端，或通过环境变量指向 language server 二进制（详见 `scripts/build-sidecar.sh`）。这是维护命令，不是 App 打包入口。
 
 检查代码：
 
@@ -106,47 +83,11 @@ npm run check
 npm run lint
 ```
 
-## Codex 接入本地 API 服务
+## API 服务状态
 
-如果需要让本机 Codex 直接走 SuperAI 暴露的 OpenAI 兼容入口，最稳的方式是只配置 `~/.codex/auth.json` 和 `~/.codex/config.toml` 这两个文件。
+仓库当前只保留 `SuperAI` 页面和 API 服务卡片的 UI 壳子，不再内置可运行的本地 API 代理、sidecar 或 language server 打包链路。
 
-`~/.codex/auth.json`：
-
-```json
-{
-  "OPENAI_API_KEY": "你的 API 服务密钥"
-}
-```
-
-`~/.codex/config.toml`：
-
-```toml
-model_provider = "superai"
-model = "gpt-5.4-medium"
-
-approval_policy = "on-request"
-sandbox_mode = "workspace-write"
-network_access = "enabled"
-disable_response_storage = true
-
-personality = "pragmatic"
-service_tier = "fast"
-
-[model_providers.superai]
-name = "Super AI"
-base_url = "http://127.0.0.1:你的端口/v1"
-wire_api = "responses"
-requires_openai_auth = true
-```
-
-注意：
-
-- 不要写 `env_key = "OPENAI_API_KEY"`。Codex 会把它当成"强制从环境变量取值"，不会再回退到 `auth.json` 读 key。
-- `model_provider` 和 `[model_providers.superai]` 都用小写 `superai`，不要写成 `SuperAI`。
-- `model` 直接写完整自定义模型 id，例如 `gpt-5.4-medium`，不要再拆成 `gpt-5.4` + `model_reasoning_effort`。
-- `auth.json` 里只保留 `OPENAI_API_KEY`，不要额外放 `tokens`、`last_refresh` 之类字段。
-- `base_url` 需要填可访问的 OpenAI 兼容根地址；如果你的本地代理实际监听的是 `http://127.0.0.1:12345`，这里就写 `http://127.0.0.1:12345/v1`。
-- 如果已经在 App 里启动了 API 服务，优先使用界面的“配置 Codex”按钮。应用会自动改写这两个文件，并在首次接管前备份原始配置。
+如果后续要重新接回真实服务，请基于当前 UI 和设置结构重新实现，不要假定仓库里仍存在旧的代理或 sidecar 运行时。
 
 ## 远程升级
 
@@ -182,7 +123,7 @@ src/App.css              主界面样式
 src/index.css            全局样式和主题变量
 src/lib/authParser.ts    Codex/Gemini/SuperAI JSON 解析
 src-tauri/               Tauri 2 桌面端工程
-scripts/                 开发、打包和 sidecar 脚本
+scripts/                 开发与打包脚本
 AGENTS.md                AI 开发协作说明
 ```
 

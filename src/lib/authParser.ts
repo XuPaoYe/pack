@@ -3,10 +3,10 @@ import { normalizeUnixSeconds, nowUnixSeconds } from "./time";
 // 仍保留历史 payload 识别能力，避免旧数据或粘贴内容直接触发解析报错；
 // UI 侧已经不再暴露 SuperAI 账号入口。
 const PROVIDER_SUPERAI = "superai" as const;
-const __SUPERAI_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
+const __LEGACY_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
   .map((c) => String.fromCharCode(c))
   .join("");
-const EXAFUNCTION_SUPERAI_AUD = "exafunction-" + __SUPERAI_AUD_PROTOCOL;
+const EXAFUNCTION_LEGACY_AUD = "exafunction-" + __LEGACY_AUD_PROTOCOL;
 
 export type Provider = "codex" | "gemini" | "superai" | "antigravity";
 
@@ -498,7 +498,7 @@ function looksLikeSuperAI(value: JsonObject): boolean {
   if (jwt) {
     const aud = stringField(jwt.aud) ?? "";
     const iss = stringField(jwt.iss) ?? "";
-    if (aud.includes(EXAFUNCTION_SUPERAI_AUD) || iss.includes(EXAFUNCTION_SUPERAI_AUD)) return true;
+    if (aud.includes(EXAFUNCTION_LEGACY_AUD) || iss.includes(EXAFUNCTION_LEGACY_AUD)) return true;
     const firebase = isObject(jwt.firebase) ? jwt.firebase : undefined;
     const signInProvider = stringField(firebase?.sign_in_provider);
     if (signInProvider === "password" && refreshToken) return true;

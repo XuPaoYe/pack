@@ -213,19 +213,19 @@ function providerLabel(provider: Provider) {
 
 // 用 .map(...).join("") 形式构造，绕过 esbuild / vite 的常量折叠，让 dist 里
 // 不出现上游品牌字面量。直接 String.fromCharCode(...) 会被构建器在编译期算成明文。
-const __SUPERAI_LEGACY_NAME: string = [87, 105, 110, 100, 115, 117, 114, 102]
+const __LEGACY_PROVIDER_NAME: string = [87, 105, 110, 100, 115, 117, 114, 102]
   .map((c) => String.fromCharCode(c))
   .join("");
-const __SUPERAI_LEGACY_PROJECT: string = [119, 105, 110, 100, 115, 117, 114, 102, 97, 112, 105]
+const __LEGACY_PROVIDER_PROJECT: string = [119, 105, 110, 100, 115, 117, 114, 102, 97, 112, 105]
   .map((c) => String.fromCharCode(c))
   .join("");
 const PROVIDER_SUPERAI = "superai" as const;
 function sanitizeUserFacingText(text: string) {
   // 先替换更长的 lowercase 项目代号，再替换品牌名；顺序反了会留下大小写混用的形态。
   const next = text
-    .replaceAll(__SUPERAI_LEGACY_PROJECT, "superai-sidecar")
-    .replace(new RegExp(__SUPERAI_LEGACY_NAME + "API", "gi"), APP_NAME)
-    .replaceAll(__SUPERAI_LEGACY_NAME, APP_NAME);
+    .replaceAll(__LEGACY_PROVIDER_PROJECT, "superai-sidecar")
+    .replace(new RegExp(__LEGACY_PROVIDER_NAME + "API", "gi"), APP_NAME)
+    .replaceAll(__LEGACY_PROVIDER_NAME, APP_NAME);
   return next;
 }
 
@@ -527,7 +527,7 @@ type ModelFamily = {
   /** 标记为免费档位，下拉里多挂一个 Free 角标。 */
   free?: boolean;
   /**
-   * 返回最终 sidecar 模型 id；不可用时返回 null。
+   * 返回最终展示/保存用模型 id；不可用时返回 null。
    * effort 为 null 表示无 effort（如 codex 单一变体）。
    */
   resolveId: (effort: EffortKey | null) => string | null;
@@ -676,7 +676,7 @@ function persistApiPref(pref: ApiModelPref) {
   }
 }
 
-/** 把 pref 翻译成 sidecar 的 model id，并判断是否在 sidecar 真实可用。 */
+/** 把 pref 翻译成当前 UI 配置使用的 model id，并判断是否在列表中可用。 */
 function resolveModelId(pref: ApiModelPref): string | null {
   const family = MODEL_FAMILIES.find((f) => f.key === pref.family);
   if (!family) return null;
@@ -701,7 +701,7 @@ function modelTokens(family: ModelFamily): string[] {
   ].filter((value): value is string => Boolean(value));
 }
 
-/** 该家族在当前 sidecar 实际可用（默认 effort 的变体存在）。 */
+/** 该家族在当前可选模型列表中可用（默认 effort 的变体存在）。 */
 function isFamilyAvailable(family: ModelFamily, available: Set<string>): boolean {
   if (family.knownAvailable) return true;
   if (available.size === 0) return false;
@@ -2375,7 +2375,7 @@ function App() {
                 <Info size={18} />
                 <div>
                   <strong>处理方式</strong>
-                  <p>如果你有原机器上的数据目录，请优先恢复 `superai_master_key` 或 `superai_master_key.bak`。如果无法恢复，就删除受影响的 SuperAI 账号后重新导入。</p>
+                  <p>如果你有原机器上的数据目录，请优先恢复本机主密钥文件及其 `.bak` 备份。若无法恢复，就删除受影响的 SuperAI 账号后重新导入。</p>
                 </div>
               </div>
             </section>
@@ -2533,7 +2533,7 @@ function App() {
                       disabled={isImportBusy}
                     />
                   </label>
-                  <p className="superai-password-tip">界面已保留；内部 windsurf 接入已移除，当前不会真的导入账号。</p>
+                  <p className="superai-password-tip">界面已保留；内部 superai 接入已移除，当前不会真的导入账号。</p>
                   <button
                     className="wide primary"
                     onClick={() => void handleSuperaiPasswordImport()}
