@@ -15,7 +15,6 @@
     "build:win:x64:full": "node scripts/tauri-build.mjs app full x86_64-pc-windows-msvc",
     "build:win:arm64": "node scripts/tauri-build.mjs app aarch64-pc-windows-msvc",
     "build:win:arm64:full": "node scripts/tauri-build.mjs app full aarch64-pc-windows-msvc",
-    "build:sidecar": "bash scripts/build-sidecar.sh",
     "lint": "eslint .",
     "check": "node scripts/app-build.mjs && npm run lint"
   },

@@ -1,7 +1,7 @@
 import { normalizeUnixSeconds, nowUnixSeconds } from "./time";
 
-// 后端 IPC 出口已经把内部协议名改写成 "superai"，前端只需要跟 "superai" 比较。
-// aud 校验路径仍需要上游协议字面量，所以单独从 charcode 构造，绕过 esbuild 常量折叠。
+// 仍保留历史 payload 识别能力，避免旧数据或粘贴内容直接触发解析报错；
+// UI 侧已经不再暴露 SuperAI 账号入口。
 const PROVIDER_SUPERAI = "superai" as const;
 const __SUPERAI_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
   .map((c) => String.fromCharCode(c))

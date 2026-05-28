@@ -1,10 +1,6 @@
 import type { AccountState, ManagedAccount } from "./authParser";
 import { formatDateTime, normalizeUnixSeconds, nowUnixSeconds } from "./time";
 
-const APP_NAME = [83, 117, 112, 101, 114, 32, 65, 73]
-  .map((c) => String.fromCharCode(c))
-  .join("");
-
 export type PlanBadge = {
   label: string;
   tone: "plus" | "team" | "enterprise" | "pro" | "ultra" | "free" | "unknown";
@@ -72,23 +68,9 @@ function resolveAntigravityPlanBadge(account: ManagedAccount): PlanBadge {
   return { label: account.plan || account.planType || "未知", tone: "unknown" };
 }
 
-function resolveSuperaiPlanBadge(account: ManagedAccount): PlanBadge {
-  const official = (account.plan || account.planType || "").trim();
-  const raw = normalizePlanKey(official);
-  if (!raw) return { label: APP_NAME, tone: "unknown" };
-  if (raw.includes("enterprise")) return { label: "Enterprise", tone: "enterprise" };
-  if (raw.includes("team")) return { label: "Team", tone: "team" };
-  if (raw.includes("trial")) return { label: "Trial", tone: "free" };
-  if (raw.includes("ultra") || raw.includes("max")) return { label: "Max", tone: "pro" };
-  if (raw.includes("pro")) return { label: "Pro", tone: "pro" };
-  if (raw.includes("free")) return { label: "Free", tone: "free" };
-  return { label: official, tone: "unknown" };
-}
-
 export function resolvePlanBadge(account: ManagedAccount): PlanBadge {
   if (account.provider === "gemini") return resolveGeminiPlanBadge(account);
   if (account.provider === "antigravity") return resolveAntigravityPlanBadge(account);
-  if (account.provider === "superai") return resolveSuperaiPlanBadge(account);
   return resolveCodexPlanBadge(account);
 }
 

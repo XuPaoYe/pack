@@ -54,10 +54,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": [
-      "binaries/superai-api",
-      "binaries/language_server"
-    ],
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }

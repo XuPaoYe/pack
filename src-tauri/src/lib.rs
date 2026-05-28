@@ -1,5 +1,3 @@
-mod api_service;
-
 use aes::Aes256;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
@@ -14,7 +12,6 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
@@ -91,7 +88,6 @@ const WINDSURF_USER_STATUS_PATH: &str =
 const WINDSURF_API_SERVER_HOSTS: [&str; 2] =
     ["server.codeium.com", "server.self-serve.windsurf.com"];
 const DEFAULT_WINDSURF_API_MODEL: &str = "claude-sonnet-4.6";
-const CLAUDE_RECOMMENDED_MODEL: &str = "claude-sonnet-4.6";
 const SUPERAI_CRYPTO_V2_PREFIX: &str = "v2:";
 // Legacy AES key/IV: 仅用于解密 v2 之前版本写入磁盘的旧凭据。
 // 新数据均使用 load_or_create_superai_master_key() 动态生成的 per-install 主密钥加密，
@@ -320,11 +316,11 @@ struct AppSettings {
 }
 
 fn default_api_service_host() -> String {
-    api_service::DEFAULT_HOST.to_string()
+    "127.0.0.1".to_string()
 }
 
 fn default_api_service_port() -> u16 {
-    api_service::DEFAULT_PORT
+    51888
 }
 
 fn api_service_port_in_allowed_range(port: u16) -> bool {
@@ -344,7 +340,7 @@ fn default_app_settings() -> AppSettings {
         auto_detect: true,
         api_service_enabled: false,
         api_service_host: default_api_service_host(),
-        api_service_port: api_service::DEFAULT_PORT,
+        api_service_port: default_api_service_port(),
         api_service_key: String::new(),
         api_service_default_model: DEFAULT_WINDSURF_API_MODEL.to_string(),
     }
@@ -361,7 +357,7 @@ fn effective_api_service_model(model: &str) -> String {
 
 fn effective_api_service_port(port: u16) -> u16 {
     if port == 0 || !api_service_port_in_allowed_range(port) {
-        api_service::DEFAULT_PORT
+        default_api_service_port()
     } else {
         port
     }
@@ -2757,103 +2753,6 @@ fn build_antigravity_export_payload(account: &ManagedAccount) -> Result<Value, S
     }))
 }
 
-async fn windsurf_firebase_sign_in(email: &str, password: &str) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| format!("创建 SuperAI 客户端失败: {error}"))?;
-    let url = format!(
-        "{WINDSURF_FIREBASE_SIGNIN_URL}?key={}",
-        windsurf_firebase_api_key()
-    );
-    let body = serde_json::json!({
-        "email": email,
-        "password": password,
-        "returnSecureToken": true,
-        "clientType": "CLIENT_TYPE_WEB",
-    });
-    let response = client
-        .post(&url)
-        .json(&body)
-        .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "*/*")
-        .header("Accept-Language", "zh-CN,zh;q=0.9")
-        .header("Cache-Control", "no-cache")
-        .header("Pragma", "no-cache")
-        .header(
-            "Sec-Ch-Ua",
-            r#""Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99""#,
-        )
-        .header("Sec-Ch-Ua-Mobile", "?0")
-        .header("Sec-Ch-Ua-Platform", r#""Windows""#)
-        .header("Sec-Fetch-Dest", "empty")
-        .header("Sec-Fetch-Mode", "cors")
-        .header("Sec-Fetch-Site", "cross-site")
-        .header("X-Client-Version", "Chrome/JsCore/11.0.0/FirebaseCore-web")
-        .header("Origin", "https://windsurf.com")
-        .header("Referer", "https://windsurf.com/")
-        .send()
-        .await
-        .map_err(|error| format!("SuperAI 登录请求失败: {error}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|error| format!("读取 SuperAI 登录响应失败: {error}"))?;
-    if !status.is_success() {
-        if status.as_u16() == 401
-            || text.contains("INVALID_LOGIN_CREDENTIALS")
-            || text.contains("INVALID_PASSWORD")
-        {
-            return Err("邮箱或密码错误，或该账号不支持邮箱密码登录".to_string());
-        }
-        if text.contains("EMAIL_NOT_FOUND") {
-            return Err("该邮箱未注册".to_string());
-        }
-        if text.contains("USER_DISABLED") {
-            return Err("该账号已被禁用".to_string());
-        }
-        if text.contains("TOO_MANY_ATTEMPTS_TRY_LATER") {
-            return Err("登录尝试次数过多，请 15-30 分钟后再试".to_string());
-        }
-        return Err(format!(
-            "SuperAI 登录失败 ({status})：{}",
-            summarize_windsurf_error_body(&text)
-        ));
-    }
-    serde_json::from_str::<Value>(&text)
-        .map_err(|error| format!("解析 SuperAI 登录响应失败: {error}"))
-}
-
-async fn windsurf_firebase_lookup(id_token: &str) -> Option<Value> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .ok()?;
-    let url = format!(
-        "{WINDSURF_FIREBASE_LOOKUP_URL}?key={}",
-        windsurf_firebase_api_key()
-    );
-    let response = client
-        .post(&url)
-        .json(&serde_json::json!({ "idToken": id_token }))
-        .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "*/*")
-        .header("Accept-Language", "zh-CN,zh;q=0.9")
-        .header("Sec-Fetch-Mode", "cors")
-        .header("Sec-Fetch-Site", "cross-site")
-        .header("X-Client-Version", "Chrome/JsCore/11.0.0/FirebaseCore-web")
-        .header("Origin", "https://windsurf.com")
-        .header("Referer", "https://windsurf.com/")
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    response.json::<Value>().await.ok()
-}
-
 async fn windsurf_register_with_codeium(
     id_token: &str,
 ) -> Result<WindsurfCodeiumRegisterResult, String> {
@@ -2913,97 +2812,6 @@ fn summarize_windsurf_error_body(text: &str) -> String {
     } else {
         without_trace.chars().take(160).collect()
     }
-}
-
-fn windsurf_browser_headers() -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        ACCEPT,
-        HeaderValue::from_static("application/json, text/plain, */*"),
-    );
-    headers.insert(
-        "Accept-Language",
-        HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
-    );
-    headers.insert("Accept-Encoding", HeaderValue::from_static("identity"));
-    headers.insert("Origin", HeaderValue::from_static("https://windsurf.com"));
-    headers.insert("Referer", HeaderValue::from_static("https://windsurf.com/"));
-    headers.insert(
-        "Sec-Ch-Ua",
-        HeaderValue::from_static(
-            r#""Chromium";v="134", "Google Chrome";v="134", "Not-A.Brand";v="99""#,
-        ),
-    );
-    headers.insert("Sec-Ch-Ua-Mobile", HeaderValue::from_static("?0"));
-    headers.insert("Sec-Ch-Ua-Platform", HeaderValue::from_static(r#""macOS""#));
-    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
-    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
-    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("cross-site"));
-    headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"));
-    headers
-}
-
-fn windsurf_auth1_error(text: &str, fallback: &str) -> String {
-    let parsed = serde_json::from_str::<Value>(text).ok();
-    let detail = parsed
-        .as_ref()
-        .and_then(|value| value.get("detail"))
-        .and_then(|value| {
-            if let Some(text) = string_field(Some(value)) {
-                Some(text)
-            } else {
-                value.as_array().map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|item| {
-                            string_field(item.get("msg")).or_else(|| string_field(item.get("type")))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-            }
-        })
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| summarize_windsurf_error_body(text));
-    match detail.as_str() {
-        "EMAIL_NOT_FOUND" => "该邮箱未注册".to_string(),
-        "INVALID_PASSWORD" | "INVALID_LOGIN_CREDENTIALS" | "Invalid email or password" => {
-            "邮箱或密码错误".to_string()
-        }
-        "No password set" | "No password set. Please log in with Google or GitHub." => {
-            "该账号没有设置邮箱密码，暂不支持导入".to_string()
-        }
-        "USER_DISABLED" => "该账号已被禁用".to_string(),
-        "TOO_MANY_ATTEMPTS_TRY_LATER" => "登录尝试次数过多，请 15-30 分钟后再试".to_string(),
-        "INVALID_EMAIL" => "邮箱格式不正确".to_string(),
-        _ if detail.is_empty() => fallback.to_string(),
-        _ => detail,
-    }
-}
-
-async fn windsurf_auth1_password_login(email: &str, password: &str) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| format!("创建 SuperAI Auth1 客户端失败: {error}"))?;
-    let response = client
-        .post(WINDSURF_AUTH1_PASSWORD_LOGIN_URL)
-        .headers(windsurf_browser_headers())
-        .json(&serde_json::json!({ "email": email, "password": password }))
-        .send()
-        .await
-        .map_err(|error| format!("SuperAI Auth1 登录请求失败: {error}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|error| format!("读取 SuperAI Auth1 登录响应失败: {error}"))?;
-    if !status.is_success() {
-        return Err(windsurf_auth1_error(&text, "SuperAI Auth1 登录失败"));
-    }
-    let value = serde_json::from_str::<Value>(&text)
-        .map_err(|error| format!("解析 SuperAI Auth1 登录响应失败: {error}"))?;
-    string_field(value.get("token")).ok_or_else(|| "SuperAI Auth1 登录响应缺少 token".to_string())
 }
 
 fn extract_prefixed_token(text: &str, prefix: &str) -> Option<String> {
@@ -3900,134 +3708,6 @@ async fn windsurf_post_auth(
     Err(last_error.unwrap_or_else(|| "SuperAI PostAuth 失败".to_string()))
 }
 
-#[tauri::command]
-#[allow(non_snake_case)]
-async fn add_superai_account_by_password(
-    app: tauri::AppHandle,
-    email: String,
-    password: String,
-) -> Result<ManagedAccount, String> {
-    let trimmed_email = email.trim();
-    let trimmed_password = password.trim();
-    if trimmed_email.is_empty() || trimmed_password.is_empty() {
-        return Err("邮箱和密码不能为空".to_string());
-    }
-
-    match windsurf_auth1_password_login(trimmed_email, trimmed_password).await {
-        Ok(auth1_token) => {
-            let post_auth = windsurf_post_auth(&auth1_token, None).await?;
-            let mut tokens_map = serde_json::Map::new();
-            tokens_map.insert(
-                "api_key".to_string(),
-                Value::String(post_auth.session_token.clone()),
-            );
-            tokens_map.insert(
-                "session_token".to_string(),
-                Value::String(post_auth.session_token.clone()),
-            );
-            tokens_map.insert("auth1_token".to_string(), Value::String(auth1_token));
-            if let Some(value) = post_auth.account_id.clone() {
-                tokens_map.insert("local_id".to_string(), Value::String(value));
-            }
-            if let Some(value) = post_auth.primary_org_id.clone() {
-                tokens_map.insert("primary_org_id".to_string(), Value::String(value));
-            }
-
-            let mut payload = serde_json::Map::new();
-            payload.insert(
-                "provider".to_string(),
-                Value::String("windsurf".to_string()),
-            );
-            payload.insert(
-                "email".to_string(),
-                Value::String(trimmed_email.to_lowercase()),
-            );
-            payload.insert(
-                "display_name".to_string(),
-                Value::String(trimmed_email.to_string()),
-            );
-            payload.insert("tokens".to_string(), Value::Object(tokens_map));
-
-            let mut account = parse_windsurf_account(&Value::Object(payload), "password")
-                .ok_or_else(|| "构建 SuperAI 账号记录失败".to_string())?;
-            let _ = enrich_windsurf_account_remote(&mut account).await;
-            upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
-            return Ok(account_for_frontend(&account));
-        }
-        Err(auth1_error) => {
-            if auth1_error.contains("没有设置邮箱密码")
-                || auth1_error.contains("该邮箱未注册")
-                || auth1_error.contains("已被禁用")
-                || auth1_error.contains("尝试次数过多")
-            {
-                return Err(auth1_error);
-            }
-        }
-    }
-
-    let signin = windsurf_firebase_sign_in(trimmed_email, trimmed_password).await?;
-    let id_token = string_field(signin.get("idToken"))
-        .ok_or_else(|| "SuperAI 登录响应缺少 idToken".to_string())?;
-    let register = windsurf_register_with_codeium(&id_token).await?;
-    let refresh_token = string_field(signin.get("refreshToken"))
-        .ok_or_else(|| "SuperAI 登录响应缺少 refreshToken".to_string())?;
-    let local_id = string_field(signin.get("localId"));
-    let display_name = string_field(signin.get("displayName"));
-    let resolved_email =
-        string_field(signin.get("email")).unwrap_or_else(|| trimmed_email.to_string());
-    let expires_in = string_field(signin.get("expiresIn"))
-        .and_then(|v| v.parse::<i64>().ok())
-        .unwrap_or(3600);
-    let expires_at = now_ts() + expires_in;
-
-    // 通过 lookup 拿到 displayName 等信息（可选）。
-    let mut final_display_name = display_name;
-    if final_display_name.is_none() {
-        if let Some(lookup) = windsurf_firebase_lookup(&id_token).await {
-            if let Some(users) = lookup.get("users").and_then(Value::as_array) {
-                if let Some(user) = users.first() {
-                    final_display_name = string_field(user.get("displayName"));
-                }
-            }
-        }
-    }
-
-    let mut tokens_map = serde_json::Map::new();
-    tokens_map.insert(
-        "api_key".to_string(),
-        Value::String(register.api_key.clone()),
-    );
-    tokens_map.insert("id_token".to_string(), Value::String(id_token.clone()));
-    tokens_map.insert("refresh_token".to_string(), Value::String(refresh_token));
-    tokens_map.insert("access_token".to_string(), Value::String(id_token));
-    if let Some(value) = local_id.clone() {
-        tokens_map.insert("local_id".to_string(), Value::String(value));
-    }
-    tokens_map.insert("expires_at".to_string(), Value::Number(expires_at.into()));
-
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "provider".to_string(),
-        Value::String("windsurf".to_string()),
-    );
-    payload.insert("email".to_string(), Value::String(resolved_email.clone()));
-    if final_display_name.is_none() {
-        final_display_name = register.name.clone();
-    }
-    if let Some(name) = final_display_name.clone() {
-        payload.insert("display_name".to_string(), Value::String(name));
-    }
-    if let Some(api_server_url) = register.api_server_url {
-        payload.insert("api_server_url".to_string(), Value::String(api_server_url));
-    }
-    payload.insert("tokens".to_string(), Value::Object(tokens_map));
-
-    let account = parse_windsurf_account(&Value::Object(payload), "password")
-        .ok_or_else(|| "构建 SuperAI 账号记录失败".to_string())?;
-    upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
-    Ok(account_for_frontend(&account))
-}
-
 fn parse_windsurf_batch_key_line(line: &str) -> Result<WindsurfBatchCredential, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -4124,86 +3804,6 @@ fn split_account_password(value: &str) -> Option<WindsurfBatchCredential> {
         }
     }
     None
-}
-
-#[tauri::command]
-async fn add_superai_accounts_by_batch_keys(
-    app: tauri::AppHandle,
-    keys: Vec<String>,
-) -> Result<ImportResult, String> {
-    let mut imported = Vec::new();
-    let mut failed = Vec::new();
-
-    for (index, key) in keys.into_iter().enumerate() {
-        let label = format!("第 {} 行", index + 1);
-        let credential = match parse_windsurf_batch_key_line(&key) {
-            Ok(value) => value,
-            Err(reason) => {
-                failed.push(ImportFailure { label, reason });
-                continue;
-            }
-        };
-        if windsurf_license_expired_at(credential.expires_at) {
-            failed.push(ImportFailure {
-                label,
-                reason: "账号已到期".to_string(),
-            });
-            continue;
-        }
-
-        match add_superai_account_by_password(app.clone(), credential.account, credential.password)
-            .await
-        {
-            Ok(account) => {
-                let mut full_account = {
-                    let conn = open_app_db(&app)?;
-                    load_account_from_db(&conn, &account.id)?
-                };
-                // 日卡场景核心保险：必须在导入时点锁住 baseline，否则等下一次
-                // refresh 才锁可能跨过上游 16:00 重置，被刷成 100%。
-                // 拉不到 daily 就重试一次 enrich；仍失败则回滚刚插入的账号，
-                // 让操作员重试，不允许"无 baseline"账号进入正式列表。
-                if current_daily_remaining_from_account(&full_account).is_none() {
-                    let _ = enrich_windsurf_account_remote(&mut full_account).await;
-                }
-                if current_daily_remaining_from_account(&full_account).is_none() {
-                    let conn = open_app_db(&app)?;
-                    let _ = conn.execute(
-                        "DELETE FROM accounts WHERE id = ?1",
-                        params![&full_account.id],
-                    );
-                    failed.push(ImportFailure {
-                        label,
-                        reason: "未能获取上游额度，导入已回滚，请稍后重试".to_string(),
-                    });
-                    continue;
-                }
-                attach_windsurf_batch_key(&app, &mut full_account, &key, credential.expires_at);
-                // 双重确认 baseline 真的写进去了。理论上前面已校验，这里再兜底
-                // 一次：万一 attach 内部 bump 因极端竞争没记录 baseline 也拦下。
-                if public_usage_baseline(&full_account).is_none() {
-                    let conn = open_app_db(&app)?;
-                    let _ = conn.execute(
-                        "DELETE FROM accounts WHERE id = ?1",
-                        params![&full_account.id],
-                    );
-                    failed.push(ImportFailure {
-                        label,
-                        reason: "未能锁定本地额度基线，导入已回滚，请稍后重试".to_string(),
-                    });
-                    continue;
-                }
-                upsert_accounts_into_db(&app, std::slice::from_ref(&full_account))?;
-                imported.push(account_for_frontend(&full_account));
-            }
-            Err(error) => failed.push(ImportFailure {
-                label,
-                reason: error,
-            }),
-        }
-    }
-
-    Ok(ImportResult { imported, failed })
 }
 
 fn attach_windsurf_batch_key(
@@ -4687,88 +4287,6 @@ fn emit_account_exhausted(app: &tauri::AppHandle, account: &ManagedAccount) {
             "consumed_percent": public_usage_consumed_percent(account),
         }),
     );
-}
-
-fn public_windsurf_export_key(account: &ManagedAccount) -> Result<String, String> {
-    if account.provider != "windsurf" {
-        return Err("只支持导出 SuperAI 公开版数据".to_string());
-    }
-    account
-        .auth_payload
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|payload| payload.get("batch_key"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| "该账号缺少可导出的批量密钥，请重新通过批量密钥导入".to_string())
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-async fn add_superai_account_by_token(
-    app: tauri::AppHandle,
-    token: String,
-    label: Option<String>,
-) -> Result<ManagedAccount, String> {
-    let trimmed = token.trim();
-    if trimmed.is_empty() {
-        return Err("凭证不能为空".to_string());
-    }
-
-    let register = windsurf_register_with_codeium(trimmed).await?;
-    let jwt = parse_jwt_payload(trimmed);
-    let email = string_field(jwt.as_ref().and_then(|j| j.get("email")))
-        .or_else(|| label.clone())
-        .unwrap_or_else(|| {
-            format!(
-                "windsurf-token-{}@local",
-                &stable_hash(&register.api_key)[..6]
-            )
-        });
-    let local_id = string_field(jwt.as_ref().and_then(|j| j.get("user_id")))
-        .or_else(|| string_field(jwt.as_ref().and_then(|j| j.get("sub"))));
-    let display_name = string_field(jwt.as_ref().and_then(|j| j.get("name")))
-        .or_else(|| register.name.clone())
-        .or(label);
-    let exp = jwt.as_ref().and_then(|j| number_field(j.get("exp")));
-
-    let mut tokens_map = serde_json::Map::new();
-    tokens_map.insert(
-        "api_key".to_string(),
-        Value::String(register.api_key.clone()),
-    );
-    tokens_map.insert("id_token".to_string(), Value::String(trimmed.to_string()));
-    tokens_map.insert(
-        "access_token".to_string(),
-        Value::String(trimmed.to_string()),
-    );
-    if let Some(value) = local_id.clone() {
-        tokens_map.insert("local_id".to_string(), Value::String(value));
-    }
-    if let Some(value) = exp {
-        tokens_map.insert("expires_at".to_string(), Value::Number(value.into()));
-    }
-
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "provider".to_string(),
-        Value::String("windsurf".to_string()),
-    );
-    payload.insert("email".to_string(), Value::String(email));
-    if let Some(name) = display_name.clone() {
-        payload.insert("display_name".to_string(), Value::String(name));
-    }
-    if let Some(api_server_url) = register.api_server_url {
-        payload.insert("api_server_url".to_string(), Value::String(api_server_url));
-    }
-    payload.insert("tokens".to_string(), Value::Object(tokens_map));
-
-    let account = parse_windsurf_account(&Value::Object(payload), "windsurf_token")
-        .ok_or_else(|| "构建 SuperAI 账号记录失败".to_string())?;
-    upsert_accounts_into_db(&app, std::slice::from_ref(&account))?;
-    Ok(account_for_frontend(&account))
 }
 
 fn codex_access_token(account: &ManagedAccount) -> Option<String> {
@@ -7967,7 +7485,14 @@ fn list_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
     encrypt_plain_windsurf_accounts(&conn)?;
     enforce_single_current_account(&conn)?;
-    read_accounts_from_conn(&conn).map(accounts_for_frontend)
+    read_accounts_from_conn(&conn).map(|accounts| {
+        accounts_for_frontend(
+            accounts
+                .into_iter()
+                .filter(|account| account.provider != "windsurf")
+                .collect(),
+        )
+    })
 }
 
 #[tauri::command]
@@ -8187,88 +7712,24 @@ fn delete_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
 fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
     let account = load_account_from_db(&conn, &accountId)?;
-    // 兜底：SuperAI 账号有效期已过 / 公开版本地累计已耗尽 → 不允许启用，
-    // 避免上游 422 / 用户误把已停用账号挂起。前端理应同步过滤，但万一不一致
-    // 走到这里也得明确拦掉。
-    if account.provider == "windsurf" {
-        if let Some(expires_at) = windsurf_license_expires_at(&account) {
-            if windsurf_license_expired_at(expires_at) {
-                return Err("该账号有效期已过，无法启用，请删除后重新导入".to_string());
-            }
-        }
-        if public_usage_is_exhausted(&account) {
-            return Err("该账号本地累计额度已耗尽，无法启用".to_string());
-        }
-    }
     match account.provider.as_str() {
         "codex" => write_codex_auth(&account)?,
         "gemini" => write_gemini_auth(&account)?,
         "antigravity" => write_antigravity_auth(&account)?,
-        "windsurf" => {
-            activate_windsurf_account_for_api(&app, &account)?;
-        }
+        "windsurf" => return Err("SuperAI 账号切换功能已移除".to_string()),
         other => return Err(format!("不支持的账号类型: {other}")),
     }
     set_account_current_state(&conn, &account.provider, &account.id).map(accounts_for_frontend)
 }
 
 fn activate_windsurf_account_for_api(
-    app: &tauri::AppHandle,
-    account: &ManagedAccount,
+    _app: &tauri::AppHandle,
+    _account: &ManagedAccount,
 ) -> Result<(), String> {
-    if !api_service::is_running_with_sidecar() {
-        return Ok(());
-    }
-
-    match api_service::activate_account_by_label(&superai_sidecar_label(account)) {
-        Ok(()) => Ok(()),
-        Err(first_error) => {
-            sync_superai_accounts_to_api(app.clone())?;
-            api_service::activate_account_by_label(&superai_sidecar_label(account)).map_err(
-                |second_error| {
-                    format!("启用 API 账号失败: {second_error}; 同步前错误: {first_error}")
-                },
-            )
-        }
-    }
+    Ok(())
 }
 
-fn sync_windsurf_current_account_by_label(
-    conn: &Connection,
-    label: &str,
-) -> Result<Vec<ManagedAccount>, String> {
-    let Some(account_id) = label
-        .strip_prefix("superai-account-")
-        .and_then(|value| value.strip_suffix("@local"))
-    else {
-        return Ok(Vec::new());
-    };
-    if !account_exists(conn, account_id)? {
-        return Ok(Vec::new());
-    }
-    set_account_current_state(conn, "windsurf", account_id)
-}
-
-#[tauri::command]
-fn sync_api_service_active_account(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
-    let Some(label) = api_service::last_used_account_label() else {
-        return Ok(Vec::new());
-    };
-    // 幂等短路：sidecar 上次挑的还是这个号 → 我们已经把 "当前" 标签打过，
-    // 不必再开 sqlite + AES 解密 + 全表 upsert。前端 setInterval 3s 也几乎零开销。
-    if api_service::last_synced_active_label()
-        .as_deref()
-        .map(|prev| prev.eq_ignore_ascii_case(&label))
-        .unwrap_or(false)
-    {
-        return Ok(Vec::new());
-    }
-    let conn = open_app_db(&app)?;
-    let result =
-        sync_windsurf_current_account_by_label(&conn, &label).map(accounts_for_frontend)?;
-    api_service::record_synced_active_label(label.to_ascii_lowercase());
-    Ok(result)
-}
+fn schedule_windsurf_sync(_app: tauri::AppHandle) {}
 
 #[tauri::command]
 #[allow(non_snake_case)]
@@ -8279,24 +7740,10 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
         "codex" => build_codex_auth_payload(&account)?,
         "gemini" => build_gemini_oauth_payload(&account)?,
         "antigravity" => build_antigravity_export_payload(&account)?,
-        "windsurf" if is_public_build() => {
-            return Err("公开版不允许导出 SuperAI 原始凭证".to_string());
-        }
-        "windsurf" => build_windsurf_payload(&account)?,
+        "windsurf" => return Err("SuperAI 账号导出功能已移除".to_string()),
         _ => serde_json::to_value(&account).map_err(|error| format!("序列化账号失败: {error}"))?,
     };
     serde_json::to_string_pretty(&value).map_err(|error| format!("序列化导出内容失败: {error}"))
-}
-
-#[tauri::command]
-#[allow(non_snake_case)]
-fn export_public_superai_account(
-    app: tauri::AppHandle,
-    accountId: String,
-) -> Result<String, String> {
-    let conn = open_app_db(&app)?;
-    let account = load_account_from_db(&conn, &accountId)?;
-    public_windsurf_export_key(&account)
 }
 
 fn system_auto_launch_enabled(app: &tauri::AppHandle) -> Result<Option<bool>, String> {
@@ -8870,75 +8317,58 @@ fn ensure_api_service_key(
     settings: &mut AppSettings,
 ) -> Result<(), String> {
     let key = settings.api_service_key.trim();
-    if key.is_empty() || api_service::is_legacy_api_key(key) {
-        settings.api_service_key = api_service::generate_api_key();
+    if key.is_empty() || key.starts_with("sk-") {
+        settings.api_service_key = format!("agt_superai_{}", stable_hash(&format!("{}:{}", now_ts(), rand::random::<u64>())));
         write_settings_record(app, settings)?;
     }
     Ok(())
 }
 
-#[tauri::command]
-fn get_api_service_status(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
-    let mut settings = read_settings_record(&app)?;
-    ensure_api_service_key(&app, &mut settings)?;
-    Ok(api_service::current_status(
-        &settings.api_service_host,
-        effective_api_service_port(settings.api_service_port),
-        &settings.api_service_key,
-        &effective_api_service_model(&settings.api_service_default_model),
-    ))
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiServiceStatus {
+    running: bool,
+    bind_host: String,
+    bind_port: u16,
+    actual_port: Option<u16>,
+    address: Option<String>,
+    api_key: String,
+    default_model: String,
+    last_error: Option<String>,
+}
+
+fn api_service_placeholder_status(settings: &AppSettings) -> ApiServiceStatus {
+    ApiServiceStatus {
+        running: false,
+        bind_host: settings.api_service_host.clone(),
+        bind_port: effective_api_service_port(settings.api_service_port),
+        actual_port: None,
+        address: None,
+        api_key: settings.api_service_key.clone(),
+        default_model: effective_api_service_model(&settings.api_service_default_model),
+        last_error: Some("API 服务后端能力已移除，当前仅保留 UI 壳子。".to_string()),
+    }
 }
 
 #[tauri::command]
-async fn start_api_service(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || start_api_service_impl(app))
-        .await
-        .map_err(|error| format!("启动 API 服务任务失败: {error}"))?
-}
-
-fn start_api_service_impl(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
+fn get_api_service_status(app: tauri::AppHandle) -> Result<ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("读取应用数据目录失败: {error}"))?;
-    let host = validate_api_service_host(&settings.api_service_host)?;
-    let port = validate_api_service_port(settings.api_service_port)?;
-    let status = api_service::start(
-        &data_dir,
-        &host,
-        port,
-        &settings.api_service_key,
-        &effective_api_service_model(&settings.api_service_default_model),
-    )?;
-    // 把启用状态持久化；端口由设置固定，不再由启动过程自动改写。
-    let mut needs_write = false;
-    if !settings.api_service_enabled {
-        settings.api_service_enabled = true;
-        needs_write = true;
-    }
-    let effective_model = effective_api_service_model(&settings.api_service_default_model);
-    if settings.api_service_default_model != effective_model {
-        settings.api_service_default_model = effective_model;
-        needs_write = true;
-    }
-    if needs_write {
-        write_settings_record(&app, &settings)?;
-    }
-    // 启动命令要尽快返回给前端；账号同步里会调用 sidecar 的 dashboard
-    // 能力刷新接口，LS 未 ready 时可能比较慢，放后台避免 UI 卡住。
-    schedule_windsurf_sync(app.clone());
-    Ok(status)
+    Ok(api_service_placeholder_status(&settings))
 }
 
-fn emit_api_service_status_changed(app: &tauri::AppHandle, status: &api_service::ApiServiceStatus) {
-    let _ = app.emit("api-service-status-changed", status);
+#[tauri::command]
+async fn start_api_service(app: tauri::AppHandle) -> Result<ApiServiceStatus, String> {
+    let mut settings = read_settings_record(&app)?;
+    ensure_api_service_key(&app, &mut settings)?;
+    settings.api_service_enabled = false;
+    write_settings_record(&app, &settings)?;
+    Ok(api_service_placeholder_status(&settings))
 }
 
 #[tauri::command]
 fn list_api_service_models() -> Result<Vec<serde_json::Value>, String> {
-    api_service::list_models()
+    Ok(Vec::new())
 }
 
 #[tauri::command]
@@ -8946,353 +8376,30 @@ fn set_api_service_default_model(app: tauri::AppHandle, model: String) -> Result
     let mut settings = read_settings_record(&app)?;
     settings.api_service_default_model = effective_api_service_model(&model);
     write_settings_record(&app, &settings)?;
-    // 在跑就立刻热更，不在跑只持久化等下次启动。
-    let _ = api_service::update_default_model(&settings.api_service_default_model);
     Ok(())
 }
 
-/// 把单个 SuperAI 账号转换成 sidecar `/auth/login` 期望的入参。
-///
-/// 上游 sidecar 的 `/auth/login` 只接受三种凭证：
-///   - `{ api_key, label }`               — 已有 Codeium api_key 或 Devin sessionToken
-///   - `{ token, label }`                 — windsurf.com show-auth-token 拿到的 ott$/JWT token
-///   - `{ email, password, label }`       — 完整账号密码（走 Auth1 → PostAuth → sessionToken，目前唯一能拿到付费配额的路径）
-///
-/// 之前 v2.0.7 支持的 `refresh_token` 路径在上游 2.0.90 已移除（Firebase 路径已死）。
-/// 持久化里只剩 refresh_token 的老账号不能同步进 sidecar，需要用户重新用 token 或邮箱密码导入。
-fn windsurf_account_to_sidecar_payload(account: &ManagedAccount) -> Option<serde_json::Value> {
-    if account.provider != "windsurf" {
-        return None;
-    }
-    // 公开版账号本地累计已用满 → 不参与 sidecar 同步。reconcile_accounts
-    // 拿到的 desired_emails 不再包含它，会主动 DELETE 到 sidecar /auth/accounts/:id。
-    if public_usage_is_exhausted(account) {
-        return None;
-    }
-    let label = superai_sidecar_label(account);
-    if let Some(token) = windsurf_payload_string(account, "api_key") {
-        return Some(serde_json::json!({ "api_key": token, "label": label }));
-    }
-    if let Some(token) = windsurf_payload_string(account, "id_token") {
-        return Some(serde_json::json!({ "token": token, "label": label }));
-    }
-    if let Some(token) = windsurf_payload_string(account, "access_token") {
-        return Some(serde_json::json!({ "token": token, "label": label }));
-    }
-    None
-}
-
-fn superai_sidecar_label(account: &ManagedAccount) -> String {
-    format!("superai-account-{}@local", account.id)
-}
-
 #[tauri::command]
-fn sync_superai_accounts_to_api(app: tauri::AppHandle) -> Result<usize, String> {
-    let accounts = {
-        let conn = open_app_db(&app)?;
-        read_accounts_from_conn(&conn)?
-    };
-    let payloads: Vec<serde_json::Value> = accounts
-        .iter()
-        .filter(|a| a.provider == "windsurf")
-        .filter_map(windsurf_account_to_sidecar_payload)
-        .collect();
-    let count = payloads.len();
-    api_service::reconcile_accounts(payloads)?;
-    Ok(count)
-}
-
-static WINDSURF_SYNC_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-
-/// 后台线程触发同步，避免阻塞 Tauri 命令。
-fn schedule_windsurf_sync(app: tauri::AppHandle) {
-    if !api_service::is_running_with_sidecar() {
-        return;
-    }
-    if WINDSURF_SYNC_IN_FLIGHT
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    std::thread::spawn(move || {
-        let result = sync_superai_accounts_to_api(app.clone());
-        WINDSURF_SYNC_IN_FLIGHT.store(false, Ordering::Release);
-        if let Ok(mut settings) = read_settings_record(&app) {
-            let _ = ensure_api_service_key(&app, &mut settings);
-            let status = api_service::current_status(
-                &settings.api_service_host,
-                effective_api_service_port(settings.api_service_port),
-                &settings.api_service_key,
-                &effective_api_service_model(&settings.api_service_default_model),
-            );
-            emit_api_service_status_changed(&app, &status);
-        }
-        if let Err(error) = result {
-            eprintln!("[SuperAI API] 后台同步失败: {error}");
-        }
-    });
-}
-
-#[tauri::command]
-async fn stop_api_service(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || stop_api_service_impl(app))
-        .await
-        .map_err(|error| format!("停止 API 服务任务失败: {error}"))?
-}
-
-fn claude_preferred_model(model_id: &str) -> String {
-    let trimmed = model_id.trim();
-    if trimmed.starts_with("claude-") {
-        trimmed.to_string()
-    } else {
-        CLAUDE_RECOMMENDED_MODEL.to_string()
-    }
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClaudeAppSetupResult {
-    settings_path: String,
-    base_url: String,
-    model_id: String,
-    settings_backup_path: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ClaudeAppRestoreResult {
-    steps: Vec<String>,
-    settings_restored_from_backup: bool,
-    settings_removed: bool,
-}
-
-fn claude_settings_superai_marker(value: &Value) -> bool {
-    let Some(root) = value.as_object() else {
-        return false;
-    };
-    if root.len() != 3 {
-        return false;
-    }
-    let Some(env) = root.get("env").and_then(|env| env.as_object()) else {
-        return false;
-    };
-    let Some(permissions) = root.get("permissions").and_then(|value| value.as_object()) else {
-        return false;
-    };
-    let Some(api_key_helper) = root.get("apiKeyHelper").and_then(|value| value.as_str()) else {
-        return false;
-    };
-
-    if env.len() != 3 {
-        return false;
-    }
-    let has_expected_env = matches!(
-        (
-            env.get("ANTHROPIC_API_KEY").and_then(|value| value.as_str()),
-            env.get("ANTHROPIC_BASE_URL").and_then(|value| value.as_str()),
-            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
-                .and_then(|value| value.as_str()),
-        ),
-        (Some(_), Some(_), Some("1"))
-    );
-    if !has_expected_env {
-        return false;
-    }
-
-    let allow_empty = permissions
-        .get("allow")
-        .and_then(|value| value.as_array())
-        .map(|items| items.is_empty())
-        .unwrap_or(false);
-    let deny_empty = permissions
-        .get("deny")
-        .and_then(|value| value.as_array())
-        .map(|items| items.is_empty())
-        .unwrap_or(false);
-    if !allow_empty || !deny_empty || permissions.len() != 2 {
-        return false;
-    }
-
-    api_key_helper.starts_with("echo '") && api_key_helper.ends_with('\'')
-}
-
-fn backup_claude_settings_once(claude_home: &Path) -> Result<Option<String>, String> {
-    let settings_path = claude_home.join("settings.json");
-    let backup_path = claude_home.join("settings.json.superai-bak");
-    if !settings_path.exists() {
-        return Ok(None);
-    }
-    if backup_path.exists() {
-        return Ok(Some(backup_path.display().to_string()));
-    }
-    let existing = read_json_file_or_default(&settings_path, serde_json::json!({}))?;
-    if claude_settings_superai_marker(&existing) {
-        return Ok(None);
-    }
-    fs::copy(&settings_path, &backup_path)
-        .map_err(|error| format!("备份 {} 失败: {error}", settings_path.display()))?;
-    Ok(Some(backup_path.display().to_string()))
-}
-
-fn build_superai_claude_settings(
-    _existing: Value,
-    base_url: &str,
-    api_key: &str,
-) -> Result<String, String> {
-    let claude_base_url = base_url
-        .trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .to_string();
-    let root = serde_json::json!({
-        "env": {
-            "ANTHROPIC_API_KEY": api_key,
-            "ANTHROPIC_BASE_URL": claude_base_url,
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        },
-        "permissions": {
-            "allow": [],
-            "deny": [],
-        },
-        "apiKeyHelper": format!("echo '{api_key}'"),
-    });
-    serde_json::to_string_pretty(&root)
-        .map_err(|error| format!("序列化 Claude settings.json 失败: {error}"))
-}
-
-#[tauri::command]
-fn configure_claude_app(app: tauri::AppHandle) -> Result<ClaudeAppSetupResult, String> {
+async fn stop_api_service(app: tauri::AppHandle) -> Result<ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
-    let status = api_service::current_status(
-        &settings.api_service_host,
-        effective_api_service_port(settings.api_service_port),
-        &settings.api_service_key,
-        &effective_api_service_model(&settings.api_service_default_model),
-    );
-    if !status.running {
-        return Err("API 服务未运行，请先启动服务再一键配置 Claude".to_string());
-    }
-    let base_url = status
-        .address
-        .clone()
-        .ok_or_else(|| "API 服务未提供监听地址".to_string())?;
-    let claude_base_url = base_url
-        .trim_end_matches('/')
-        .trim_end_matches("/v1")
-        .to_string();
-    let api_key = status.api_key.clone();
-    if api_key.trim().is_empty() {
-        return Err("API 服务密钥为空，无法配置 Claude".to_string());
-    }
-    let model_id = status.default_model.trim().to_string();
-    if model_id.is_empty() {
-        return Err("尚未选择默认模型，请先在 API 服务配置里挑一个".to_string());
-    }
-    let effective_model_id = claude_preferred_model(&model_id);
-
-    let claude_home = claude_home_dir()?;
-    fs::create_dir_all(&claude_home)
-        .map_err(|error| format!("创建目录失败 {}: {error}", claude_home.display()))?;
-    let settings_path = claude_home.join("settings.json");
-    let settings_backup_path = backup_claude_settings_once(&claude_home)?;
-    let existing = read_json_file_or_default(&settings_path, serde_json::json!({}))?;
-    let payload = build_superai_claude_settings(existing, &claude_base_url, &api_key)?;
-    write_string_atomic(&settings_path, &payload)?;
-
-    Ok(ClaudeAppSetupResult {
-        settings_path: settings_path.display().to_string(),
-        base_url: claude_base_url,
-        model_id: effective_model_id,
-        settings_backup_path,
-    })
-}
-
-#[tauri::command]
-fn restore_claude_app(_app: tauri::AppHandle) -> Result<ClaudeAppRestoreResult, String> {
-    let claude_home = claude_home_dir()?;
-    let settings_path = claude_home.join("settings.json");
-    let backup_path = claude_home.join("settings.json.superai-bak");
-    let mut steps = Vec::new();
-    let mut settings_restored_from_backup = false;
-    let mut settings_removed = false;
-
-    if backup_path.exists() {
-        fs::copy(&backup_path, &settings_path)
-            .map_err(|error| format!("恢复 Claude settings.json 失败: {error}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&settings_path, fs::Permissions::from_mode(0o600));
-        }
-        steps.push(format!(
-            "已用 {} 覆盖回 {}",
-            backup_path.display(),
-            settings_path.display(),
-        ));
-        settings_restored_from_backup = true;
-    } else if settings_path.exists() {
-        let existing = read_json_file_or_default(&settings_path, serde_json::json!({}))?;
-        if claude_settings_superai_marker(&existing) {
-            fs::remove_file(&settings_path)
-                .map_err(|error| format!("删除 Claude settings.json 失败: {error}"))?;
-            steps.push(format!("已删除 SuperAI 写的 {}", settings_path.display()));
-            settings_removed = true;
-        } else {
-            steps.push(format!(
-                "Claude settings.json 非 SuperAI 接管，原样保留（{}）",
-                settings_path.display(),
-            ));
-        }
-    } else {
-        steps.push("没有 ~/.claude/settings.json，无需处理".to_string());
-    }
-
-    Ok(ClaudeAppRestoreResult {
-        steps,
-        settings_restored_from_backup,
-        settings_removed,
-    })
-}
-
-
-fn stop_api_service_impl(app: tauri::AppHandle) -> Result<api_service::ApiServiceStatus, String> {
-    api_service::stop()?;
-    let mut settings = read_settings_record(&app)?;
-    ensure_api_service_key(&app, &mut settings)?;
-    if settings.api_service_enabled {
-        settings.api_service_enabled = false;
-        write_settings_record(&app, &settings)?;
-    }
-    Ok(api_service::current_status(
-        &settings.api_service_host,
-        effective_api_service_port(settings.api_service_port),
-        &settings.api_service_key,
-        &effective_api_service_model(&settings.api_service_default_model),
-    ))
+    settings.api_service_enabled = false;
+    write_settings_record(&app, &settings)?;
+    Ok(api_service_placeholder_status(&settings))
 }
 
 fn prepare_for_update_install_impl(
     app: tauri::AppHandle,
-) -> Result<api_service::ApiServiceStatus, String> {
-    api_service::stop()?;
-    api_service::cleanup_update_blockers();
-    #[cfg(target_os = "windows")]
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+) -> Result<ApiServiceStatus, String> {
     let mut settings = read_settings_record(&app)?;
     ensure_api_service_key(&app, &mut settings)?;
-    Ok(api_service::current_status(
-        &settings.api_service_host,
-        effective_api_service_port(settings.api_service_port),
-        &settings.api_service_key,
-        &effective_api_service_model(&settings.api_service_default_model),
-    ))
+    Ok(api_service_placeholder_status(&settings))
 }
 
 #[tauri::command]
 async fn prepare_for_update_install(
     app: tauri::AppHandle,
-) -> Result<api_service::ApiServiceStatus, String> {
+) -> Result<ApiServiceStatus, String> {
     tauri::async_runtime::spawn_blocking(move || prepare_for_update_install_impl(app))
         .await
         .map_err(|e| format!("准备安装更新失败: {e}"))?
@@ -9318,7 +8425,6 @@ pub fn run() {
             delete_account,
             switch_account,
             export_account,
-            export_public_superai_account,
             load_settings,
             save_settings,
             import_accounts_from_json,
@@ -9331,19 +8437,12 @@ pub fn run() {
             complete_gemini_oauth,
             start_antigravity_oauth,
             complete_antigravity_oauth,
-            add_superai_account_by_password,
-            add_superai_accounts_by_batch_keys,
-            add_superai_account_by_token,
             get_api_service_status,
             start_api_service,
             stop_api_service,
             prepare_for_update_install,
-            sync_superai_accounts_to_api,
-            sync_api_service_active_account,
             list_api_service_models,
             set_api_service_default_model,
-            configure_claude_app,
-            restore_claude_app,
         ])
         .on_window_event(|window, event| {
             if window.label() != "main" {
@@ -9409,24 +8508,6 @@ pub fn run() {
                 )?;
             }
 
-            // 清理历史构建留下的旧 sidecar 数据子目录（superal-api 是早期临时
-            // 命名，windsurfapi 是更早的上游默认名）。新版本只往 superai-api
-            // 写，所以这两个旧目录可以安全删除，避免暴露在用户的 Application
-            // Support 目录里。
-            if let Ok(data_dir) = app.handle().path().app_data_dir() {
-                for stale in ["superal-api", "windsurfapi"] {
-                    let path = data_dir.join(stale);
-                    if path.exists() {
-                        if let Err(error) = std::fs::remove_dir_all(&path) {
-                            eprintln!(
-                                "[startup] 清理旧 sidecar 数据目录失败 {}: {error}",
-                                path.display()
-                            );
-                        }
-                    }
-                }
-            }
-
             let handle = app.handle().clone();
 
             // 启动时立刻扫一遍过期 SuperAI 账号；之后每分钟再跑一次。
@@ -9470,9 +8551,7 @@ pub fn run() {
         tauri::RunEvent::Reopen { .. } => {
             show_main_window(_handle);
         }
-        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-            let _ = api_service::stop();
-        }
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {}
         _ => {}
     });
 }
@@ -9641,20 +8720,6 @@ mod tests {
 
 
     #[test]
-    fn public_windsurf_export_returns_original_batch_key() {
-        let batch_key = "v2:imported-encrypted-batch-key";
-        let account = ManagedAccount {
-            auth_payload: Some(serde_json::json!({
-                "batch_key": batch_key,
-                "license_expires_at": 4_102_444_800_i64,
-            })),
-            ..test_account("superai-public", "windsurf", "public@example.com", 10)
-        };
-
-        assert_eq!(public_windsurf_export_key(&account).unwrap(), batch_key);
-    }
-
-    #[test]
     fn public_usage_history_key_uses_parsed_credential_identity() {
         let a = WindsurfBatchCredential {
             account: "USER@example.com".to_string(),
@@ -9730,68 +8795,6 @@ mod tests {
             .map(|account| account.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(available_ids, vec!["gemini-b"]);
-    }
-
-    #[test]
-    fn sync_windsurf_current_account_by_label_keeps_only_one_current_account() {
-        let conn = Connection::open_in_memory().expect("open sqlite");
-        init_app_db(&conn).expect("init db");
-
-        let older = test_account("superai-a", "windsurf", "a@example.com", 10);
-        let newer = test_account("superai-b", "windsurf", "b@example.com", 20);
-        upsert_account(&conn, &older).expect("insert older");
-        upsert_account(&conn, &newer).expect("insert newer");
-
-        let changed =
-            sync_windsurf_current_account_by_label(&conn, "superai-account-superai-a@local")
-                .expect("sync active account by label");
-        let current_ids = changed
-            .iter()
-            .filter(|account| is_current_status(&account.status))
-            .map(|account| account.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(current_ids, vec!["superai-a"]);
-
-        let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");
-        let persisted_current_ids = all_accounts
-            .iter()
-            .filter(|account| account.provider == "windsurf" && is_current_status(&account.status))
-            .map(|account| account.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(persisted_current_ids, vec!["superai-a"]);
-    }
-
-    #[test]
-    fn sync_windsurf_current_account_by_label_noops_for_unknown_label() {
-        let conn = Connection::open_in_memory().expect("open sqlite");
-        init_app_db(&conn).expect("init db");
-
-        let current = test_account("superai-a", "windsurf", "a@example.com", 10);
-        let available = ManagedAccount {
-            status: Some(AccountStatus {
-                state: "available".to_string(),
-                label: "可用".to_string(),
-                reason: None,
-                updated_at: Some(20),
-            }),
-            updated_at: 20,
-            ..test_account("superai-b", "windsurf", "b@example.com", 20)
-        };
-        upsert_account(&conn, &current).expect("insert current");
-        upsert_account(&conn, &available).expect("insert available");
-
-        let changed =
-            sync_windsurf_current_account_by_label(&conn, "superai-account-missing@local")
-                .expect("sync unknown label");
-        assert!(changed.is_empty());
-
-        let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");
-        let persisted_current_ids = all_accounts
-            .iter()
-            .filter(|account| account.provider == "windsurf" && is_current_status(&account.status))
-            .map(|account| account.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(persisted_current_ids, vec!["superai-a"]);
     }
 
     #[test]

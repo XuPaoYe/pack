@@ -2499,13 +2499,16 @@ textarea:focus {
   display: flex;
   flex-direction: column;
   height: 356px; /* 匹配标准卡片高度 */
-  padding: 24px 20px;
+  padding: 18px 18px 20px;
   border: 1px solid var(--line);
-  background: var(--control);
-  border-radius: 12px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--control) 90%, transparent), color-mix(in srgb, var(--control) 72%, transparent)),
+    var(--panel);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.03);
   transition: all 0.2s;
   box-sizing: border-box;
+  overflow: hidden;
 }
 
 .account-row.superai-api-card.running {
@@ -2692,6 +2695,7 @@ textarea:focus {
   column-gap: 12px;
   margin: 14px 0 12px;
   font-size: 12px;
+  min-width: 0;
 }
 
 .superai-api-grid dt {
@@ -3205,8 +3209,8 @@ textarea:focus {
 }
 
 .superai-api-error {
-  display: inline-flex;
-  align-items: center;
+  display: flex;
+  align-items: flex-start;
   gap: 6px;
   padding: 8px 12px;
   font-size: 12px;
@@ -3214,7 +3218,12 @@ textarea:focus {
   background: rgba(239, 68, 68, 0.05);
   border: 1px solid rgba(239, 68, 68, 0.15);
   border-radius: 8px;
-  align-self: center;
+  align-self: stretch;
+  width: 100%;
+  box-sizing: border-box;
+  line-height: 1.45;
+  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .account-details-overlay {

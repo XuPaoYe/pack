@@ -22,7 +22,6 @@ import {
   FileJson,
   FolderDown,
   Info,
-  KeyRound,
   Laptop,
   LockKeyhole,
   Monitor,
@@ -70,8 +69,6 @@ import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey" | "password";
 type OAuthProvider = "codex" | "gemini" | "antigravity";
 type ThemeMode = "system" | "light" | "dark";
-
-const IS_PUBLIC_BUILD = import.meta.env.VITE_SUPERAI_PUBLIC_BUILD === "1";
 
 const themeOptions: Array<{ key: ThemeMode; label: string; icon: typeof Monitor }> = [
   { key: "system", label: "跟随系统", icon: Monitor },
@@ -142,13 +139,13 @@ type KeyIssueModalState = {
 };
 const ACCOUNT_PAGE_SIZE = 12;
 const ACTIVE_ACCOUNT_REFRESH_INTERVAL_MS = 15_000;
-const API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS = 3_000;
 const API_SERVICE_PORT_MIN = 51000;
 const API_SERVICE_PORT_MAX = 59999;
 const DEFAULT_API_SERVICE_PORT = 51888;
 const APP_NAME = [83, 117, 112, 101, 114, 32, 65, 73]
   .map((c) => String.fromCharCode(c))
   .join("");
+const IS_PUBLIC_BUILD = import.meta.env.VITE_SUPERAI_PUBLIC_BUILD === "1";
 
 const modeConfig: Record<
   ImportMode,
@@ -179,7 +176,7 @@ const modeConfig: Record<
     desc: "点击下方按钮，在浏览器中完成 OpenAI 账号 OAuth 授权。",
   },
   batchKey: {
-    icon: KeyRound,
+    icon: Clipboard,
     title: "批量密钥",
     desc: `一行一个密钥，支持多个 ${APP_NAME} 账号一起导入。`,
   },
@@ -193,10 +190,7 @@ const modeConfig: Record<
 const importModeOrder: ImportMode[] = ["oauth", "paste", "local", "file"];
 // Antigravity 没有标准本机凭证文件（Google IDE 把 token 存在 protobuf 编码的 vscdb 里），所以不提供本机导入。
 const antigravityImportModeOrder: ImportMode[] = ["oauth", "paste", "file"];
-// 完全版额外允许“账号密码”导入单个 SuperAI 账号；公开版仅批量密钥。
-const superaiImportModeOrder: ImportMode[] = IS_PUBLIC_BUILD
-  ? ["batchKey"]
-  : ["batchKey", "password"];
+const superaiImportModeOrder: ImportMode[] = ["batchKey", "password"];
 const defaultImportMode: ImportMode = "oauth";
 const defaultSuperaiImportMode: ImportMode = "batchKey";
 
@@ -225,23 +219,13 @@ const __SUPERAI_LEGACY_NAME: string = [87, 105, 110, 100, 115, 117, 114, 102]
 const __SUPERAI_LEGACY_PROJECT: string = [119, 105, 110, 100, 115, 117, 114, 102, 97, 112, 105]
   .map((c) => String.fromCharCode(c))
   .join("");
-// 后端 account_for_frontend 出口处把内部协议名改写成 "superai"，前端只比较
-// "superai" 即可。upsert_accounts 入口会反向翻译回去。
 const PROVIDER_SUPERAI = "superai" as const;
-
 function sanitizeUserFacingText(text: string) {
   // 先替换更长的 lowercase 项目代号，再替换品牌名；顺序反了会留下大小写混用的形态。
-  let next = text
+  const next = text
     .replaceAll(__SUPERAI_LEGACY_PROJECT, "superai-sidecar")
     .replace(new RegExp(__SUPERAI_LEGACY_NAME + "API", "gi"), APP_NAME)
     .replaceAll(__SUPERAI_LEGACY_NAME, APP_NAME);
-  if (IS_PUBLIC_BUILD) {
-    next = next
-      .replace(/(password|pwd|api[_-]?key|session[_-]?token|auth1[_-]?token|refresh[_-]?token|access[_-]?token|id[_-]?token)(["'\s:=]+)([^"',\s}]+)/gi, "$1$2[secret]")
-      .replace(/\b(auth1_[A-Za-z0-9._-]+)/g, "[secret]")
-      .replace(/\b(devin-session-token\$[A-Za-z0-9._-]+)/g, "[secret]")
-      .replace(/\b(eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)\b/g, "[secret]");
-  }
   return next;
 }
 
@@ -309,10 +293,6 @@ function stateLabel(state: AccountState) {
   return "不可用";
 }
 
-function isUsageExhausted(account: ManagedAccount) {
-  return account.status?.label === "已耗尽" || account.status?.reason === "本地累计额度已用满";
-}
-
 function isCurrentAccount(account: ManagedAccount) {
   return account.status?.state === "available" && account.status.label === "当前";
 }
@@ -321,24 +301,8 @@ function accountTitle(account: ManagedAccount) {
   return account.email || account.displayName || account.accountId || account.id;
 }
 
-function publicAccountCode(account: ManagedAccount, prefix: string) {
-  const seed = (account.email || account.accountId || account.id || "").toLowerCase();
-  const input = `${prefix}|${account.provider}|${seed}`;
-  let hash = 2166136261;
-  for (let index = 0; index < input.length; index += 1) {
-    hash ^= input.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  const code = (hash >>> 0).toString(36).toUpperCase().padStart(7, "0").slice(0, 7);
-  return `${prefix}-${code}`;
-}
-
-function shouldHideAccountDetails(account: ManagedAccount) {
-  return IS_PUBLIC_BUILD && account.provider === PROVIDER_SUPERAI;
-}
-
 function accountCardTitle(account: ManagedAccount) {
-  return shouldHideAccountDetails(account) ? publicAccountCode(account, "SUPERAI") : accountTitle(account);
+  return accountTitle(account);
 }
 
 function accountDisplayLabel(account: ManagedAccount) {
@@ -346,7 +310,6 @@ function accountDisplayLabel(account: ManagedAccount) {
 }
 
 function accountNoticeLabel(account: ManagedAccount) {
-  if (shouldHideAccountDetails(account)) return publicAccountCode(account, "ACCT");
   return account.accountId || account.email || accountTitle(account);
 }
 
@@ -396,19 +359,14 @@ function sortAccountsForView(items: ManagedAccount[]) {
 function AccountStateCorner({ account }: { account: ManagedAccount }) {
   const status = account.status ?? fallbackStatus(account);
   const isCurrent = isCurrentAccount(account);
-  const exhausted = isUsageExhausted(account);
   return (
-    <span className={clsx("state-corner", exhausted ? "unavailable" : status.state, isCurrent && "current")} title={shouldHideAccountDetails(account) ? undefined : isCurrent ? "当前启用账号" : (status.reason ?? stateLabel(status.state))}>
+    <span className={clsx("state-corner", status.state, isCurrent && "current")} title={isCurrent ? "当前启用账号" : (status.reason ?? stateLabel(status.state))}>
       {isCurrent ? "启用" : status.label || stateLabel(status.state)}
     </span>
   );
 }
 
 function AccountPlanBadge({ account }: { account: ManagedAccount }) {
-  if (shouldHideAccountDetails(account)) {
-    return <span className="pill plan pro">Max</span>;
-  }
-
   const badge = resolvePlanBadge(account);
   return <span className={clsx("pill", "plan", badge.tone)}>{badge.label}</span>;
 }
@@ -487,28 +445,14 @@ function pickAntigravitySummaryMetrics(metrics: QuotaMetric[]): QuotaMetric[] {
 
 function QuotaMeters({ account }: { account: ManagedAccount }) {
   const isUnavailable = account.status?.state === "unavailable";
-  const exhausted = isUsageExhausted(account);
   const rawMetrics =
     account.quota?.metrics?.length
       ? account.quota.metrics
       : [
-          { key: "quota-primary", label: shouldHideAccountDetails(account) ? "日限" : "状态", remainingPercent: undefined, state: "unknown" as AccountState },
+          { key: "quota-primary", label: "状态", remainingPercent: undefined, state: "unknown" as AccountState },
         ];
-  const hideDetails = shouldHideAccountDetails(account);
   let metrics = rawMetrics;
-  if (hideDetails) {
-    metrics = rawMetrics.filter(
-      (metric) =>
-        metric.key === "superai-daily" ||
-        metric.key === "superai-public" ||
-        localizeQuotaLabel(metric.label) === "日限",
-    );
-    // 公开版兜底：daily 用完后上游可能走 credits 分支或 metric 缺失，
-    // 此时显示未知态，避免把"还没刷新出来"误判成 0%。
-    if (metrics.length === 0) {
-      metrics = [{ key: "superai-daily", label: "日限", remainingPercent: undefined, state: "unknown" }];
-    }
-  } else if (account.provider === "antigravity" && account.quota?.metrics?.length) {
+  if (account.provider === "antigravity" && account.quota?.metrics?.length) {
     metrics = pickAntigravitySummaryMetrics(account.quota.metrics);
   }
 
@@ -516,15 +460,14 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
     <div className="quota-meters">
       {metrics.slice(0, 3).map((metric) => {
         const remaining = metric.remainingPercent;
-        const state = isUnavailable || exhausted ? "unavailable" : (metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available"));
-        const shouldHideReset = shouldHideAccountDetails(account);
-        const resetText = shouldHideReset ? "" : isUnavailable || exhausted ? "--" : (formatResetTime(metric.resetAt) ?? "--");
-        const meterTitle = shouldHideAccountDetails(account) ? localizeQuotaLabel(metric.label) : metric.detail ?? account.quota?.error ?? metric.label;
+        const state = isUnavailable ? "unavailable" : (metric.state ?? (remaining === undefined ? "unknown" : remaining <= 0 ? "unavailable" : remaining <= 15 ? "warning" : "available"));
+        const resetText = isUnavailable ? "--" : (formatResetTime(metric.resetAt) ?? "--");
+        const meterTitle = metric.detail ?? account.quota?.error ?? metric.label;
         return (
           <div className={clsx("quota-meter", state)} key={metric.key} title={meterTitle}>
             <div className="quota-meter-head">
               <span>{localizeQuotaLabel(metric.label)}</span>
-              <time className={clsx("quota-meter-reset", shouldHideReset && "hidden")}>{resetText}</time>
+              <time className="quota-meter-reset">{resetText}</time>
               <div className="quota-meter-value">
                 <strong>{remaining === undefined ? "N/A" : `${remaining}%`}</strong>
               </div>
@@ -914,19 +857,6 @@ function EffortSegments({
   );
 }
 
-type ClaudeAppSetupResult = {
-  settingsPath: string;
-  baseUrl: string;
-  modelId: string;
-  settingsBackupPath: string | null;
-};
-
-type ClaudeAppRestoreResult = {
-  steps: string[];
-  settingsRestoredFromBackup: boolean;
-  settingsRemoved: boolean;
-};
-
 function ApiServiceCard({
   status,
   busy,
@@ -1035,7 +965,7 @@ function ApiServiceCard({
           {starting
             ? "API 服务正在后台启动，请稍候，启动完成后会自动刷新状态。"
             : running
-            ? `API 服务运行中。账号池会按 ${APP_NAME} 账号可用额度自动轮询请求。`
+            ? "API 服务运行中。你可以使用上方地址和密钥让外部 IDE 或工具接入。"
             : "启动 API 服务后，你可以通过上方地址和密钥在 IDE 或其他工具中调用。"}
         </p>
       </div>
@@ -1202,10 +1132,9 @@ function App() {
   const [refreshingProviders, setRefreshingProviders] = useState<Set<Provider>>(() => new Set());
   const [pendingOAuth, setPendingOAuth] = useState<Partial<Record<OAuthProvider, string>>>({});
   const [isSettingsLoaded, setIsSettingsLoaded] = useState(false);
-  const [apiService, setApiService] = useState<ApiServiceStatus | null>(null);
   const [apiServiceEnabled, setApiServiceEnabled] = useState(false);
-  const [isApiServiceStarting, setIsApiServiceStarting] = useState(false);
-  const [isApiServiceBusy, setIsApiServiceBusy] = useState(false);
+  const [isApiServiceStarting] = useState(false);
+  const [isApiServiceBusy] = useState(false);
   const [settings, setSettings] = useState<AppSettings>({
     theme: "system",
     autoLaunch: false,
@@ -1217,10 +1146,10 @@ function App() {
   });
   const [apiServiceHostInput, setApiServiceHostInput] = useState("0.0.0.0");
   const [apiServicePortInput, setApiServicePortInput] = useState(String(DEFAULT_API_SERVICE_PORT));
-  const [apiServiceModels, setApiServiceModels] = useState<ApiServiceModel[]>([]);
+  const [apiServiceModels] = useState<ApiServiceModel[]>([]);
   const [apiPref, setApiPrefState] = useState<ApiModelPref>(loadApiPref);
-  const [isConfiguringClaude, setIsConfiguringClaude] = useState(false);
-  const [isRestoringClaude, setIsRestoringClaude] = useState(false);
+  const [isConfiguringClaude] = useState(false);
+  const [isRestoringClaude] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const accountListRef = useRef<HTMLDivElement | null>(null);
   const pendingOAuthRef = useRef(pendingOAuth);
@@ -1246,9 +1175,17 @@ function App() {
       return null;
     }
   }, []);
-  const apiServiceRunning = Boolean(apiService?.running);
-  const apiServiceActualPort = apiService?.actualPort ?? null;
-
+  const apiService = useMemo<ApiServiceStatus>(() => ({
+    running: false,
+    bindHost: settings.apiServiceHost,
+    bindPort: settings.apiServicePort,
+    actualPort: null,
+    address: null,
+    apiKey: "",
+    defaultModel: resolveModelId(apiPref) ?? "",
+    lastError: null,
+  }), [settings.apiServiceHost, settings.apiServicePort, apiPref]);
+  const apiServiceRunning = Boolean(apiService.running);
   useEffect(() => {
     apiServiceEnabledRef.current = apiServiceEnabled;
   }, [apiServiceEnabled]);
@@ -1305,7 +1242,7 @@ function App() {
       codex: accounts.filter((account) => account.provider === "codex").length,
       gemini: accounts.filter((account) => account.provider === "gemini").length,
       antigravity: accounts.filter((account) => account.provider === "antigravity").length,
-      [PROVIDER_SUPERAI]: accounts.filter((account) => account.provider === PROVIDER_SUPERAI).length,
+      [PROVIDER_SUPERAI]: 0,
     }),
     [accounts],
   );
@@ -1365,21 +1302,7 @@ function App() {
 
   const prepareForUpdateInstall = useCallback(async () => {
     if (!isTauri()) return;
-    setIsApiServiceBusy(true);
-    try {
-      const status = await invoke<ApiServiceStatus>("prepare_for_update_install");
-      if (apiServiceRunning) {
-        setApiService(status);
-        appendAppLog("info", "安装更新前已停止本地 API 服务。");
-      }
-    } catch (error) {
-      const message = `安装更新前清理本地进程失败，已取消更新安装：${String(error)}`;
-      appendAppLog("error", message);
-      throw new Error(message, { cause: error });
-    } finally {
-      setIsApiServiceBusy(false);
-    }
-  }, [apiServiceRunning, appendAppLog]);
+  }, []);
 
   const { forceUpdate, installForceUpdate } = useUpdater({
     appendAppLog,
@@ -1476,11 +1399,9 @@ function App() {
 
   const closeImportModal = () => {
     if (isImportBusy) return;
-    if (activeProvider !== PROVIDER_SUPERAI) {
-      const provider = activeProvider as OAuthProvider;
-      const loginId = pendingOAuthRef.current[provider];
-      if (loginId) void cancelPendingOAuth(provider, loginId);
-    }
+    const provider = activeProvider as OAuthProvider;
+    const loginId = pendingOAuthRef.current[provider];
+    if (loginId) void cancelPendingOAuth(provider, loginId);
     setIsImportModalOpen(false);
     setMode(defaultImportModeForProvider(activeProvider));
     setPasteValue("");
@@ -1717,59 +1638,13 @@ function App() {
   };
 
   const handleSuperaiPasswordImport = async () => {
-    const email = superaiPasswordEmail.trim();
-    const password = superaiPasswordPwd;
-    if (!email || !password) {
-      showNotice("error", `请输入 ${APP_NAME} 邮箱和密码`);
-      return;
-    }
-    if (isImportBusy) return;
-    setIsImportBusy(true);
-    try {
-      const account = await invoke<ManagedAccount>("add_superai_account_by_password", {
-        email,
-        password,
-      });
-      setAccounts((current) => mergeAccounts(current, [account]));
-      refreshImportedAccountStatus([account]);
-      setSuperaiPasswordEmail("");
-      setSuperaiPasswordPwd("");
-      closeImportModal();
-      showNotice("success", `已添加 ${APP_NAME} 账号${account.email ? "：" + account.email : ""}`);
-    } catch (error) {
-      showNormalizedError("导入失败", error);
-    } finally {
-      setIsImportBusy(false);
-    }
+    showNotice("info", "SuperAI 账号导入界面已保留，但内部接入已移除。");
   };
 
   const handleSuperaiBatchKeyImport = async () => {
-    const keys = superaiBatchKeys
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
-    if (keys.length === 0) {
-      showNotice("error", `请粘贴 ${APP_NAME} 批量密钥`);
-      return;
-    }
-    if (isImportBusy) return;
-    setIsImportBusy(true);
-    try {
-      const result = await invoke<BackendImportResult>("add_superai_accounts_by_batch_keys", { keys });
-      applyImportResult(result, {
-        closeModal: result.imported.length > 0,
-        successText: `已添加 ${result.imported.length} 个 ${APP_NAME} 账号`,
-        accountsToPersist: [],
-      });
-      if (result.imported.length > 0) {
-        setSuperaiBatchKeys("");
-      }
-    } catch (error) {
-      showNormalizedError("批量导入失败", error);
-    } finally {
-      setIsImportBusy(false);
-    }
+    showNotice("info", "SuperAI 批量密钥导入界面已保留，但内部接入已移除。");
   };
+
   const handleProviderChange = (provider: Provider) => {
     setActiveProvider(provider);
     setSelectedExportIds(new Set());
@@ -1834,7 +1709,7 @@ function App() {
   };
   const handleToggleAccount = async (account: ManagedAccount) => {
     if (isCurrentAccount(account)) return;
-    if ((account.status ?? fallbackStatus(account)).state === "unavailable" || isUsageExhausted(account)) return;
+    if ((account.status ?? fallbackStatus(account)).state === "unavailable") return;
     if (switchingAccountId) return;
     setSwitchingAccountId(account.id);
     try {
@@ -1913,11 +1788,8 @@ function App() {
     if (isExportBusy) return;
     setIsExportBusy(true);
     let payload: string;
-    const isPublicKeyExport = shouldHideAccountDetails(account);
     try {
-      payload = isPublicKeyExport
-        ? await invoke<string>("export_public_superai_account", { accountId: account.id })
-        : await invoke<string>("export_account", { accountId: account.id });
+      payload = await invoke<string>("export_account", { accountId: account.id });
     } catch (error) {
       showNormalizedError("导出账号失败", error);
       return;
@@ -1926,8 +1798,8 @@ function App() {
     }
     setExportPreview({
       payload,
-      kind: isPublicKeyExport ? "key" : "json",
-      label: isPublicKeyExport ? `${APP_NAME} 密钥` : accountDisplayLabel(account),
+      kind: "json",
+      label: accountDisplayLabel(account),
       fileBase: `${account.provider}-${exportFileBase(accountDisplayLabel(account))}`,
     });
   };
@@ -1953,21 +1825,15 @@ function App() {
     try {
       const exported = await Promise.all(
         selectedAccounts.map(async (account) => {
-          const isPublicKeyExport = shouldHideAccountDetails(account);
-          const payload = isPublicKeyExport
-            ? await invoke<string>("export_public_superai_account", { accountId: account.id })
-            : await invoke<string>("export_account", { accountId: account.id });
-          return { payload, kind: isPublicKeyExport ? ("key" as const) : ("json" as const) };
+          const payload = await invoke<string>("export_account", { accountId: account.id });
+          return { payload, kind: "json" as const };
         }),
       );
-      const isKeyExport = exported.every((item) => item.kind === "key");
-      const payload = isKeyExport
-        ? exported.map((item) => item.payload.trim()).filter(Boolean).join("\n")
-        : JSON.stringify(exported.map((item) => JSON.parse(item.payload)), null, 2);
+      const payload = JSON.stringify(exported.map((item) => JSON.parse(item.payload)), null, 2);
       setExportPreview({
         payload,
-        kind: isKeyExport ? "key" : "json",
-        label: isKeyExport ? `${APP_NAME} 密钥 · ${exported.length} 个账号` : `${providerLabel(activeProvider)} · ${exported.length} 个账号`,
+        kind: "json",
+        label: `${providerLabel(activeProvider)} · ${exported.length} 个账号`,
         fileBase: `${activeProvider}-${exported.length}-accounts`,
       });
       setSelectedExportIds(new Set());
@@ -2086,37 +1952,6 @@ function App() {
   }, [appLogs]);
 
   useEffect(() => {
-    if (!isTauri()) return;
-    invoke<ApiServiceStatus>("get_api_service_status")
-      .then((status) => {
-        setApiService(status);
-        if (status.running) {
-          setApiServiceEnabled(true);
-          setIsApiServiceStarting(false);
-        } else if (!apiServiceEnabledRef.current) {
-          setIsApiServiceStarting(false);
-        }
-      })
-      .catch(() => undefined);
-  }, []);
-
-  // 服务在跑就拉一次 sidecar 的模型清单。
-  useEffect(() => {
-    if (!isTauri() || !apiServiceRunning) return;
-    let cancelled = false;
-    invoke<ApiServiceModel[]>("list_api_service_models")
-      .then((list) => {
-        if (!cancelled) setApiServiceModels(list ?? []);
-      })
-      .catch(() => {
-        if (!cancelled) setApiServiceModels([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [apiServiceRunning, apiServiceActualPort]);
-
-  useEffect(() => {
     if (!isTauri() || !apiServiceRunning || apiServiceModels.length === 0) return;
     const availableSet = new Set(apiServiceModels.map((model) => model.id));
     const selectedFamily = MODEL_FAMILIES.find((family) => family.key === apiPref.family);
@@ -2134,124 +1969,11 @@ function App() {
             : fallbackFamily.defaultEffort ?? fallbackFamily.efforts[0],
         };
         persistApiPref(next);
-        const modelId = resolveModelId(next) ?? "";
-        invoke("set_api_service_default_model", { model: modelId })
-          .then(() => {
-            setApiService((status) => status ? { ...status, defaultModel: modelId } : status);
-          })
-          .catch((error) => {
-            showNormalizedError("设置默认模型失败", error);
-          });
         return next;
       });
     }, 0);
     return () => window.clearTimeout(timer);
   }, [apiPref.family, apiServiceModels, apiServiceRunning, showNormalizedError]);
-
-  useEffect(() => {
-    if (!isTauri() || !apiServiceRunning) return undefined;
-    let cancelled = false;
-
-    const syncActiveApiAccount = () => {
-      void invoke<SwitchAccountResult>("sync_api_service_active_account")
-        .then((changedAccounts) => {
-          if (cancelled || changedAccounts.length === 0) return;
-          setAccounts((current) =>
-            sortAccountsForView(current.map((item) => changedAccounts.find((changed) => changed.id === item.id) ?? item)),
-          );
-        })
-        .catch(() => undefined);
-    };
-
-    syncActiveApiAccount();
-    const timer = window.setInterval(syncActiveApiAccount, API_ACTIVE_ACCOUNT_SYNC_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [apiServiceRunning, apiServiceActualPort]);
-
-  // API 服务启动异常事件 → toast。
-  useEffect(() => {
-    if (!isTauri()) return;
-    let unlisten: (() => void) | null = null;
-    void listen<{ phase?: string; message?: string }>("api-service-error", (event) => {
-      setIsApiServiceStarting(false);
-      const message = event.payload?.message ?? "未知错误";
-      showNotice("error", `${APP_NAME} API 服务异常：${message}`);
-    }).then((fn) => {
-      unlisten = fn;
-    });
-    return () => {
-      unlisten?.();
-    };
-  }, [showNotice, showNormalizedError]);
-
-  useEffect(() => {
-    if (!isTauri()) return;
-    let unlisten: (() => void) | null = null;
-    void listen<ApiServiceStatus>("api-service-status-changed", (event) => {
-      if (event.payload) {
-        setApiService(event.payload);
-        setIsApiServiceStarting(false);
-        setApiServiceEnabled(Boolean(event.payload.running));
-      }
-    }).then((fn) => {
-      unlisten = fn;
-    });
-    return () => {
-      unlisten?.();
-    };
-  }, []);
-
-  // 公开版账号本地累计达到 100% 时由 Rust 主动 emit；前端弹 toast 并重读账号列表，
-  // 让"已耗尽"红字立刻显示出来。
-  useEffect(() => {
-    if (!isTauri()) return;
-    let unlisten: (() => void) | null = null;
-    void listen<{ id?: string; provider?: string; consumed_percent?: number }>(
-      "account-exhausted",
-      () => {
-        showNotice("info", "有账号本地额度已用满，已自动停用");
-        void invoke<ManagedAccount[]>("list_accounts")
-          .then((next) => setAccounts(sortAccountsForView(next)))
-          .catch((error) => {
-            showNormalizedError("读取账号列表失败", error);
-          });
-      },
-    ).then((fn) => {
-      unlisten = fn;
-    });
-    return () => {
-      unlisten?.();
-    };
-  }, [showNotice, showNormalizedError]);
-
-  // 后台定时任务删掉过期 SuperAI 账号时由 Rust 主动 emit；前端 re-fetch 列表，
-  // 避免已过期卡片残留在 UI 直到用户手动点刷新（且手动刷新会触发 "no rows" 报错）。
-  useEffect(() => {
-    if (!isTauri()) return;
-    let unlisten: (() => void) | null = null;
-    void listen<{ ids?: string[]; count?: number }>(
-      "accounts-expired-removed",
-      (event) => {
-        const count = event.payload?.count ?? event.payload?.ids?.length ?? 0;
-        if (count > 0) {
-          showNotice("info", `已自动移除 ${count} 个过期账号`);
-        }
-        void invoke<ManagedAccount[]>("list_accounts")
-          .then((next) => setAccounts(sortAccountsForView(next)))
-          .catch((error) => {
-            showNormalizedError("读取账号列表失败", error);
-          });
-      },
-    ).then((fn) => {
-      unlisten = fn;
-    });
-    return () => {
-      unlisten?.();
-    };
-  }, [showNotice, showNormalizedError]);
 
   useEffect(() => {
     completeOAuthRef.current = completeOAuth;
@@ -2279,47 +2001,18 @@ function App() {
 
   const toggleApiService = useCallback(async () => {
     if (isApiServiceBusy || isApiServiceStarting) return;
-    setIsApiServiceBusy(true);
-    try {
-      const command = apiServiceRunning ? "stop_api_service" : "start_api_service";
-      if (command === "start_api_service") {
-        setIsApiServiceStarting(true);
-      }
-      const status = await invoke<ApiServiceStatus>(command);
-      setApiService(status);
-      setApiServiceEnabled(Boolean(status.running));
-      setIsApiServiceStarting(false);
-      showNotice(
-        "success",
-        status.running ? `已启动 API 服务${status.address ? "：" + status.address : ""}` : "已停用 API 服务",
-      );
-    } catch (error) {
-      setIsApiServiceStarting(false);
-      showNormalizedError("操作 API 服务失败", error);
-    } finally {
-      setIsApiServiceBusy(false);
-    }
-  }, [isApiServiceBusy, isApiServiceStarting, showNormalizedError, apiServiceRunning, showNotice]);
+    showNotice("info", "API 服务目前仅保留 UI 壳子，后端能力已移除。");
+  }, [isApiServiceBusy, isApiServiceStarting, showNotice]);
 
   const applyApiPref = useCallback(
     (updater: (prev: ApiModelPref) => ApiModelPref) => {
       setApiPrefState((prev) => {
         const next = updater(prev);
         persistApiPref(next);
-        const modelId = resolveModelId(next) ?? "";
-        if (isTauri()) {
-          invoke("set_api_service_default_model", { model: modelId })
-            .then(() => {
-              setApiService((status) => status ? { ...status, defaultModel: modelId } : status);
-            })
-            .catch((error) => {
-              showNormalizedError("设置默认模型失败", error);
-            });
-        }
         return next;
       });
     },
-    [showNormalizedError],
+    [],
   );
 
   const handleChangeFamily = useCallback(
@@ -2343,48 +2036,13 @@ function App() {
     [applyApiPref],
   );
 
-  // 服务启动后，确保 sidecar 用的 default_model 和 UI 当前选择一致。
-  useEffect(() => {
-    if (!isTauri() || !apiService?.running) return;
-    const modelId = resolveModelId(apiPref) ?? "";
-    invoke("set_api_service_default_model", { model: modelId }).catch(() => undefined);
-  }, [apiService?.running, apiPref]);
-
   const configureClaudeApp = useCallback(async () => {
-    if (!isTauri()) {
-      showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
-      return;
-    }
-    if (!apiService?.running) {
-      showNotice("error", "请先启动 API 服务");
-      return;
-    }
-    setIsConfiguringClaude(true);
-    try {
-      const result = await invoke<ClaudeAppSetupResult>("configure_claude_app");
-      showNotice("success", `Claude 已配置完成，请重启 Claude Code 生效。当前走 SuperAI 默认模型 ${result.modelId}。`);
-    } catch (error) {
-      showNormalizedError("配置 Claude 失败", error);
-    } finally {
-      setIsConfiguringClaude(false);
-    }
-  }, [apiService?.running, showNormalizedError, showNotice]);
+    showNotice("info", "API 服务目前仅保留 UI 壳子，Claude 配置能力暂未接入。");
+  }, [showNotice]);
 
   const restoreClaudeApp = useCallback(async () => {
-    if (!isTauri()) {
-      showNotice("error", `仅在 ${APP_NAME} 桌面应用中可用`);
-      return;
-    }
-    setIsRestoringClaude(true);
-    try {
-      await invoke<ClaudeAppRestoreResult>("restore_claude_app");
-      showNotice("success", "Claude 已恢复完成，请重启 Claude Code 生效。");
-    } catch (error) {
-      showNormalizedError("恢复 Claude 配置失败", error);
-    } finally {
-      setIsRestoringClaude(false);
-    }
-  }, [showNormalizedError, showNotice]);
+    showNotice("info", "API 服务目前仅保留 UI 壳子，Claude 恢复能力暂未接入。");
+  }, [showNotice]);
 
   const copyApiServiceText = useCallback(
     async (text: string, label: string) => {
@@ -2566,32 +2224,19 @@ function App() {
                           <AccountPlanBadge account={account} />
                         </div>
                         <div className="account-subtitle">
-                          {shouldHideAccountDetails(account) ? (
-                            <>
-                              <span>
-                                <b>名称</b>
-                                {publicAccountCode(account, "USER")}
-                              </span>
+                          <>
+                            <span>
+                              <b>名称</b>
+                              {account.email}
+                            </span>
+                            {account.accountId && (
                               <span>
                                 <b>账号</b>
-                                {publicAccountCode(account, "ACCT")}
+                                {account.accountId}
                               </span>
-                            </>
-                          ) : (
-                            <>
-                              <span>
-                                <b>名称</b>
-                                {account.email}
-                              </span>
-                              {account.accountId && (
-                                <span>
-                                  <b>账号</b>
-                                  {account.accountId}
-                                </span>
-                              )}
-                            </>
-                          )}
-                          {!shouldHideAccountDetails(account) && account.organizationId && (
+                            )}
+                          </>
+                          {account.organizationId && (
                             <span>
                               <b>组织</b>
                               {account.organizationId}
@@ -2612,8 +2257,7 @@ function App() {
                           disabled={
                             isCurrentAccount(account) ||
                             switchingAccountId !== null ||
-                            (account.status ?? fallbackStatus(account)).state === "unavailable" ||
-                            isUsageExhausted(account)
+                            (account.status ?? fallbackStatus(account)).state === "unavailable"
                           }
                         >
                           <BadgeCheck
@@ -2857,13 +2501,13 @@ function App() {
                     onClick={() => void handleSuperaiBatchKeyImport()}
                     disabled={!superaiBatchKeys.trim() || isImportBusy}
                   >
-                    <KeyRound size={20} />
+                    <Clipboard size={20} />
                     {isImportBusy ? "导入中..." : "批量导入"}
                   </button>
                 </>
               )}
 
-              {mode === "password" && activeProvider === PROVIDER_SUPERAI && !IS_PUBLIC_BUILD && (
+              {mode === "password" && activeProvider === PROVIDER_SUPERAI && (
                 <div className="superai-password-form">
                   <label className="field">
                     <span>邮箱</span>
@@ -2889,7 +2533,7 @@ function App() {
                       disabled={isImportBusy}
                     />
                   </label>
-                  <p className="superai-password-tip">凭证仅在本机加密保存，导入完成后建议立即修改密码或启用二步验证。</p>
+                  <p className="superai-password-tip">界面已保留；内部 windsurf 接入已移除，当前不会真的导入账号。</p>
                   <button
                     className="wide primary"
                     onClick={() => void handleSuperaiPasswordImport()}

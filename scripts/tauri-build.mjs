@@ -83,22 +83,6 @@ function augmentPathForWindowsCross(env) {
   env.PATH = merged.filter((p) => (seen.has(p) ? false : (seen.add(p), true))).join(":");
 }
 
-// 二进制按 <name>-<rust-target-triple>(.exe) 摆在 src-tauri/binaries/，
-// 提前检查能给出清晰错误，避免 tauri-cli 再吐一遍长堆栈。
-function sidecarsReady(target) {
-  const suffix = target.includes("windows") ? ".exe" : "";
-  const sidecarBin = join(rootDir, "src-tauri", "binaries", `superai-api-${target}${suffix}`);
-  const lsBin = join(rootDir, "src-tauri", "binaries", `language_server-${target}${suffix}`);
-  if (!existsSync(sidecarBin) || !existsSync(lsBin)) {
-    return {
-      ok: false,
-      hint: `缺少 sidecar 二进制: ${sidecarBin} / ${lsBin}\n` +
-            `   请先在能产出该架构的机器上运行 TARGET=${target} npm run build:sidecar`,
-    };
-  }
-  return { ok: true };
-}
-
 function rustupHasTarget(target) {
   const result = spawnSync("rustup", ["target", "list", "--installed"], { encoding: "utf8" });
   if (result.status !== 0) return null; // rustup 不在或调用失败时不阻塞
@@ -111,13 +95,6 @@ for (const target of targets) {
   console.log(`target  : ${target}`);
   console.log(`bundle  : ${bundle}`);
   console.log(`profile : ${isFullBuild ? "full" : "public"}`);
-
-  const ready = sidecarsReady(target);
-  if (!ready.ok) {
-    console.warn(`⚠️  跳过 ${target}: ${ready.hint}`);
-    summary.push({ target, status: "skipped", reason: "missing-sidecar" });
-    continue;
-  }
 
   const hasTarget = rustupHasTarget(target);
   if (hasTarget === false) {
