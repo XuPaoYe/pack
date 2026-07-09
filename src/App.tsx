@@ -6,7 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import clsx from "clsx";
 import {
-  BadgeCheck,
+  ArrowRightLeft,
   CalendarDays,
   Check,
   ChevronDown,
@@ -54,7 +54,6 @@ import { AboutPanelBody } from "./components/AboutPanel";
 import { SidebarAdCard } from "./components/SidebarAdCard";
 import { noticeToneConfig } from "./components/noticeTone";
 import { CodexIcon } from "./components/icons/CodexIcon";
-import { GeminiIcon } from "./components/icons/GeminiIcon";
 import { SuperaiIcon } from "./components/icons/SuperaiIcon";
 import { AntigravityIcon } from "./components/icons/AntigravityIcon";
 import { fallbackStatus, formatValidityText, resolvePlanBadge } from "./lib/accountPresentation";
@@ -67,7 +66,7 @@ import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccou
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
 type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey" | "password";
-type OAuthProvider = "codex" | "gemini" | "antigravity";
+type OAuthProvider = "codex" | "antigravity";
 type ThemeMode = "system" | "light" | "dark";
 
 const themeOptions: Array<{ key: ThemeMode; label: string; icon: typeof Monitor }> = [
@@ -206,7 +205,6 @@ function defaultImportModeForProvider(provider: Provider): ImportMode {
 
 function providerLabel(provider: Provider) {
   if (provider === "codex") return "Codex";
-  if (provider === "gemini") return "Gemini Cli";
   if (provider === "antigravity") return "Antigravity";
   return APP_NAME;
 }
@@ -317,18 +315,21 @@ function accountActionLabel(account: ManagedAccount) {
   return `${providerLabel(account.provider)} ${accountNoticeLabel(account)}`;
 }
 
-function activationSuccessMessage(account: ManagedAccount) {
+function switchSuccessMessage(account: ManagedAccount) {
   const label = accountActionLabel(account);
   if (account.provider === "codex") {
-    return `已启用 ${label}，请重启 Codex 相关产品`;
-  }
-  if (account.provider === "gemini") {
-    return `已启用 ${label}，请重启 Gemini 相关产品`;
+    return `已切换到 ${label}，请重启 Codex 相关产品`;
   }
   if (account.provider === "antigravity") {
-    return `已启用 ${label}，请重启 Antigravity 相关产品`;
+    return `已切换到 ${label}，请重启 Antigravity 相关产品`;
   }
-  return `已启用 ${label}`;
+  return `已切换到 ${label}`;
+}
+
+function switchButtonTitle(account: ManagedAccount) {
+  if (account.provider === "antigravity") return "切换到 Antigravity（经典版）";
+  if (account.provider === "codex") return "切换到 Codex";
+  return "切换账号";
 }
 
 function refreshFailureMessage(account: ManagedAccount) {
@@ -1230,7 +1231,6 @@ function App() {
   const counts = useMemo(
     () => ({
       codex: accounts.filter((account) => account.provider === "codex").length,
-      gemini: accounts.filter((account) => account.provider === "gemini").length,
       antigravity: accounts.filter((account) => account.provider === "antigravity").length,
       [PROVIDER_SUPERAI]: 0,
     }),
@@ -1507,8 +1507,7 @@ function App() {
     }
     setIsImportBusy(true);
     try {
-      const command = provider === "codex" ? "import_codex_from_local" : "import_gemini_from_local";
-      const result = await invoke<BackendImportResult>(command);
+      const result = await invoke<BackendImportResult>("import_codex_from_local");
       applyImportResult(
         result,
         { accountsToPersist: [] },
@@ -1527,7 +1526,6 @@ function App() {
   ) => {
     const command =
       provider === "codex" ? "complete_codex_oauth"
-      : provider === "gemini" ? "complete_gemini_oauth"
       : "complete_antigravity_oauth";
     try {
       const result = await invoke<BackendImportResult>(command, { loginId });
@@ -1558,7 +1556,6 @@ function App() {
     try {
       const command =
         provider === "codex" ? "start_codex_oauth"
-        : provider === "gemini" ? "start_gemini_oauth"
         : "start_antigravity_oauth";
       const result = await invoke<OAuthStartResult>(command);
       setPendingOAuth((current) => ({ ...current, [provider]: result.login_id }));
@@ -1576,11 +1573,10 @@ function App() {
     activeProvider !== PROVIDER_SUPERAI && Boolean(pendingOAuth[activeProvider as OAuthProvider]);
   const oauthAccountLabel =
     activeProvider === "codex" ? "OpenAI"
-    : activeProvider === "gemini" ? "Gemini"
     : activeProvider === "antigravity" ? "Antigravity"
     : "OpenAI";
   const localImportDesc =
-    activeProvider === "codex" ? "从本地已登录的会话中导入 Codex 账号" : "从本地已登录的会话中导入 Gemini Cli 账号";
+    activeProvider === "codex" ? "从本地已登录的会话中导入 Codex 账号" : "Antigravity 暂不支持本机导入";
   const selectedModeDesc =
     mode === "oauth"
       ? `点击下方按钮，在浏览器中完成 ${oauthAccountLabel} 账号 OAuth 授权。`
@@ -1697,8 +1693,7 @@ function App() {
     }
     setApiServicePortInput(String(settings.apiServicePort));
   };
-  const handleToggleAccount = async (account: ManagedAccount) => {
-    if (isCurrentAccount(account)) return;
+  const handleSwitchAccount = async (account: ManagedAccount) => {
     if ((account.status ?? fallbackStatus(account)).state === "unavailable") return;
     if (switchingAccountId) return;
     setSwitchingAccountId(account.id);
@@ -1708,9 +1703,9 @@ function App() {
         sortAccountsForView(current.map((item) => providerAccounts.find((changed) => changed.id === item.id) ?? item)),
       );
       setAccountPage(1);
-      showNotice("success", activationSuccessMessage(account));
+      showNotice("success", switchSuccessMessage(account));
     } catch (error) {
-      showNormalizedError("启用账号失败", error);
+      showNormalizedError("切换账号失败", error);
     } finally {
       setSwitchingAccountId(null);
     }
@@ -2097,11 +2092,6 @@ function App() {
             <span>Codex</span>
             <b>{counts.codex}</b>
           </button>
-          <button className={clsx(activeProvider === "gemini" && "active")} onClick={() => handleProviderChange("gemini")}>
-            <GeminiIcon className="provider-nav-icon gemini" />
-            <span>Gemini Cli</span>
-            <b>{counts.gemini}</b>
-          </button>
           <button className={clsx(activeProvider === "antigravity" && "active")} onClick={() => handleProviderChange("antigravity")}>
             <AntigravityIcon className="provider-nav-icon antigravity" />
             <span>Antigravity</span>
@@ -2240,16 +2230,15 @@ function App() {
                         <div className="account-actions" onClick={(event) => event.stopPropagation()}>
                         <button
                           className="icon-button"
-                          aria-label={isCurrentAccount(account) ? "当前账号" : "设为当前账号"}
-                          title={isCurrentAccount(account) ? "当前账号" : "设为当前"}
-                          onClick={() => handleToggleAccount(account)}
+                          aria-label={switchButtonTitle(account)}
+                          title={switchButtonTitle(account)}
+                          onClick={() => handleSwitchAccount(account)}
                           disabled={
-                            isCurrentAccount(account) ||
                             switchingAccountId !== null ||
                             (account.status ?? fallbackStatus(account)).state === "unavailable"
                           }
                         >
-                          <BadgeCheck
+                          <ArrowRightLeft
                             size={15}
                             strokeWidth={1.75}
                             className={clsx(switchingAccountId === account.id && "spin")}
@@ -2451,7 +2440,7 @@ function App() {
                   <button className={clsx("drop-zone", isFileImporting && "loading")} onClick={() => fileInputRef.current?.click()} disabled={isImportBusy}>
                     <Upload size={28} />
                     <strong>{isFileImporting ? "正在导入 JSON..." : "选择 JSON 文件"}</strong>
-                    <span>{isFileImporting ? "正在解析并刷新账号信息" : "支持 auth.json、oauth_creds.json、导出数组"}</span>
+                    <span>{isFileImporting ? "正在解析并刷新账号信息" : "支持 auth.json、Antigravity JSON、导出数组"}</span>
                   </button>
                 </>
               )}

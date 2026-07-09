@@ -8,7 +8,7 @@ const __LEGACY_AUD_PROTOCOL = [119, 105, 110, 100, 115, 117, 114, 102]
   .join("");
 const EXAFUNCTION_LEGACY_AUD = "exafunction-" + __LEGACY_AUD_PROTOCOL;
 
-export type Provider = "codex" | "gemini" | "superai" | "antigravity";
+export type Provider = "codex" | "superai" | "antigravity";
 
 export type ImportSource = "paste" | "file" | "local" | "oauth";
 
@@ -60,8 +60,25 @@ export type QuotaMetric = {
   modelName?: string;
 };
 
+export type QuotaBucket = {
+  bucketId: string;
+  window: string;
+  remainingPercent?: number;
+  resetAt?: number | string;
+  displayName?: string;
+  description?: string;
+  state?: AccountState;
+};
+
+export type QuotaGroup = {
+  displayName: string;
+  description?: string;
+  buckets: QuotaBucket[];
+};
+
 export type AccountQuota = {
   metrics: QuotaMetric[];
+  groups?: QuotaGroup[];
   lastUpdated?: number;
   error?: string;
   isForbidden?: boolean;
@@ -206,50 +223,45 @@ function parseCodexQuota(value: JsonObject): AccountQuota | undefined {
   };
 }
 
-function parseGeminiQuota(value: JsonObject): AccountQuota | undefined {
-  const raw = isObject(value.gemini_usage_raw) ? value.gemini_usage_raw : undefined;
-  const models = Array.isArray(raw?.models) ? raw.models : Array.isArray(value.models) ? value.models : [];
-  const metrics: QuotaMetric[] = [];
-
-  for (const item of models) {
-    if (!isObject(item)) continue;
-    const remainingPercent = percentField(item.percentage ?? item.remainingPercent ?? item.remaining_percent);
-    const name = stringField(item.display_name) ?? stringField(item.displayName) ?? stringField(item.name);
-    if (!name && remainingPercent === undefined) continue;
-    metrics.push({
-      key: `gemini-${metrics.length}`,
-      label: name ?? `MODEL ${metrics.length + 1}`,
-      remainingPercent,
-      resetAt: stringField(item.reset_time) ?? stringField(item.resetTime),
-      state: quotaState(remainingPercent),
-    });
-  }
-
-  const totalPercentUsed = percentField(raw?.totalPercentUsed ?? raw?.total_percent_used ?? value.totalPercentUsed);
-  if (!metrics.length && totalPercentUsed !== undefined) {
-    const remainingPercent = 100 - totalPercentUsed;
-    metrics.push({
-      key: "gemini-total",
-      label: "TOTAL",
-      remainingPercent,
-      state: quotaState(remainingPercent),
-    });
-  }
-
-  const error = stringField(value.quota_query_last_error);
-  if (!metrics.length && !error) return undefined;
-
-  return {
-    metrics,
-    lastUpdated: numberField(value.usage_updated_at),
-    error,
-  };
-}
-
 function parseAntigravityQuota(value: JsonObject): AccountQuota | undefined {
   const raw = isObject(value.antigravity_usage_raw) ? value.antigravity_usage_raw : undefined;
+  const summaryRaw = isObject(value.antigravity_quota_summary_raw) ? value.antigravity_quota_summary_raw : undefined;
   const modelsObj = raw && isObject(raw.models) ? raw.models : undefined;
   const metrics: QuotaMetric[] = [];
+  const groups: QuotaGroup[] = [];
+
+  const rawGroups = Array.isArray(summaryRaw?.groups)
+    ? summaryRaw.groups
+    : Array.isArray(raw?.quota_groups)
+      ? raw.quota_groups
+      : [];
+  rawGroups.forEach((item, groupIndex) => {
+    if (!isObject(item)) return;
+    const buckets = Array.isArray(item.buckets) ? item.buckets : [];
+    const parsedBuckets: QuotaBucket[] = [];
+    buckets.forEach((bucket, bucketIndex) => {
+      if (!isObject(bucket)) return;
+      const fraction = numberField(bucket.remainingFraction ?? bucket.remaining_fraction);
+      const remainingPercent = fraction === undefined ? undefined : Math.max(0, Math.min(100, Math.round(fraction * 100)));
+      const window = stringField(bucket.window) ?? stringField(bucket.displayName) ?? `bucket-${bucketIndex + 1}`;
+      parsedBuckets.push({
+        bucketId: stringField(bucket.bucketId) ?? stringField(bucket.bucket_id) ?? `antigravity-group-${groupIndex}-${bucketIndex}`,
+        window,
+        remainingPercent,
+        resetAt: stringField(bucket.resetTime) ?? stringField(bucket.reset_time),
+        displayName: stringField(bucket.displayName) ?? stringField(bucket.display_name),
+        description: stringField(bucket.description),
+        state: quotaState(remainingPercent),
+      });
+    });
+    if (parsedBuckets.length) {
+      groups.push({
+        displayName: stringField(item.displayName) ?? stringField(item.display_name) ?? `Quota Group ${groupIndex + 1}`,
+        description: stringField(item.description),
+        buckets: parsedBuckets,
+      });
+    }
+  });
 
   if (modelsObj) {
     const entries = Object.entries(modelsObj);
@@ -295,10 +307,11 @@ function parseAntigravityQuota(value: JsonObject): AccountQuota | undefined {
 
   const error = stringField(value.quota_query_last_error);
   const isForbidden = boolField(value.is_forbidden) ?? false;
-  if (!metrics.length && !error && !isForbidden) return undefined;
+  if (!metrics.length && !groups.length && !error && !isForbidden) return undefined;
 
   return {
     metrics,
+    groups,
     lastUpdated: numberField(value.usage_updated_at),
     error,
     isForbidden,
@@ -719,72 +732,6 @@ function parseAntigravity(value: unknown, source: ImportSource): ManagedAccount 
   };
 }
 
-function parseGemini(value: unknown, source: ImportSource): ManagedAccount | null {
-  if (!isObject(value)) return null;
-
-  const token = isObject(value.token) ? value.token : undefined;
-  const accessToken =
-    stringField(value.access_token) ??
-    stringField(value.accessToken) ??
-    stringField(token?.access_token) ??
-    stringField(token?.accessToken);
-  const refreshToken =
-    stringField(value.refresh_token) ??
-    stringField(value.refreshToken) ??
-    stringField(token?.refresh_token) ??
-    stringField(token?.refreshToken);
-  const idToken =
-    stringField(value.id_token) ??
-    stringField(value.idToken) ??
-    stringField(token?.id_token) ??
-    stringField(token?.idToken);
-
-  if (!accessToken && !refreshToken && !idToken) return null;
-
-  const jwt = parseJwtPayload(idToken);
-  const email =
-    stringField(value.email) ??
-    stringField(value.active) ??
-    stringField(jwt?.email) ??
-    stringField(value.account);
-  if (!email) return null;
-
-  const authId = stringField(value.auth_id) ?? stringField(value.authId) ?? stringField(jwt?.sub);
-  const planType = stringField(value.selected_auth_type) ?? stringField(value.selectedAuthType);
-  const expiresAt =
-    numberField(value.expiry_date) ??
-    numberField(value.expiryDate) ??
-    numberField(token?.expires_at) ??
-    numberField(token?.expiresAt) ??
-    numberField(jwt?.exp);
-  const now = nowUnixSeconds();
-  const tokenMeta = {
-    hasAccessToken: Boolean(accessToken),
-    hasRefreshToken: Boolean(refreshToken),
-    hasIdToken: Boolean(idToken),
-    expiresAt,
-  };
-  const quota = parseGeminiQuota(value);
-
-  return {
-    id: stringField(value.id) ?? accountIdFor("gemini", email, authId ?? accessToken ?? email),
-    provider: "gemini",
-    email: email.toLowerCase(),
-    displayName: stringField(value.name),
-    plan: stringField(value.plan_name) ?? stringField(value.planName) ?? stringField(value.tier_name),
-    planType,
-    subscriptionActiveUntil: expiresAt,
-    accountId: authId,
-    userId: authId,
-    source,
-    tokenMeta,
-    status: deriveStatus(value, tokenMeta, quota),
-    quota,
-    createdAt: numberField(value.created_at) ?? now,
-    updatedAt: numberField(value.last_used) ?? numberField(value.updated_at) ?? now,
-  };
-}
-
 export function parseAuthJson(content: string, source: ImportSource, label = "JSON"): ImportResult {
   let parsed: unknown;
   try {
@@ -799,11 +746,11 @@ export function parseAuthJson(content: string, source: ImportSource, label = "JS
 
   items.forEach((item, index) => {
     const itemLabel = `${label}${items.length > 1 ? ` #${index + 1}` : ""}`;
-    const account = parseCodex(item, source) ?? parseSuperAI(item, source) ?? parseAntigravity(item, source) ?? parseGemini(item, source);
+    const account = parseCodex(item, source) ?? parseSuperAI(item, source) ?? parseAntigravity(item, source);
     if (account) {
       imported.push(account);
     } else {
-      failed.push({ label: itemLabel, reason: "未识别到 Codex / Antigravity / Gemini 凭证字段" });
+      failed.push({ label: itemLabel, reason: "未识别到 Codex / Antigravity 凭证字段" });
     }
   });
 

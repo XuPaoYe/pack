@@ -170,12 +170,6 @@ button:disabled {
   color: currentColor;
 }
 
-.provider-nav-icon.gemini {
-  width: 24px;
-  height: 24px;
-  padding: 0;
-}
-
 .provider-nav-icon.superai {
   width: 18px;
   height: 18px;
@@ -1020,12 +1014,6 @@ h2 {
   background: var(--accent);
   color: var(--accent-ink);
   border: 1px solid rgba(16, 185, 129, 0.35);
-}
-
-.provider-dot.gemini,
-.pill.gemini {
-  background: var(--accent);
-  color: var(--accent-ink);
 }
 
 .pill.codex {
@@ -3324,6 +3312,50 @@ textarea:focus {
   gap: 12px;
 }
 
+.quota-group-list {
+  display: grid;
+  gap: 18px;
+}
+
+.quota-group-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid rgba(37, 99, 235, 0.24);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 88%, rgba(37, 99, 235, 0.08));
+}
+
+.quota-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.quota-group-head h3 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.25;
+  font-weight: 650;
+  color: color-mix(in srgb, #2563eb 58%, var(--text));
+}
+
+.quota-group-head p {
+  margin: 0;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-soft);
+  text-align: right;
+}
+
+.quota-group-buckets {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
 .quota-detail-tile {
   display: grid;
   gap: 8px;
@@ -3429,4 +3461,18 @@ textarea:focus {
   font-size: 10px;
   color: var(--text-soft);
   font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 720px) {
+  .quota-group-head {
+    display: grid;
+  }
+
+  .quota-group-head p {
+    text-align: left;
+  }
+
+  .quota-group-buckets {
+    grid-template-columns: 1fr;
+  }
 }

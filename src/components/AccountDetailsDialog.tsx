@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { Clock, X } from "lucide-react";
 import clsx from "clsx";
-import type { ManagedAccount, QuotaMetric } from "../lib/authParser";
+import type { ManagedAccount, QuotaBucket, QuotaMetric } from "../lib/authParser";
 import { formatDateTime, formatResetTime } from "../lib/time";
 import { useVirtualScrollbar } from "../hooks/useVirtualScrollbar";
 
@@ -18,6 +18,15 @@ function sortMetrics(metrics: QuotaMetric[]): QuotaMetric[] {
     const bName = (b.modelName ?? b.label).toLowerCase();
     return aName.localeCompare(bName);
   });
+}
+
+function quotaBucketTone(bucket: QuotaBucket): "good" | "warn" | "bad" | "unknown" {
+  return quotaTone(bucket.remainingPercent);
+}
+
+function bucketLabel(bucket: QuotaBucket) {
+  const label = bucket.displayName ?? bucket.window;
+  return label.toUpperCase() === "WEEKLY" ? "WEEKLY" : label.toUpperCase();
 }
 
 export function AccountDetailsDialog({
@@ -38,7 +47,8 @@ export function AccountDetailsDialog({
   const { ref: bodyRef, state: scrollbar, update: updateScrollbar } =
     useVirtualScrollbar<HTMLDivElement>();
 
-  const metrics = account.quota?.metrics ? sortMetrics(account.quota.metrics) : [];
+  const groups = account.quota?.groups?.filter((group) => group.buckets.length > 0) ?? [];
+  const metrics = groups.length === 0 && account.quota?.metrics ? sortMetrics(account.quota.metrics) : [];
   const tier = account.plan ?? account.planType;
 
   return (
@@ -62,9 +72,46 @@ export function AccountDetailsDialog({
         </header>
         <div className="account-details-body-wrap">
           <div className="account-details-body" ref={bodyRef} onScroll={updateScrollbar}>
-            {metrics.length === 0 ? (
+            {groups.length === 0 && metrics.length === 0 ? (
               <div className="account-details-empty">
                 {account.quota?.error ?? "暂无明细数据"}
+              </div>
+            ) : groups.length > 0 ? (
+              <div className="quota-group-list">
+                {groups.map((group, groupIndex) => (
+                  <section className="quota-group-card" key={`${group.displayName}-${groupIndex}`}>
+                    <div className="quota-group-head">
+                      <h3>{group.displayName}</h3>
+                      {group.description && <p>{group.description}</p>}
+                    </div>
+                    <div className="quota-group-buckets">
+                      {group.buckets.map((bucket, bucketIndex) => {
+                        const tone = quotaBucketTone(bucket);
+                        const reset = formatResetTime(bucket.resetAt);
+                        const resetTitle = formatDateTime(bucket.resetAt);
+                        return (
+                          <article className={clsx("quota-detail-tile", tone)} key={`${bucket.bucketId}-${bucketIndex}`}>
+                            <div className="quota-detail-tile-head">
+                              <div className="quota-detail-tile-name">
+                                <strong>{bucketLabel(bucket)}</strong>
+                              </div>
+                              <span className="quota-detail-percent">
+                                {bucket.remainingPercent === undefined ? "N/A" : `${bucket.remainingPercent}%`}
+                              </span>
+                            </div>
+                            <div className={clsx("quota-detail-bar", tone)}>
+                              <i style={{ width: `${bucket.remainingPercent ?? 0}%` }} />
+                            </div>
+                            <div className="quota-detail-foot" title={resetTitle ?? undefined}>
+                              <Clock size={11} strokeWidth={1.8} />
+                              <span>重置时间：{reset ?? "未知"}</span>
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
+                  </section>
+                ))}
               </div>
             ) : (
               <div className="account-details-grid">

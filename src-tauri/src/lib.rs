@@ -29,9 +29,6 @@ use url::Url;
 use std::os::windows::process::CommandExt;
 
 const CODEX_KEYCHAIN_SERVICE: &str = "Codex Auth";
-const GEMINI_KEYCHAIN_SERVICE: &str = "gemini-cli-oauth";
-const GEMINI_KEYCHAIN_ACCOUNT: &str = "main-account";
-const GEMINI_FILE_KEYCHAIN_FILE: &str = "gemini-credentials.json";
 const CODEX_ACCOUNT_CHECK_URL: &str = "https://chatgpt.com/backend-api/wham/accounts/check";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_API_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
@@ -42,14 +39,7 @@ const CODEX_OAUTH_SCOPES: &str =
     "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const CODEX_OAUTH_CALLBACK_PORT: u16 = 1455;
 const OAUTH_TIMEOUT_SECONDS: i64 = 300;
-const GEMINI_OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
-const GEMINI_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
-const GEMINI_OAUTH_CALLBACK_PATH: &str = "/oauth2callback";
-const GEMINI_CODE_ASSIST_LOAD_URL: &str =
-    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
-const GEMINI_CODE_ASSIST_QUOTA_URL: &str =
-    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota";
 const ANTIGRAVITY_OAUTH_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const ANTIGRAVITY_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const ANTIGRAVITY_OAUTH_CALLBACK_PATH: &str = "/antigravity/callback";
@@ -68,6 +58,11 @@ const ANTIGRAVITY_FETCH_MODELS_URLS: [&str; 3] = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
     "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+];
+const ANTIGRAVITY_QUOTA_SUMMARY_URLS: [&str; 3] = [
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
 ];
 const DEFAULT_API_SERVICE_MODEL: &str = "claude-sonnet-4.6";
 const LOCAL_CREDENTIAL_CRYPTO_V2_PREFIX: &str = "v2:";
@@ -160,10 +155,32 @@ struct QuotaMetric {
     model_name: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaBucket {
+    bucket_id: String,
+    window: String,
+    remaining_percent: Option<i64>,
+    reset_at: Option<Value>,
+    display_name: Option<String>,
+    description: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuotaGroup {
+    display_name: String,
+    description: Option<String>,
+    buckets: Vec<QuotaBucket>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountQuota {
     metrics: Vec<QuotaMetric>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    groups: Vec<QuotaGroup>,
     last_updated: Option<i64>,
     error: Option<String>,
     is_forbidden: Option<bool>,
@@ -177,6 +194,9 @@ fn quota_with_error_preserving_metrics(
     AccountQuota {
         metrics: existing
             .map(|quota| quota.metrics.clone())
+            .unwrap_or_default(),
+        groups: existing
+            .map(|quota| quota.groups.clone())
             .unwrap_or_default(),
         last_updated: existing.and_then(|quota| quota.last_updated),
         error: Some(error),
@@ -498,10 +518,7 @@ fn init_app_db(conn: &Connection) -> Result<(), String> {
       "#,
     )
     .map_err(|error| format!("初始化 SQLite 数据库失败: {error}"))?;
-    conn.execute(
-        "DELETE FROM accounts WHERE id IN ('codex_preview', 'gemini_preview')",
-        [],
-    )
+    conn.execute("DELETE FROM accounts WHERE id = 'codex_preview'", [])
     .map_err(|error| format!("清理演示账号失败: {error}"))?;
     // 历史数据里 provider 列存的是协议字面量；重命名成对用户透明的 "superai"，
     // 避免用户用 sqlite cli 打开 DB 时看到内部协议代号。代码里所有内部比较仍用
@@ -672,7 +689,7 @@ fn import_result_for_frontend(mut result: ImportResult) -> ImportResult {
 fn enforce_single_current_account(conn: &Connection) -> Result<(), String> {
     let mut accounts = read_accounts_from_conn(conn)?;
     let mut keep_by_provider: HashMap<String, String> = HashMap::new();
-    for provider in ["codex", "gemini", "antigravity"] {
+    for provider in ["codex", "antigravity"] {
         let mut current_ids = accounts
             .iter()
             .filter(|account| account.provider == provider && is_current_status(&account.status))
@@ -875,41 +892,6 @@ fn random_hex(byte_len: usize) -> String {
 
 fn join_chars(chars: &[u8]) -> String {
     chars.iter().map(|c| char::from(*c)).collect()
-}
-
-fn gemini_oauth_client_id() -> String {
-    [
-        join_chars(&[54, 56, 49, 50, 53, 53, 56, 48, 57, 51, 57, 53]),
-        join_chars(&[45]),
-        join_chars(&[
-            111, 111, 56, 102, 116, 50, 111, 112, 114, 100, 114, 110, 112, 57, 101, 51, 97, 113,
-            102, 54, 97, 118, 51, 104, 109, 100, 105, 98, 49, 51, 53, 106,
-        ]),
-        join_chars(&[46]),
-        join_chars(&[97, 112, 112, 115]),
-        join_chars(&[46]),
-        join_chars(&[
-            103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116,
-        ]),
-        join_chars(&[46]),
-        join_chars(&[99, 111, 109]),
-    ]
-    .join("")
-}
-
-fn gemini_oauth_client_secret() -> String {
-    [
-        join_chars(&[71, 79, 67, 83, 80, 88]),
-        join_chars(&[45]),
-        join_chars(&[52, 117, 72, 103, 77, 80, 109]),
-        join_chars(&[45]),
-        join_chars(&[49, 111, 55, 83, 107]),
-        join_chars(&[45]),
-        join_chars(&[
-            103, 101, 86, 54, 67, 117, 53, 99, 108, 88, 70, 115, 120, 108,
-        ]),
-    ]
-    .join("")
 }
 
 fn antigravity_oauth_client_id() -> String {
@@ -1215,139 +1197,11 @@ fn parse_codex_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuot
 
     Some(AccountQuota {
         metrics,
+        groups: Vec::new(),
         last_updated: number_field(obj.get("usage_updated_at"))
             .or_else(|| quota.and_then(|q| number_field(q.get("last_updated")))),
         error,
         is_forbidden: Some(is_forbidden),
-    })
-}
-
-fn parse_gemini_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuota> {
-    let raw = obj.get("gemini_usage_raw").and_then(Value::as_object);
-    let models = raw
-        .and_then(|r| r.get("models"))
-        .and_then(Value::as_array)
-        .or_else(|| obj.get("models").and_then(Value::as_array));
-    let buckets = raw.and_then(|r| r.get("buckets")).and_then(Value::as_array);
-    let mut metrics = Vec::new();
-
-    if let Some(buckets) = buckets {
-        let mut picked: HashMap<String, QuotaMetric> = HashMap::new();
-        for item in buckets {
-            let Some(bucket) = item.as_object() else {
-                continue;
-            };
-            let Some(model_id) = string_field(bucket.get("modelId"))
-                .or_else(|| string_field(bucket.get("model_id")))
-            else {
-                continue;
-            };
-            let remaining_fraction = match bucket
-                .get("remainingFraction")
-                .or_else(|| bucket.get("remaining_fraction"))
-            {
-                Some(Value::Number(num)) => num.as_f64(),
-                Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
-                _ => None,
-            };
-            let Some(remaining_fraction) = remaining_fraction else {
-                continue;
-            };
-            let remaining = (remaining_fraction * 100.0).round().clamp(0.0, 100.0) as i64;
-            let lower = model_id.to_ascii_lowercase();
-            let (key, label) = if lower.contains("pro") {
-                ("gemini-pro".to_string(), "PRO".to_string())
-            } else if lower.contains("flash") {
-                ("gemini-flash".to_string(), "FLASH".to_string())
-            } else {
-                (
-                    format!("gemini-{}", metrics.len() + picked.len()),
-                    model_id.clone(),
-                )
-            };
-            let metric = QuotaMetric {
-                key: key.clone(),
-                label,
-                remaining_percent: Some(remaining),
-                reset_at: bucket
-                    .get("resetTime")
-                    .or_else(|| bucket.get("reset_time"))
-                    .cloned(),
-                detail: Some(format!("{model_id} 剩余 {remaining}%")),
-                state: Some(quota_state(Some(remaining))),
-                ..Default::default()
-            };
-            match picked.get(&key) {
-                Some(existing) if existing.remaining_percent.unwrap_or(101) <= remaining => {}
-                _ => {
-                    picked.insert(key, metric);
-                }
-            }
-        }
-        let mut values = picked.into_values().collect::<Vec<_>>();
-        values.sort_by(|left, right| left.key.cmp(&right.key));
-        metrics.extend(values);
-    }
-
-    if let Some(models) = models {
-        for item in models {
-            let Some(model) = item.as_object() else {
-                continue;
-            };
-            let remaining = percent_field(
-                model
-                    .get("percentage")
-                    .or_else(|| model.get("remainingPercent"))
-                    .or_else(|| model.get("remaining_percent")),
-            );
-            let label = string_field(model.get("display_name"))
-                .or_else(|| string_field(model.get("displayName")))
-                .or_else(|| string_field(model.get("name")))
-                .unwrap_or_else(|| format!("MODEL {}", metrics.len() + 1));
-            metrics.push(QuotaMetric {
-                key: format!("gemini-{}", metrics.len()),
-                label,
-                remaining_percent: remaining,
-                reset_at: model
-                    .get("reset_time")
-                    .or_else(|| model.get("resetTime"))
-                    .cloned(),
-                detail: None,
-                state: Some(quota_state(remaining)),
-                ..Default::default()
-            });
-        }
-    }
-
-    if metrics.is_empty() {
-        if let Some(total_used) = percent_field(
-            raw.and_then(|r| r.get("totalPercentUsed"))
-                .or_else(|| raw.and_then(|r| r.get("total_percent_used")))
-                .or_else(|| obj.get("totalPercentUsed")),
-        ) {
-            let remaining = 100 - total_used;
-            metrics.push(QuotaMetric {
-                key: "gemini-total".to_string(),
-                label: "TOTAL".to_string(),
-                remaining_percent: Some(remaining),
-                reset_at: None,
-                detail: None,
-                state: Some(quota_state(Some(remaining))),
-                ..Default::default()
-            });
-        }
-    }
-
-    let error = string_field(obj.get("quota_query_last_error"));
-    if metrics.is_empty() && error.is_none() {
-        return None;
-    }
-
-    Some(AccountQuota {
-        metrics,
-        last_updated: number_field(obj.get("usage_updated_at")),
-        error,
-        is_forbidden: None,
     })
 }
 
@@ -1605,8 +1459,8 @@ fn looks_like_antigravity(obj: &serde_json::Map<String, Value>) -> bool {
             return true;
         }
     }
-    // 通过 scope 识别：Antigravity 请求的 cclog / experimentsandconfigs scope 是
-    // Gemini CLI 不会请求的，足够把粘贴进来的 Antigravity 凭证和 Gemini 凭证区分开。
+    // 通过 scope 识别：Antigravity 请求的 cclog / experimentsandconfigs scope
+    // 是普通 Google OAuth 凭证不会请求的，足够把粘贴内容路由到 Antigravity parser。
     let scope =
         string_field(obj.get("scope")).or_else(|| token.and_then(|t| string_field(t.get("scope"))));
     if let Some(scope) = scope {
@@ -1751,88 +1605,8 @@ fn parse_antigravity_account(value: &Value, source: &str) -> Option<ManagedAccou
     })
 }
 
-fn parse_gemini_account(value: &Value, source: &str) -> Option<ManagedAccount> {
-    let obj = value.as_object()?;
-    let token = obj.get("token").and_then(Value::as_object);
-
-    let access_token = string_field(obj.get("access_token"))
-        .or_else(|| token.and_then(|t| string_field(t.get("access_token"))));
-    let refresh_token = string_field(obj.get("refresh_token"))
-        .or_else(|| token.and_then(|t| string_field(t.get("refresh_token"))));
-    let id_token = string_field(obj.get("id_token"))
-        .or_else(|| token.and_then(|t| string_field(t.get("id_token"))));
-
-    if access_token.is_none() && refresh_token.is_none() && id_token.is_none() {
-        return None;
-    }
-
-    let jwt = id_token.as_deref().and_then(parse_jwt_payload);
-    let email = string_field(obj.get("email"))
-        .or_else(|| string_field(obj.get("active")))
-        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("email"))))
-        .or_else(|| string_field(obj.get("account")))?;
-
-    let auth_id = string_field(obj.get("auth_id"))
-        .or_else(|| jwt.as_ref().and_then(|j| string_field(j.get("sub"))));
-    let expires_at = number_field(obj.get("expiry_date"))
-        .or_else(|| token.and_then(|t| number_field(t.get("expires_at"))))
-        .or_else(|| jwt.as_ref().and_then(|j| number_field(j.get("exp"))));
-    let plan_type = string_field(obj.get("plan_type"))
-        .or_else(|| string_field(obj.get("plan_name")))
-        .or_else(|| string_field(obj.get("tier_name")));
-    let now = now_ts();
-    let token_meta = TokenMeta {
-        has_access_token: access_token.is_some(),
-        has_refresh_token: refresh_token.is_some(),
-        has_id_token: id_token.is_some(),
-        expires_at,
-    };
-    let quota = parse_gemini_quota(obj);
-    let status = derive_status(obj, &token_meta, quota.as_ref());
-
-    Some(ManagedAccount {
-        id: string_field(obj.get("id")).unwrap_or_else(|| {
-            // 优先用稳定身份字段：auth_id；缺失时退到 refresh_token（只在重新授权/
-            // 吊销时变），最后才用 email。access_token / id_token 每次刷新都变，
-            // 不能进 fallback 链——否则同一个账号刷一次 token 就会生成不同 id、
-            // 在 DB 里堆出重复账号。同邮箱不同账号的区分靠 refresh_token 兜住。
-            format!(
-                "gemini_{}",
-                stable_hash(&format!(
-                    "{}::{}",
-                    email.to_lowercase(),
-                    auth_id
-                        .clone()
-                        .or_else(|| refresh_token.clone())
-                        .unwrap_or_else(|| email.to_lowercase())
-                ))
-            )
-        }),
-        provider: "gemini".to_string(),
-        email: email.to_lowercase(),
-        display_name: string_field(obj.get("name")),
-        account_name: string_field(obj.get("name")),
-        organization_id: None,
-        plan: plan_type.clone(),
-        plan_type: plan_type.clone(),
-        auth_file_plan_type: None,
-        subscription_active_until: expires_at.map(|value| Value::Number(value.into())),
-        account_id: auth_id.clone(),
-        user_id: auth_id,
-        source: source.to_string(),
-        token_meta,
-        status: Some(status),
-        quota,
-        created_at: number_field(obj.get("created_at")).unwrap_or(now),
-        updated_at: number_field(obj.get("last_used"))
-            .or_else(|| number_field(obj.get("updated_at")))
-            .unwrap_or(now),
-        auth_payload: Some(value.clone()),
-    })
-}
-
 fn build_antigravity_export_payload(account: &ManagedAccount) -> Result<Value, String> {
-    let refresh_token = gemini_payload_string(account, "refresh_token", "refreshToken")
+    let refresh_token = google_payload_string(account, "refresh_token", "refreshToken")
         .ok_or_else(|| "Antigravity 账号缺少 refresh_token，无法导出最小凭证".to_string())?;
     Ok(serde_json::json!({
         "email": account.email,
@@ -2183,6 +1957,7 @@ fn parse_codex_usage_quota(payload: &Value) -> AccountQuota {
     }
     AccountQuota {
         metrics,
+        groups: Vec::new(),
         last_updated: Some(now_ts()),
         error: None,
         is_forbidden: None,
@@ -2321,217 +2096,19 @@ async fn refresh_codex_account_remote(account: &mut ManagedAccount) -> Result<()
     refresh_codex_account_remote_inner(account, false).await
 }
 
-fn gemini_payload_string(account: &ManagedAccount, snake: &str, camel: &str) -> Option<String> {
+fn google_payload_string(account: &ManagedAccount, snake: &str, camel: &str) -> Option<String> {
     let payload = account.auth_payload.as_ref()?.as_object()?;
     let token = payload.get("token").and_then(Value::as_object);
     nested_string_field(payload, token, snake, camel)
 }
 
-fn gemini_payload_expiry(account: &ManagedAccount) -> Option<i64> {
+fn google_payload_expiry(account: &ManagedAccount) -> Option<i64> {
     let payload = account.auth_payload.as_ref()?.as_object()?;
     let token = payload.get("token").and_then(Value::as_object);
     number_field(payload.get("expiry_date"))
         .or_else(|| number_field(payload.get("expiryDate")))
         .or_else(|| token.and_then(|t| number_field(t.get("expires_at"))))
         .or_else(|| token.and_then(|t| number_field(t.get("expiresAt"))))
-}
-
-async fn load_gemini_code_assist_status(
-    access_token: &str,
-) -> Result<(Option<String>, Option<String>, Option<String>), String> {
-    let payload = serde_json::json!({
-        "metadata": {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI"
-        }
-    });
-    let value = post_gemini_code_assist_json(
-        access_token,
-        GEMINI_CODE_ASSIST_LOAD_URL,
-        &payload,
-        "loadCodeAssist",
-    )
-    .await?;
-    let current_tier_id = value
-        .get("currentTier")
-        .and_then(|v| v.get("id"))
-        .and_then(Value::as_str)
-        .and_then(|v| normalize_non_empty(Some(v)));
-    let current_tier_name = value
-        .get("currentTier")
-        .and_then(|v| v.get("name"))
-        .and_then(Value::as_str)
-        .and_then(|v| normalize_non_empty(Some(v)));
-    let paid_tier_id = value
-        .get("paidTier")
-        .and_then(|v| v.get("id"))
-        .and_then(Value::as_str)
-        .and_then(|v| normalize_non_empty(Some(v)));
-    let paid_tier_name = value
-        .get("paidTier")
-        .and_then(|v| v.get("name"))
-        .and_then(Value::as_str)
-        .and_then(|v| normalize_non_empty(Some(v)));
-    let first_allowed_tier_id = value
-        .get("allowedTiers")
-        .and_then(Value::as_array)
-        .and_then(|tiers| tiers.first())
-        .and_then(|tier| tier.get("id"))
-        .and_then(Value::as_str)
-        .and_then(|v| normalize_non_empty(Some(v)));
-    let project_id = value
-        .get("cloudaicompanionProject")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            value
-                .get("cloudaicompanionProject")
-                .and_then(|v| v.get("id"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            value
-                .get("cloudaicompanionProject")
-                .and_then(|v| v.get("projectId"))
-                .and_then(Value::as_str)
-        })
-        .and_then(|v| normalize_non_empty(Some(v)));
-    Ok((
-        paid_tier_id.or(current_tier_id).or(first_allowed_tier_id),
-        paid_tier_name.or(current_tier_name),
-        project_id,
-    ))
-}
-
-async fn refresh_gemini_account_remote(account: &mut ManagedAccount) -> Result<(), String> {
-    if account.provider != "gemini" {
-        return Ok(());
-    }
-    let mut access_token = gemini_payload_string(account, "access_token", "accessToken")
-        .ok_or_else(|| "缺少 Gemini access_token".to_string())?;
-    let refresh_token = gemini_payload_string(account, "refresh_token", "refreshToken");
-
-    if gemini_payload_expiry(account)
-        .map(|expiry| expiry <= now_ts_ms() + 300_000)
-        .unwrap_or(false)
-    {
-        let refresh_token = refresh_token
-            .clone()
-            .ok_or_else(|| "Gemini refresh_token 不存在，无法刷新 access_token".to_string())?;
-        let refreshed = refresh_gemini_access_token(&refresh_token).await?;
-        access_token = refreshed
-            .access_token
-            .ok_or_else(|| "Gemini token 刷新后 access_token 为空".to_string())?;
-        if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
-            payload.insert(
-                "access_token".to_string(),
-                Value::String(access_token.clone()),
-            );
-            if let Some(id_token) = refreshed.id_token {
-                payload.insert("id_token".to_string(), Value::String(id_token));
-            }
-            if let Some(token_type) = refreshed.token_type {
-                payload.insert("token_type".to_string(), Value::String(token_type));
-            }
-            if let Some(scope) = refreshed.scope {
-                payload.insert("scope".to_string(), Value::String(scope));
-            }
-            if let Some(expires_in) = refreshed.expires_in {
-                let expiry_date = now_ts_ms() + expires_in.saturating_mul(1000);
-                payload.insert("expiry_date".to_string(), Value::Number(expiry_date.into()));
-                account.token_meta.expires_at = Some(expiry_date);
-                account.subscription_active_until = Some(Value::Number(expiry_date.into()));
-            }
-        }
-    }
-
-    if let Some(userinfo) = fetch_google_userinfo(&access_token).await {
-        if let Some(email) = normalize_non_empty(userinfo.email.as_deref()) {
-            account.email = email.to_lowercase();
-        }
-        if account.user_id.is_none() {
-            account.user_id = normalize_non_empty(userinfo.id.as_deref());
-        }
-        if account.account_id.is_none() {
-            account.account_id = account.user_id.clone();
-        }
-        if account.display_name.is_none() {
-            account.display_name = normalize_non_empty(userinfo.name.as_deref());
-        }
-    }
-
-    let mut status = load_gemini_code_assist_status(&access_token).await;
-    if let Err(error) = &status {
-        let error_lower = error.to_ascii_lowercase();
-        if error.contains("UNAUTHORIZED")
-            || error_lower.contains("http 401")
-            || error_lower.contains("401")
-            || error_lower.contains("unauthorized")
-        {
-            if let Some(refresh_token) = refresh_token {
-                let refreshed = refresh_gemini_access_token(&refresh_token).await?;
-                access_token = refreshed
-                    .access_token
-                    .ok_or_else(|| "Gemini token 刷新后 access_token 为空".to_string())?;
-                if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut)
-                {
-                    payload.insert(
-                        "access_token".to_string(),
-                        Value::String(access_token.clone()),
-                    );
-                }
-                status = load_gemini_code_assist_status(&access_token).await;
-            }
-        }
-    }
-    let (tier_id, tier_name, project_id) = status?;
-    if let Some(tier_id) = tier_id.clone() {
-        account.plan_type = Some(tier_id);
-    }
-    account.plan = tier_name.or(tier_id);
-
-    if let Some(project_id) = project_id {
-        match post_gemini_code_assist_json(
-            &access_token,
-            GEMINI_CODE_ASSIST_QUOTA_URL,
-            &serde_json::json!({ "project": project_id }),
-            "retrieveUserQuota",
-        )
-        .await
-        {
-            Ok(quota) => {
-                if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut)
-                {
-                    payload.insert("gemini_usage_raw".to_string(), quota.clone());
-                    payload.insert(
-                        "usage_updated_at".to_string(),
-                        Value::Number(now_ts().into()),
-                    );
-                }
-                let empty = serde_json::Map::new();
-                let payload = account
-                    .auth_payload
-                    .as_ref()
-                    .and_then(Value::as_object)
-                    .unwrap_or(&empty);
-                account.quota = parse_gemini_quota(payload);
-            }
-            Err(error) => {
-                account.quota = Some(quota_with_error_preserving_metrics(
-                    account.quota.as_ref(),
-                    error.clone(),
-                    Some(
-                        error.to_ascii_lowercase().contains("403")
-                            || error.to_ascii_lowercase().contains("forbidden"),
-                    ),
-                ));
-            }
-        }
-    }
-
-    account.updated_at = now_ts();
-    account.status = Some(fallback_status_refreshed(account));
-    Ok(())
 }
 
 async fn post_antigravity_json(
@@ -2692,67 +2269,158 @@ async fn fetch_antigravity_available_models(
     Err(last_error.unwrap_or_else(|| "Antigravity fetchAvailableModels 全部端点失败".to_string()))
 }
 
+async fn fetch_antigravity_quota_summary(
+    access_token: &str,
+    project_id: Option<&str>,
+) -> Option<Value> {
+    let payload = project_id
+        .map(|pid| serde_json::json!({ "project": pid }))
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    for url in ANTIGRAVITY_QUOTA_SUMMARY_URLS.iter() {
+        match post_antigravity_json(access_token, url, &payload, "retrieveUserQuotaSummary").await
+        {
+            Ok(value) => return Some(value),
+            Err(error) => {
+                let lower = error.to_ascii_lowercase();
+                if lower.contains("unauthorized") || lower.contains("forbidden") {
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_antigravity_quota_groups(obj: &serde_json::Map<String, Value>) -> Vec<QuotaGroup> {
+    let Some(summary) = obj
+        .get("antigravity_quota_summary_raw")
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+    let Some(groups) = summary.get("groups").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    groups
+        .iter()
+        .enumerate()
+        .filter_map(|(group_index, group)| {
+            let group = group.as_object()?;
+            let buckets = group.get("buckets").and_then(Value::as_array)?;
+            let buckets = buckets
+                .iter()
+                .enumerate()
+                .filter_map(|(bucket_index, bucket)| {
+                    let bucket = bucket.as_object()?;
+                    let remaining_fraction =
+                        bucket.get("remainingFraction").and_then(|value| match value {
+                            Value::Number(n) => n.as_f64(),
+                            Value::String(s) => s.trim().parse::<f64>().ok(),
+                            _ => None,
+                        });
+                    let remaining = remaining_fraction
+                        .map(|f| (f * 100.0).round().clamp(0.0, 100.0) as i64);
+                    let window = string_field(bucket.get("window"))
+                        .or_else(|| string_field(bucket.get("displayName")))
+                        .unwrap_or_else(|| format!("bucket-{}", bucket_index + 1));
+                    Some(QuotaBucket {
+                        bucket_id: string_field(bucket.get("bucketId"))
+                            .or_else(|| string_field(bucket.get("bucket_id")))
+                            .unwrap_or_else(|| {
+                                format!("antigravity-group-{group_index}-{bucket_index}")
+                            }),
+                        window,
+                        remaining_percent: remaining,
+                        reset_at: bucket
+                            .get("resetTime")
+                            .or_else(|| bucket.get("reset_time"))
+                            .cloned(),
+                        display_name: string_field(bucket.get("displayName"))
+                            .or_else(|| string_field(bucket.get("display_name"))),
+                        description: string_field(bucket.get("description")),
+                        state: Some(quota_state(remaining)),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if buckets.is_empty() {
+                return None;
+            }
+            Some(QuotaGroup {
+                display_name: string_field(group.get("displayName"))
+                    .or_else(|| string_field(group.get("display_name")))
+                    .unwrap_or_else(|| format!("Quota Group {}", group_index + 1)),
+                description: string_field(group.get("description")),
+                buckets,
+            })
+        })
+        .collect()
+}
+
 fn parse_antigravity_quota(obj: &serde_json::Map<String, Value>) -> Option<AccountQuota> {
-    let raw = obj
-        .get("antigravity_usage_raw")
-        .and_then(Value::as_object)?;
-    let models_obj = raw.get("models").and_then(Value::as_object)?;
+    let groups = parse_antigravity_quota_groups(obj);
+    let raw = obj.get("antigravity_usage_raw").and_then(Value::as_object);
+    let models_obj = raw.and_then(|raw| raw.get("models")).and_then(Value::as_object);
     let mut metrics: Vec<QuotaMetric> = Vec::new();
     let mut index = 0usize;
-    for (name, info) in models_obj.iter() {
-        let Some(info) = info.as_object() else {
-            continue;
-        };
-        let lower_name = name.to_ascii_lowercase();
-        if !(lower_name.starts_with("gemini")
-            || lower_name.starts_with("claude")
-            || lower_name.starts_with("gpt")
-            || lower_name.starts_with("image")
-            || lower_name.starts_with("imagen"))
-        {
-            continue;
-        }
-        let quota_info = info.get("quotaInfo").and_then(Value::as_object);
-        let remaining_fraction = quota_info.and_then(|q| {
-            q.get("remainingFraction").and_then(|v| match v {
-                Value::Number(n) => n.as_f64(),
-                Value::String(s) => s.trim().parse::<f64>().ok(),
+    if let Some(models_obj) = models_obj {
+        for (name, info) in models_obj.iter() {
+            let Some(info) = info.as_object() else {
+                continue;
+            };
+            let lower_name = name.to_ascii_lowercase();
+            if !(lower_name.starts_with("gemini")
+                || lower_name.starts_with("claude")
+                || lower_name.starts_with("gpt")
+                || lower_name.starts_with("image")
+                || lower_name.starts_with("imagen"))
+            {
+                continue;
+            }
+            let quota_info = info.get("quotaInfo").and_then(Value::as_object);
+            let remaining_fraction = quota_info.and_then(|q| {
+                q.get("remainingFraction").and_then(|v| match v {
+                    Value::Number(n) => n.as_f64(),
+                    Value::String(s) => s.trim().parse::<f64>().ok(),
+                    _ => None,
+                })
+            });
+            let remaining =
+                remaining_fraction.map(|f| (f * 100.0).round().clamp(0.0, 100.0) as i64);
+            let reset_time = quota_info
+                .and_then(|q| q.get("resetTime").or_else(|| q.get("reset_time")))
+                .cloned();
+            let display_name = info
+                .get("displayName")
+                .and_then(Value::as_str)
+                .and_then(|v| normalize_non_empty(Some(v)));
+            let thinking_budget = info.get("thinkingBudget").and_then(|v| match v {
+                Value::Number(n) => n.as_i64(),
                 _ => None,
-            })
-        });
-        let remaining = remaining_fraction.map(|f| (f * 100.0).round().clamp(0.0, 100.0) as i64);
-        let reset_time = quota_info
-            .and_then(|q| q.get("resetTime").or_else(|| q.get("reset_time")))
-            .cloned();
-        let display_name = info
-            .get("displayName")
-            .and_then(Value::as_str)
-            .and_then(|v| normalize_non_empty(Some(v)));
-        let thinking_budget = info.get("thinkingBudget").and_then(|v| match v {
-            Value::Number(n) => n.as_i64(),
-            _ => None,
-        });
-        let label = display_name.clone().unwrap_or_else(|| name.clone());
-        metrics.push(QuotaMetric {
-            key: format!("antigravity-{}", index),
-            label,
-            remaining_percent: remaining,
-            reset_at: reset_time,
-            detail: Some(format!("{name} 剩余 {}%", remaining.unwrap_or(0))),
-            state: Some(quota_state(remaining)),
-            display_name,
-            thinking_budget,
-            model_name: Some(name.clone()),
-        });
-        index += 1;
+            });
+            let label = display_name.clone().unwrap_or_else(|| name.clone());
+            metrics.push(QuotaMetric {
+                key: format!("antigravity-{}", index),
+                label,
+                remaining_percent: remaining,
+                reset_at: reset_time,
+                detail: Some(format!("{name} 剩余 {}%", remaining.unwrap_or(0))),
+                state: Some(quota_state(remaining)),
+                display_name,
+                thinking_budget,
+                model_name: Some(name.clone()),
+            });
+            index += 1;
+        }
     }
     let error = string_field(obj.get("quota_query_last_error"));
     let is_forbidden = bool_field(obj.get("is_forbidden")).unwrap_or(false);
-    if metrics.is_empty() && error.is_none() && !is_forbidden {
+    if metrics.is_empty() && groups.is_empty() && error.is_none() && !is_forbidden {
         return None;
     }
     Some(AccountQuota {
         metrics,
+        groups,
         last_updated: number_field(obj.get("usage_updated_at")),
         error,
         is_forbidden: Some(is_forbidden),
@@ -2763,11 +2431,11 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
     if account.provider != "antigravity" {
         return Ok(());
     }
-    let refresh_token = gemini_payload_string(account, "refresh_token", "refreshToken");
-    let mut access_token = gemini_payload_string(account, "access_token", "accessToken");
+    let refresh_token = google_payload_string(account, "refresh_token", "refreshToken");
+    let mut access_token = google_payload_string(account, "access_token", "accessToken");
 
     if access_token.is_none()
-        || gemini_payload_expiry(account)
+        || google_payload_expiry(account)
             .map(|expiry| expiry <= now_ts_ms() + 300_000)
             .unwrap_or(false)
     {
@@ -2870,8 +2538,15 @@ async fn refresh_antigravity_account_remote(account: &mut ManagedAccount) -> Res
 
     match fetch_antigravity_available_models(&access_token, project_id.as_deref()).await {
         Ok(quota_value) => {
+            let quota_summary =
+                fetch_antigravity_quota_summary(&access_token, project_id.as_deref()).await;
             if let Some(payload) = account.auth_payload.as_mut().and_then(Value::as_object_mut) {
                 payload.insert("antigravity_usage_raw".to_string(), quota_value);
+                if let Some(summary) = quota_summary {
+                    payload.insert("antigravity_quota_summary_raw".to_string(), summary);
+                } else {
+                    payload.remove("antigravity_quota_summary_raw");
+                }
                 payload.insert(
                     "usage_updated_at".to_string(),
                     Value::Number(now_ts().into()),
@@ -3006,11 +2681,6 @@ async fn refresh_imported_accounts(accounts: &mut [ManagedAccount]) {
                     mark_account_unavailable(account, error);
                 }
             }
-            "gemini" => {
-                if let Err(error) = refresh_gemini_account_remote(account).await {
-                    mark_account_unavailable(account, error);
-                }
-            }
             "antigravity" => {
                 if let Err(error) = refresh_antigravity_account_remote(account).await {
                     mark_account_unavailable(account, error);
@@ -3057,8 +2727,8 @@ fn oauth_pending_cancel(login_id: Option<&str>, provider: Option<&str>) -> Resul
         .map_err(|_| "OAuth 状态锁失败".to_string())?
         .iter()
         .filter(|(id, item)| {
-            login_id.is_none_or(|value| value == id.as_str())
-                && provider.is_none_or(|value| value == item.provider)
+            login_id.map_or(true, |value| value == id.as_str())
+                && provider.map_or(true, |value| value == item.provider)
         })
         .map(|(id, item)| (id.clone(), item.port))
         .collect::<Vec<_>>();
@@ -3120,13 +2790,12 @@ fn parse_auth_json_content(content: &str, source: &str, label: &str) -> ImportRe
         };
         if let Some(account) = parse_codex_account(item, source)
             .or_else(|| parse_antigravity_account(item, source))
-            .or_else(|| parse_gemini_account(item, source))
         {
             imported.push(account);
         } else {
             failed.push(ImportFailure {
                 label: item_label,
-                reason: "未识别到 Codex / Gemini / Antigravity 凭证字段".to_string(),
+                reason: "未识别到 Codex / Antigravity 凭证字段".to_string(),
             });
         }
     }
@@ -3205,10 +2874,6 @@ fn codex_home_dir() -> Result<PathBuf, String> {
         }
     }
     Ok(home_dir()?.join(".codex"))
-}
-
-fn gemini_home_dir() -> Result<PathBuf, String> {
-    Ok(home_dir()?.join(".gemini"))
 }
 
 fn antigravity_storage_dir_candidates() -> Result<Vec<PathBuf>, String> {
@@ -3634,147 +3299,6 @@ fn write_codex_keychain(_base_dir: &Path, _secret: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn build_gemini_oauth_payload(account: &ManagedAccount) -> Result<Value, String> {
-    let payload = account
-        .auth_payload
-        .as_ref()
-        .and_then(Value::as_object)
-        .ok_or_else(|| "该账号缺少可写入的 Gemini 凭证，请重新导入 oauth_creds.json".to_string())?;
-    let token = payload.get("token").and_then(Value::as_object);
-    let access_token = nested_string_field(payload, token, "access_token", "accessToken")
-        .ok_or_else(|| "Gemini 账号缺少 access_token".to_string())?;
-    let refresh_token = nested_string_field(payload, token, "refresh_token", "refreshToken");
-    let id_token = nested_string_field(payload, token, "id_token", "idToken");
-    let token_type = nested_string_field(payload, token, "token_type", "tokenType")
-        .unwrap_or_else(|| "Bearer".to_string());
-    let scope = nested_string_field(payload, token, "scope", "scope");
-    let expiry_date = payload
-        .get("expiry_date")
-        .or_else(|| payload.get("expiryDate"))
-        .or_else(|| token.and_then(|t| t.get("expires_at")))
-        .or_else(|| token.and_then(|t| t.get("expiresAt")))
-        .cloned();
-
-    let mut result = serde_json::Map::new();
-    result.insert("access_token".to_string(), Value::String(access_token));
-    if let Some(refresh_token) = refresh_token {
-        result.insert("refresh_token".to_string(), Value::String(refresh_token));
-    }
-    if let Some(id_token) = id_token {
-        result.insert("id_token".to_string(), Value::String(id_token));
-    }
-    result.insert("token_type".to_string(), Value::String(token_type));
-    if let Some(scope) = scope {
-        result.insert("scope".to_string(), Value::String(scope));
-    }
-    if let Some(expiry_date) = expiry_date {
-        result.insert("expiry_date".to_string(), expiry_date);
-    }
-    Ok(Value::Object(result))
-}
-
-fn write_gemini_active_account(email: &str) -> Result<(), String> {
-    let path = gemini_home_dir()?.join("google_accounts.json");
-    let mut value = if path.exists() {
-        serde_json::from_str::<Value>(&read_to_string(&path)?)
-            .unwrap_or_else(|_| serde_json::json!({ "old": [] }))
-    } else {
-        serde_json::json!({ "old": [] })
-    };
-    if !value.is_object() {
-        value = serde_json::json!({ "old": [] });
-    }
-    let obj = value
-        .as_object_mut()
-        .ok_or_else(|| "Gemini google_accounts.json 根结构非法".to_string())?;
-    if let Some(active) = obj
-        .get("active")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-    {
-        if !active.eq_ignore_ascii_case(email) {
-            let old = obj.entry("old").or_insert_with(|| Value::Array(Vec::new()));
-            if let Some(arr) = old.as_array_mut() {
-                if !arr
-                    .iter()
-                    .any(|item| item.as_str() == Some(active.as_str()))
-                {
-                    arr.push(Value::String(active));
-                }
-                arr.retain(|item| {
-                    item.as_str()
-                        .map(|old_email| !old_email.eq_ignore_ascii_case(email))
-                        .unwrap_or(true)
-                });
-            }
-        }
-    }
-    obj.insert("active".to_string(), Value::String(email.to_string()));
-    let content = serde_json::to_string_pretty(&value)
-        .map_err(|error| format!("序列化 Gemini google_accounts.json 失败: {error}"))?;
-    write_string_atomic(&path, &content)
-}
-
-fn write_gemini_selected_auth_type() -> Result<(), String> {
-    let path = gemini_home_dir()?.join("settings.json");
-    let mut value = if path.exists() {
-        serde_json::from_str::<Value>(&read_to_string(&path)?)
-            .unwrap_or_else(|_| Value::Object(serde_json::Map::new()))
-    } else {
-        Value::Object(serde_json::Map::new())
-    };
-    if !value.is_object() {
-        value = Value::Object(serde_json::Map::new());
-    }
-    let root = value
-        .as_object_mut()
-        .ok_or_else(|| "Gemini settings.json 根结构非法".to_string())?;
-    let security = root
-        .entry("security")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    if !security.is_object() {
-        *security = Value::Object(serde_json::Map::new());
-    }
-    let security_obj = security
-        .as_object_mut()
-        .ok_or_else(|| "Gemini settings.json.security 结构非法".to_string())?;
-    let auth = security_obj
-        .entry("auth")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    if !auth.is_object() {
-        *auth = Value::Object(serde_json::Map::new());
-    }
-    auth.as_object_mut()
-        .ok_or_else(|| "Gemini settings.json.security.auth 结构非法".to_string())?
-        .insert(
-            "selectedType".to_string(),
-            Value::String("oauth-personal".to_string()),
-        );
-    let content = serde_json::to_string_pretty(&value)
-        .map_err(|error| format!("序列化 Gemini settings.json 失败: {error}"))?;
-    write_string_atomic(&path, &content)
-}
-
-fn clear_gemini_file_keychain() -> Result<(), String> {
-    let path = gemini_home_dir()?.join(GEMINI_FILE_KEYCHAIN_FILE);
-    if !path.exists() {
-        return Ok(());
-    }
-    fs::remove_file(&path)
-        .map_err(|error| format!("清理 Gemini file keychain 失败 {}: {error}", path.display()))
-}
-
-fn write_gemini_auth(account: &ManagedAccount) -> Result<(), String> {
-    let oauth_payload = build_gemini_oauth_payload(account)?;
-    let oauth_content = serde_json::to_string_pretty(&oauth_payload)
-        .map_err(|error| format!("序列化 Gemini oauth_creds.json 失败: {error}"))?;
-    write_string_atomic(&gemini_home_dir()?.join("oauth_creds.json"), &oauth_content)?;
-    write_gemini_keychain(&oauth_payload)?;
-    clear_gemini_file_keychain()?;
-    write_gemini_active_account(&account.email)?;
-    write_gemini_selected_auth_type()
-}
-
 fn antigravity_payload_string(account: &ManagedAccount, key: &str) -> Option<String> {
     let payload = account.auth_payload.as_ref()?.as_object()?;
     let token = payload.get("token").and_then(Value::as_object);
@@ -4152,126 +3676,6 @@ fn write_antigravity_auth(account: &ManagedAccount) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn write_gemini_keychain(oauth_payload: &Value) -> Result<(), String> {
-    if !is_macos_default_keychain_available() {
-        return Ok(());
-    }
-    let Some(obj) = oauth_payload.as_object() else {
-        return Ok(());
-    };
-    let access_token = string_field(obj.get("access_token"))
-        .ok_or_else(|| "Gemini Keychain 写入失败: access_token 为空".to_string())?;
-    let token_type = string_field(obj.get("token_type")).unwrap_or_else(|| "Bearer".to_string());
-    let mut token = serde_json::Map::new();
-    token.insert("accessToken".to_string(), Value::String(access_token));
-    token.insert("tokenType".to_string(), Value::String(token_type));
-    if let Some(refresh_token) = string_field(obj.get("refresh_token")) {
-        token.insert("refreshToken".to_string(), Value::String(refresh_token));
-    }
-    if let Some(scope) = string_field(obj.get("scope")) {
-        token.insert("scope".to_string(), Value::String(scope));
-    }
-    if let Some(expiry_date) = obj.get("expiry_date").cloned() {
-        token.insert("expiresAt".to_string(), expiry_date);
-    }
-    let payload = serde_json::json!({
-        "serverName": GEMINI_KEYCHAIN_ACCOUNT,
-        "token": token,
-        "updatedAt": now_ts() * 1000,
-    });
-    let secret = serde_json::to_string(&payload)
-        .map_err(|error| format!("序列化 Gemini Keychain 凭证失败: {error}"))?;
-    let output = Command::new("security")
-        .arg("add-generic-password")
-        .arg("-U")
-        .arg("-s")
-        .arg(GEMINI_KEYCHAIN_SERVICE)
-        .arg("-a")
-        .arg(GEMINI_KEYCHAIN_ACCOUNT)
-        .arg("-w")
-        .arg(secret)
-        .output()
-        .map_err(|error| format!("执行 security 写入 Gemini Keychain 失败: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(format!(
-        "写入 Gemini Keychain 失败: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    ))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn write_gemini_keychain(_oauth_payload: &Value) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn is_macos_default_keychain_available() -> bool {
-    Command::new("security")
-        .arg("default-keychain")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-fn read_gemini_keychain() -> Result<Option<Value>, String> {
-    let output = Command::new("security")
-        .arg("find-generic-password")
-        .arg("-s")
-        .arg(GEMINI_KEYCHAIN_SERVICE)
-        .arg("-a")
-        .arg(GEMINI_KEYCHAIN_ACCOUNT)
-        .arg("-w")
-        .output()
-        .map_err(|error| format!("执行 security 读取 Gemini Keychain 失败: {error}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if secret.is_empty() {
-        return Ok(None);
-    }
-    let parsed: Value = serde_json::from_str(&secret)
-        .map_err(|error| format!("解析 Gemini Keychain 凭证失败: {error}"))?;
-    let Some(token) = parsed.get("token").and_then(Value::as_object) else {
-        return Ok(None);
-    };
-    let mut oauth = serde_json::Map::new();
-    if let Some(access_token) = token.get("accessToken").and_then(Value::as_str) {
-        oauth.insert(
-            "access_token".to_string(),
-            Value::String(access_token.to_string()),
-        );
-    }
-    if let Some(refresh_token) = token.get("refreshToken").and_then(Value::as_str) {
-        oauth.insert(
-            "refresh_token".to_string(),
-            Value::String(refresh_token.to_string()),
-        );
-    }
-    if let Some(token_type) = token.get("tokenType").and_then(Value::as_str) {
-        oauth.insert(
-            "token_type".to_string(),
-            Value::String(token_type.to_string()),
-        );
-    }
-    if let Some(scope) = token.get("scope").and_then(Value::as_str) {
-        oauth.insert("scope".to_string(), Value::String(scope.to_string()));
-    }
-    if let Some(expires_at) = token.get("expiresAt").cloned() {
-        oauth.insert("expiry_date".to_string(), expires_at);
-    }
-    Ok(Some(Value::Object(oauth)))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn read_gemini_keychain() -> Result<Option<Value>, String> {
-    Ok(None)
-}
-
 fn query_map_from_url(
     path_and_query: &str,
     port: u16,
@@ -4579,23 +3983,6 @@ fn build_codex_oauth_url(
     Ok(url.to_string())
 }
 
-fn build_gemini_oauth_url(redirect_uri: &str, state: &str) -> Result<String, String> {
-    let client_id = gemini_oauth_client_id();
-    let mut url = Url::parse(GEMINI_OAUTH_AUTH_URL)
-        .map_err(|error| format!("构建 Gemini OAuth URL 失败: {error}"))?;
-    url.query_pairs_mut()
-        .append_pair("response_type", "code")
-        .append_pair("client_id", client_id.as_str())
-        .append_pair("redirect_uri", redirect_uri)
-        .append_pair("access_type", "offline")
-        .append_pair(
-            "scope",
-            "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile",
-        )
-        .append_pair("state", state);
-    Ok(url.to_string())
-}
-
 async fn exchange_codex_oauth_code(
     code: &str,
     code_verifier: &str,
@@ -4628,8 +4015,7 @@ async fn exchange_codex_oauth_code(
             .chars()
             .take(160)
             .collect::<String>()
-            .replace('\n', " ")
-            .replace('\r', " ");
+            .replace(['\n', '\r'], " ");
         return Err(format!(
             "Codex OAuth token 交换失败: status={status}, body_len={}, body_preview={preview}",
             body.len(),
@@ -4675,105 +4061,6 @@ async fn exchange_codex_oauth_code(
     }))
 }
 
-async fn exchange_gemini_oauth_code(code: &str, redirect_uri: &str) -> Result<Value, String> {
-    let client_id = gemini_oauth_client_id();
-    let client_secret = gemini_oauth_client_secret();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|error| format!("创建 Gemini OAuth 客户端失败: {error}"))?;
-    let response = client
-        .post(GEMINI_OAUTH_TOKEN_URL)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .form(&[
-            ("code", code),
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("redirect_uri", redirect_uri),
-            ("grant_type", "authorization_code"),
-        ])
-        .send()
-        .await
-        .map_err(|error| format!("请求 Google OAuth token 失败: {error}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "Google OAuth token 交换失败: status={status}, body_len={}",
-            body.len()
-        ));
-    }
-    let payload = response
-        .json::<OAuthTokenResponse>()
-        .await
-        .map_err(|error| format!("解析 Google OAuth token 响应失败: {error}"))?;
-    let access_token = payload.access_token.clone().ok_or_else(|| {
-        format!(
-            "Google OAuth 响应缺少 access_token: error={:?}, desc={:?}",
-            payload.error, payload.error_description
-        )
-    })?;
-    let user_info = fetch_google_userinfo(&access_token).await;
-    let email = normalize_non_empty(user_info.as_ref().and_then(|info| info.email.as_deref()))
-        .or_else(|| {
-            payload
-                .id_token
-                .as_deref()
-                .and_then(parse_jwt_payload)
-                .and_then(|jwt| string_field(jwt.get("email")))
-        })
-        .unwrap_or_else(|| "unknown@gmail.com".to_string());
-    let auth_id = normalize_non_empty(user_info.as_ref().and_then(|info| info.id.as_deref()))
-        .or_else(|| {
-            payload
-                .id_token
-                .as_deref()
-                .and_then(parse_jwt_payload)
-                .and_then(|jwt| string_field(jwt.get("sub")))
-        });
-    let name = normalize_non_empty(user_info.as_ref().and_then(|info| info.name.as_deref()))
-        .or_else(|| {
-            payload
-                .id_token
-                .as_deref()
-                .and_then(parse_jwt_payload)
-                .and_then(|jwt| string_field(jwt.get("name")))
-        });
-    let expiry_date = payload
-        .expires_in
-        .map(|seconds| now_ts_ms() + seconds.saturating_mul(1000));
-
-    let mut result = serde_json::Map::new();
-    result.insert("access_token".to_string(), Value::String(access_token));
-    if let Some(refresh_token) = payload.refresh_token {
-        result.insert("refresh_token".to_string(), Value::String(refresh_token));
-    }
-    if let Some(id_token) = payload.id_token {
-        result.insert("id_token".to_string(), Value::String(id_token));
-    }
-    if let Some(token_type) = payload.token_type {
-        result.insert("token_type".to_string(), Value::String(token_type));
-    }
-    if let Some(scope) = payload.scope {
-        result.insert("scope".to_string(), Value::String(scope));
-    }
-    if let Some(expiry_date) = expiry_date {
-        result.insert("expiry_date".to_string(), Value::Number(expiry_date.into()));
-    }
-    result.insert("email".to_string(), Value::String(email));
-    if let Some(auth_id) = auth_id {
-        result.insert("auth_id".to_string(), Value::String(auth_id));
-    }
-    if let Some(name) = name {
-        result.insert("name".to_string(), Value::String(name));
-    }
-    result.insert(
-        "selected_auth_type".to_string(),
-        Value::String("oauth-personal".to_string()),
-    );
-    Ok(Value::Object(result))
-}
-
 async fn fetch_google_userinfo(access_token: &str) -> Option<GoogleUserInfoResponse> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -4789,39 +4076,6 @@ async fn fetch_google_userinfo(access_token: &str) -> Option<GoogleUserInfoRespo
         return None;
     }
     response.json::<GoogleUserInfoResponse>().await.ok()
-}
-
-async fn refresh_gemini_access_token(refresh_token: &str) -> Result<OAuthTokenResponse, String> {
-    let client_id = gemini_oauth_client_id();
-    let client_secret = gemini_oauth_client_secret();
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|error| format!("创建 Gemini token 客户端失败: {error}"))?;
-    let response = client
-        .post(GEMINI_OAUTH_TOKEN_URL)
-        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("client_secret", client_secret.as_str()),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
-        ])
-        .send()
-        .await
-        .map_err(|error| format!("刷新 Gemini access_token 请求失败: {error}"))?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!(
-            "刷新 Gemini access_token 失败: status={status}, body_len={}",
-            body.len()
-        ));
-    }
-    response
-        .json::<OAuthTokenResponse>()
-        .await
-        .map_err(|error| format!("解析 Gemini access_token 刷新响应失败: {error}"))
 }
 
 fn build_antigravity_oauth_url(redirect_uri: &str, state: &str) -> Result<String, String> {
@@ -4980,41 +4234,6 @@ async fn refresh_antigravity_access_token(
         .map_err(|error| format!("解析 Antigravity access_token 刷新响应失败: {error}"))
 }
 
-async fn post_gemini_code_assist_json(
-    access_token: &str,
-    endpoint: &str,
-    payload: &Value,
-    action: &str,
-) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|error| format!("创建 Gemini API 客户端失败: {error}"))?;
-    let response = client
-        .post(endpoint)
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header(CONTENT_TYPE, "application/json")
-        .json(payload)
-        .send()
-        .await
-        .map_err(|error| format!("请求 Gemini {action} 失败: {error}"))?;
-    if response.status().as_u16() == 401 {
-        return Err("UNAUTHORIZED: Gemini access_token 已失效".to_string());
-    }
-    if response.status().is_success() {
-        return response
-            .json::<Value>()
-            .await
-            .map_err(|error| format!("解析 Gemini {action} 响应失败: {error}"));
-    }
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Err(format!(
-        "请求 Gemini {action} 失败: status={status}, body_len={}",
-        body.len()
-    ))
-}
-
 #[tauri::command]
 fn start_window_drag(window: tauri::Window) -> Result<(), String> {
     window.start_dragging().map_err(|error| error.to_string())
@@ -5064,11 +4283,6 @@ async fn refresh_account(
                 mark_account_unavailable(&mut account, error);
             }
         }
-        "gemini" => {
-            if let Err(error) = refresh_gemini_account_remote(&mut account).await {
-                mark_account_unavailable(&mut account, error);
-            }
-        }
         "antigravity" => {
             if let Err(error) = refresh_antigravity_account_remote(&mut account).await {
                 mark_account_unavailable(&mut account, error);
@@ -5108,11 +4322,6 @@ async fn refresh_provider_accounts(
                     mark_account_unavailable(account, error);
                 }
             }
-            "gemini" => {
-                if let Err(error) = refresh_gemini_account_remote(account).await {
-                    mark_account_unavailable(account, error);
-                }
-            }
             "antigravity" => {
                 if let Err(error) = refresh_antigravity_account_remote(account).await {
                     mark_account_unavailable(account, error);
@@ -5141,11 +4350,6 @@ async fn refresh_all_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccoun
         match account.provider.as_str() {
             "codex" => {
                 if let Err(error) = refresh_codex_account_remote(account).await {
-                    mark_account_unavailable(account, error);
-                }
-            }
-            "gemini" => {
-                if let Err(error) = refresh_gemini_account_remote(account).await {
                     mark_account_unavailable(account, error);
                 }
             }
@@ -5186,7 +4390,6 @@ fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
     let account = load_account_from_db(&conn, &accountId)?;
     match account.provider.as_str() {
         "codex" => write_codex_auth(&account)?,
-        "gemini" => write_gemini_auth(&account)?,
         "antigravity" => write_antigravity_auth(&account)?,
         "superai" => return Err("SuperAI 账号切换功能已移除".to_string()),
         other => return Err(format!("不支持的账号类型: {other}")),
@@ -5201,7 +4404,6 @@ fn export_account(app: tauri::AppHandle, accountId: String) -> Result<String, St
     let account = load_account_from_db(&conn, &accountId)?;
     let value = match account.provider.as_str() {
         "codex" => build_codex_auth_payload(&account)?,
-        "gemini" => build_gemini_oauth_payload(&account)?,
         "antigravity" => build_antigravity_export_payload(&account)?,
         "superai" => return Err("SuperAI 账号导出功能已移除".to_string()),
         _ => serde_json::to_value(&account).map_err(|error| format!("序列化账号失败: {error}"))?,
@@ -5350,7 +4552,7 @@ fn import_accounts_from_json(
 
 /// 当用户在某个 provider tab 下粘贴/上传 JSON 时，把该 provider 注入到每个
 /// item 顶层，确保 parse 链能稳定路由到对应 parser。目前只对 antigravity
-/// 启用（codex/gemini 已有靠 token 字段名能稳定识别的路径）。
+/// 启用（codex 已有靠 token 字段名能稳定识别的路径）。
 fn apply_provider_hint(content: &str, provider_hint: Option<&str>) -> Option<String> {
     let hint = provider_hint?.trim();
     if hint != "antigravity" {
@@ -5397,52 +4599,6 @@ fn import_codex_from_local(app: tauri::AppHandle) -> Result<ImportResult, String
         }];
         return Ok(result);
     }
-    persist_and_refresh_imported(app, result)
-}
-
-#[tauri::command]
-fn import_gemini_from_local(app: tauri::AppHandle) -> Result<ImportResult, String> {
-    let gemini_dir = home_dir()?.join(".gemini");
-    let oauth_path = gemini_dir.join("oauth_creds.json");
-    let google_accounts_path = gemini_dir.join("google_accounts.json");
-    let settings_path = gemini_dir.join("settings.json");
-
-    let mut oauth_value = if let Some(value) = read_gemini_keychain()? {
-        value
-    } else {
-        if !oauth_path.exists() {
-            return Err(format!(
-                "未找到本机 Gemini 账号文件: {}",
-                oauth_path.display()
-            ));
-        }
-        let oauth_content = read_to_string(&oauth_path)?;
-        serde_json::from_str(&oauth_content)
-            .map_err(|e| format!("解析 oauth_creds.json 失败: {e}"))?
-    };
-
-    if let Some(obj) = oauth_value.as_object_mut() {
-        if let Ok(raw) = fs::read_to_string(&google_accounts_path) {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                if let Some(active) = v.get("active").and_then(Value::as_str) {
-                    obj.insert("email".to_string(), Value::String(active.to_string()));
-                }
-            }
-        }
-        if let Ok(raw) = fs::read_to_string(&settings_path) {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                if let Some(selected) = v
-                    .get("selectedAuthType")
-                    .and_then(Value::as_str)
-                    .or_else(|| v.get("selected_auth_type").and_then(Value::as_str))
-                {
-                    obj.insert("plan_name".to_string(), Value::String(selected.to_string()));
-                }
-            }
-        }
-    }
-
-    let result = parse_auth_json_content(&oauth_value.to_string(), "local", "Gemini 本机账号");
     persist_and_refresh_imported(app, result)
 }
 
@@ -5583,78 +4739,6 @@ async fn complete_codex_oauth(
     if let Some(port) = oauth_pending_remove_with_port(&login_id) {
         notify_oauth_listener_cancel(port);
     }
-    Ok(result)
-}
-
-#[tauri::command]
-fn start_gemini_oauth(app: tauri::AppHandle) -> Result<OAuthStartResult, String> {
-    cancel_pending_oauth_for_provider("gemini");
-    let port = ensure_oauth_callback_listener(
-        &app,
-        "gemini",
-        None,
-        GEMINI_OAUTH_CALLBACK_PATH,
-        Some("https://developers.google.com/gemini-code-assist/auth_success_gemini"),
-    )?;
-    let login_id = random_urlsafe_token(24);
-    let state = random_urlsafe_token(24);
-    let redirect_uri = format!("http://127.0.0.1:{port}{GEMINI_OAUTH_CALLBACK_PATH}");
-    let auth_url = build_gemini_oauth_url(&redirect_uri, &state)?;
-    OAUTH_PENDING
-        .lock()
-        .map_err(|_| "OAuth 状态锁失败".to_string())?
-        .insert(
-            login_id.clone(),
-            OAuthPending {
-                provider: "gemini".to_string(),
-                redirect_uri,
-                state,
-                code_verifier: None,
-                port,
-                expires_at: now_ts() + OAUTH_TIMEOUT_SECONDS,
-                code: None,
-                code_consumed: false,
-            },
-        );
-    open_oauth_url(&auth_url)?;
-
-    Ok(OAuthStartResult {
-        login_id,
-        provider: "gemini".to_string(),
-        command: auth_url.clone(),
-        message: "已启动 Gemini OAuth，完成浏览器授权后会自动添加。".to_string(),
-        auth_url: Some(auth_url),
-    })
-}
-
-#[tauri::command]
-async fn complete_gemini_oauth(
-    app: tauri::AppHandle,
-    login_id: String,
-) -> Result<ImportResult, String> {
-    let Some(pending) = oauth_pending_get(&login_id)? else {
-        return Ok(ImportResult {
-            imported: vec![],
-            failed: vec![],
-        });
-    };
-    if pending.provider != "gemini" {
-        return Err("无效的 Gemini OAuth 会话".to_string());
-    }
-    if pending.expires_at <= now_ts() {
-        oauth_pending_remove(&login_id);
-        return Err("Gemini OAuth 登录已超时，请重新发起授权".to_string());
-    }
-    let Some(code) = pending.code else {
-        return Ok(ImportResult {
-            imported: vec![],
-            failed: vec![],
-        });
-    };
-    let payload = exchange_gemini_oauth_code(&code, &pending.redirect_uri).await?;
-    let result = parse_auth_json_content(&payload.to_string(), "oauth", "Gemini OAuth");
-    let result = persist_and_refresh_imported(app, result)?;
-    oauth_pending_remove(&login_id);
     Ok(result)
 }
 
@@ -5892,12 +4976,9 @@ pub fn run() {
             save_settings,
             import_accounts_from_json,
             import_codex_from_local,
-            import_gemini_from_local,
             start_codex_oauth,
             complete_codex_oauth,
             cancel_oauth,
-            start_gemini_oauth,
-            complete_gemini_oauth,
             start_antigravity_oauth,
             complete_antigravity_oauth,
             get_api_service_status,
@@ -6133,6 +5214,7 @@ mod tests {
                 state: Some("available".to_string()),
                 ..Default::default()
             }],
+            groups: Vec::new(),
             last_updated: Some(1_700_000_000),
             error: None,
             is_forbidden: Some(false),
@@ -6154,31 +5236,31 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open sqlite");
         init_app_db(&conn).expect("init db");
 
-        let older = test_account("gemini-a", "gemini", "a@example.com", 10);
-        let newer = test_account("gemini-b", "gemini", "b@example.com", 20);
+        let older = test_account("antigravity-a", "antigravity", "a@example.com", 10);
+        let newer = test_account("antigravity-b", "antigravity", "b@example.com", 20);
         upsert_account(&conn, &older).expect("insert older");
         upsert_account(&conn, &newer).expect("insert newer");
 
         let changed =
-            set_account_current_state(&conn, "gemini", "gemini-a").expect("switch current account");
+            set_account_current_state(&conn, "antigravity", "antigravity-a").expect("switch current account");
         let current_ids = changed
             .iter()
             .filter(|account| is_current_status(&account.status))
             .map(|account| account.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(current_ids, vec!["gemini-a"]);
+        assert_eq!(current_ids, vec!["antigravity-a"]);
 
         let all_accounts = read_accounts_from_conn(&conn).expect("read accounts");
         let persisted_current_ids = all_accounts
             .iter()
-            .filter(|account| account.provider == "gemini" && is_current_status(&account.status))
+            .filter(|account| account.provider == "antigravity" && is_current_status(&account.status))
             .map(|account| account.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(persisted_current_ids, vec!["gemini-a"]);
+        assert_eq!(persisted_current_ids, vec!["antigravity-a"]);
 
         let available_ids = all_accounts
             .iter()
-            .filter(|account| account.provider == "gemini")
+            .filter(|account| account.provider == "antigravity")
             .filter(|account| {
                 account
                     .status
@@ -6187,7 +5269,7 @@ mod tests {
             })
             .map(|account| account.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(available_ids, vec!["gemini-b"]);
+        assert_eq!(available_ids, vec!["antigravity-b"]);
     }
 
     #[test]

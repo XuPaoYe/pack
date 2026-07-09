@@ -39,16 +39,6 @@ function resolveCodexPlanBadge(account: ManagedAccount): PlanBadge {
   return { label: account.plan || raw, tone: "unknown" };
 }
 
-function resolveGeminiPlanBadge(account: ManagedAccount): PlanBadge {
-  const raw = normalizePlanKey(account.plan || account.planType);
-  if (!raw) return { label: "未知", tone: "unknown" };
-  if (raw.includes("ultra")) return { label: "ULTRA", tone: "ultra" };
-  if (raw === "standard-tier") return { label: "FREE", tone: "free" };
-  if (raw.includes("pro") || raw.includes("premium")) return { label: "PRO", tone: "pro" };
-  if (raw === "free-tier" || raw.includes("free")) return { label: "FREE", tone: "free" };
-  return { label: account.plan || account.planType || "未知", tone: "unknown" };
-}
-
 function resolveAntigravityPlanBadge(account: ManagedAccount): PlanBadge {
   const raw = normalizePlanKey(account.plan || account.planType);
   if (!raw) return { label: "未知", tone: "unknown" };
@@ -69,21 +59,19 @@ function resolveAntigravityPlanBadge(account: ManagedAccount): PlanBadge {
 }
 
 export function resolvePlanBadge(account: ManagedAccount): PlanBadge {
-  if (account.provider === "gemini") return resolveGeminiPlanBadge(account);
   if (account.provider === "antigravity") return resolveAntigravityPlanBadge(account);
   return resolveCodexPlanBadge(account);
 }
 
 export function resolveValidityUntil(account: ManagedAccount) {
-  if (account.provider === "gemini") return undefined;
   if (account.provider === "antigravity") return undefined;
   return normalizeUnixSeconds(account.subscriptionActiveUntil);
 }
 
 export function formatValidityText(account: ManagedAccount): ValidityText {
-  // gemini / antigravity 走 Google OAuth，订阅维度的"有效期"上游不返回，
+  // Antigravity 走 Google OAuth，订阅维度的"有效期"上游不返回，
   // access_token 的过期时间不代表订阅本身，硬塞会误导用户，所以这两种 provider 一律不显示。
-  if (account.provider === "gemini" || account.provider === "antigravity") {
+  if (account.provider === "antigravity") {
     return { label: "有效期", detail: "" };
   }
   if ((account.status ?? fallbackStatus(account)).state === "unavailable") {
