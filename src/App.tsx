@@ -23,6 +23,7 @@ import {
   FolderDown,
   Info,
   Laptop,
+  LoaderCircle,
   LockKeyhole,
   Monitor,
   Moon,
@@ -62,7 +63,7 @@ import {
   persistAppLogs,
   pruneAppLogs,
 } from "./lib/appLogs";
-import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider, type QuotaMetric } from "./lib/authParser";
+import { parseAuthJson, type AccountState, type ImportFailure, type ManagedAccount, type Provider, type QuotaGroup, type QuotaMetric } from "./lib/authParser";
 import { formatDateTime, formatRelative, formatResetTime } from "./lib/time";
 
 type ImportMode = "paste" | "file" | "local" | "oauth" | "batchKey" | "password";
@@ -167,7 +168,7 @@ const modeConfig: Record<
   local: {
     icon: Laptop,
     title: "读取本机",
-    desc: "从本地已登录的会话中导入 Codex 账号",
+    desc: "从本地已登录的会话中导入 ChatGPT 账号",
   },
   oauth: {
     icon: Cloud,
@@ -204,7 +205,7 @@ function defaultImportModeForProvider(provider: Provider): ImportMode {
 }
 
 function providerLabel(provider: Provider) {
-  if (provider === "codex") return "Codex";
+  if (provider === "codex") return "ChatGPT";
   if (provider === "antigravity") return "Antigravity";
   return APP_NAME;
 }
@@ -317,18 +318,15 @@ function accountActionLabel(account: ManagedAccount) {
 
 function switchSuccessMessage(account: ManagedAccount) {
   const label = accountActionLabel(account);
-  if (account.provider === "codex") {
-    return `已切换到 ${label}，请重启 Codex 相关产品`;
-  }
-  if (account.provider === "antigravity") {
-    return `已切换到 ${label}，请重启 Antigravity 相关产品`;
+  if (account.provider === "codex" || account.provider === "antigravity") {
+    return `已启用 ${label}`;
   }
   return `已切换到 ${label}`;
 }
 
 function switchButtonTitle(account: ManagedAccount) {
-  if (account.provider === "antigravity") return "切换到 Antigravity（经典版）";
-  if (account.provider === "codex") return "切换到 Codex";
+  if (isCurrentAccount(account)) return "当前启用账号";
+  if (account.provider === "codex" || account.provider === "antigravity") return "启用账号";
   return "切换账号";
 }
 
@@ -403,45 +401,47 @@ function parseApiServiceHost(value: string): string | null {
   return octets.join(".");
 }
 
-function pickAntigravitySummaryMetrics(metrics: QuotaMetric[]): QuotaMetric[] {
-  if (metrics.length === 0) return metrics;
-  const pickLowest = (predicate: (label: string, name: string) => boolean, fallbackLabel: string, fallbackKey: string): QuotaMetric | undefined => {
-    const matches = metrics.filter((metric) => {
-      const display = (metric.displayName ?? metric.label ?? "").toLowerCase();
-      const name = (metric.modelName ?? "").toLowerCase();
-      return predicate(display, name);
+function normalizeQuotaText(value?: string): string {
+  return (value ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function pickAntigravityGroupMetrics(groups: QuotaGroup[]): QuotaMetric[] {
+  const findGroup = (name: string) => groups.find((group) => {
+    const text = normalizeQuotaText(`${group.displayName} ${group.description ?? ""}`);
+    return text.includes(name);
+  });
+  const findBucket = (group: QuotaGroup | undefined, window: "5h" | "weekly") =>
+    group?.buckets.find((bucket) => {
+      const text = normalizeQuotaText(`${bucket.window} ${bucket.displayName ?? ""} ${bucket.description ?? ""}`);
+      if (window === "5h") {
+        return text.includes("five hour") || /(^| )5 ?h( |$)/.test(text);
+      }
+      return text.includes("weekly") || text.includes("week limit");
     });
-    if (matches.length === 0) return undefined;
-    const best = matches.reduce((acc, metric) => {
-      const remaining = metric.remainingPercent ?? 101;
-      const accRemaining = acc.remainingPercent ?? 101;
-      return remaining < accRemaining ? metric : acc;
-    });
-    return { ...best, key: fallbackKey, label: fallbackLabel };
+  const toMetric = (
+    key: string,
+    label: string,
+    group: QuotaGroup | undefined,
+    window: "5h" | "weekly",
+  ): QuotaMetric => {
+    const bucket = findBucket(group, window);
+    return {
+      key,
+      label,
+      remainingPercent: bucket?.remainingPercent,
+      resetAt: bucket?.resetAt,
+      state: bucket?.state ?? "unknown",
+      detail: bucket
+        ? `${group?.displayName ?? label} · ${bucket.displayName ?? bucket.window}`
+        : `${label} 暂无分组配额`,
+    };
   };
-  const gemini31Pro = pickLowest(
-    (label, name) => name.includes("gemini-3.1-pro") || label.includes("gemini 3.1 pro"),
-    "Gemini 3.1 Pro",
-    "antigravity-summary-gemini-3.1-pro",
-  );
-  const gemini3Flash = pickLowest(
-    (label, name) =>
-      name.includes("gemini-3-flash") ||
-      name.includes("gemini-3.0-flash") ||
-      name.includes("gemini-3.1-flash") ||
-      label.includes("gemini 3 flash") ||
-      label.includes("gemini 3.0 flash") ||
-      label.includes("gemini 3.1 flash"),
-    "Gemini 3 Flash",
-    "antigravity-summary-gemini-3-flash",
-  );
-  const claude = pickLowest(
-    (label, name) => name.startsWith("claude") || label.includes("claude"),
-    "Claude",
-    "antigravity-summary-claude",
-  );
-  const picked = [gemini31Pro, gemini3Flash, claude].filter((m): m is QuotaMetric => Boolean(m));
-  return picked.length > 0 ? picked : metrics.slice(0, 3);
+
+  const gemini = findGroup("gemini");
+  return [
+    toMetric("antigravity-summary-gemini-5h", "Gemini 5H", gemini, "5h"),
+    toMetric("antigravity-summary-gemini-weekly", "Gemini 周限", gemini, "weekly"),
+  ];
 }
 
 function QuotaMeters({ account }: { account: ManagedAccount }) {
@@ -453,8 +453,8 @@ function QuotaMeters({ account }: { account: ManagedAccount }) {
           { key: "quota-primary", label: "状态", remainingPercent: undefined, state: "unknown" as AccountState },
         ];
   let metrics = rawMetrics;
-  if (account.provider === "antigravity" && account.quota?.metrics?.length) {
-    metrics = pickAntigravitySummaryMetrics(account.quota.metrics);
+  if (account.provider === "antigravity") {
+    metrics = pickAntigravityGroupMetrics(account.quota?.groups ?? []);
   }
 
   return (
@@ -1576,7 +1576,7 @@ function App() {
     : activeProvider === "antigravity" ? "Antigravity"
     : "OpenAI";
   const localImportDesc =
-    activeProvider === "codex" ? "从本地已登录的会话中导入 Codex 账号" : "Antigravity 暂不支持本机导入";
+    activeProvider === "codex" ? "从本地已登录的会话中导入 ChatGPT 账号" : "Antigravity 暂不支持本机导入";
   const selectedModeDesc =
     mode === "oauth"
       ? `点击下方按钮，在浏览器中完成 ${oauthAccountLabel} 账号 OAuth 授权。`
@@ -1694,6 +1694,7 @@ function App() {
     setApiServicePortInput(String(settings.apiServicePort));
   };
   const handleSwitchAccount = async (account: ManagedAccount) => {
+    if (isCurrentAccount(account)) return;
     if ((account.status ?? fallbackStatus(account)).state === "unavailable") return;
     if (switchingAccountId) return;
     setSwitchingAccountId(account.id);
@@ -1705,7 +1706,7 @@ function App() {
       setAccountPage(1);
       showNotice("success", switchSuccessMessage(account));
     } catch (error) {
-      showNormalizedError("切换账号失败", error);
+      showNormalizedError("启用账号失败", error);
     } finally {
       setSwitchingAccountId(null);
     }
@@ -2089,7 +2090,7 @@ function App() {
           </button>
           <button className={clsx(activeProvider === "codex" && "active")} onClick={() => handleProviderChange("codex")}>
             <CodexIcon className="provider-nav-icon codex" />
-            <span>Codex</span>
+            <span>ChatGPT</span>
             <b>{counts.codex}</b>
           </button>
           <button className={clsx(activeProvider === "antigravity" && "active")} onClick={() => handleProviderChange("antigravity")}>
@@ -2235,20 +2236,29 @@ function App() {
                           onClick={() => handleSwitchAccount(account)}
                           disabled={
                             switchingAccountId !== null ||
+                            isCurrentAccount(account) ||
                             (account.status ?? fallbackStatus(account)).state === "unavailable"
                           }
                         >
-                          <ArrowRightLeft
-                            size={15}
-                            strokeWidth={1.75}
-                            className={clsx(switchingAccountId === account.id && "spin")}
-                          />
+                          {switchingAccountId === account.id ? (
+                            <LoaderCircle size={15} strokeWidth={1.75} className="spin" />
+                          ) : account.provider === "codex" || account.provider === "antigravity" ? (
+                            <Power
+                              size={15}
+                              strokeWidth={1.75}
+                            />
+                          ) : (
+                            <ArrowRightLeft
+                              size={15}
+                              strokeWidth={1.75}
+                            />
+                          )}
                         </button>
                         {account.provider === "antigravity" && (
                           <button
                             className="icon-button"
-                            aria-label="查看账号明细"
-                            title="查看明细"
+                            aria-label="查看配额详情"
+                            title="查看配额详情"
                             onClick={() => setDetailsAccountId(account.id)}
                           >
                             <Eye size={15} strokeWidth={1.75} />

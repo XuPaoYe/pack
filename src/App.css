@@ -3294,6 +3294,30 @@ textarea:focus {
   display: none;
 }
 
+.account-details-tabs {
+  display: flex;
+  align-items: center;
+  height: 38px;
+  margin: -4px 0 16px;
+  border-bottom: 1px solid var(--surface-line, rgba(15, 23, 42, 0.08));
+}
+
+.account-details-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 38px;
+  padding: 0 4px;
+  border-bottom: 2px solid transparent;
+  color: var(--text-soft);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.account-details-tab.active {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+
 /* dialog 内部的虚拟滚动条不需要 -14px 偏移到容器外，靠右内嵌即可 */
 .account-scrollbar.in-dialog {
   right: 6px;
@@ -3304,12 +3328,6 @@ textarea:focus {
   text-align: center;
   font-size: 13px;
   color: var(--text-soft);
-}
-
-.account-details-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 12px;
 }
 
 .quota-group-list {
@@ -3414,16 +3432,6 @@ textarea:focus {
 .quota-detail-tile.bad .quota-detail-percent {
   background: rgba(239, 68, 68, 0.12);
   color: #b91c1c;
-}
-
-.thinking-budget-pill {
-  justify-self: start;
-  padding: 1px 6px;
-  font-size: 10px;
-  font-family: ui-monospace, "SFMono-Regular", "Menlo", monospace;
-  color: var(--text-soft);
-  background: var(--surface-mute, rgba(15, 23, 42, 0.05));
-  border-radius: 4px;
 }
 
 .quota-detail-bar {

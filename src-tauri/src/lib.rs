@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1703,11 +1703,11 @@ fn codex_subscription_until_from_payload(account: &ManagedAccount) -> Option<Val
 
 async fn refresh_codex_access_token(account: &mut ManagedAccount) -> Result<String, String> {
     let refresh_token =
-        codex_refresh_token(account).ok_or_else(|| "缺少 Codex refresh_token".to_string())?;
+        codex_refresh_token(account).ok_or_else(|| "缺少 ChatGPT refresh_token".to_string())?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("创建 Codex OAuth 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 ChatGPT OAuth 客户端失败: {error}"))?;
     let response = client
         .post(CODEX_OAUTH_TOKEN_URL)
         .json(&serde_json::json!({
@@ -1717,29 +1717,29 @@ async fn refresh_codex_access_token(account: &mut ManagedAccount) -> Result<Stri
         }))
         .send()
         .await
-        .map_err(|error| format!("Codex token 刷新请求失败: {error}"))?;
+        .map_err(|error| format!("ChatGPT token 刷新请求失败: {error}"))?;
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|error| format!("读取 Codex token 刷新响应失败: {error}"))?;
+        .map_err(|error| format!("读取 ChatGPT token 刷新响应失败: {error}"))?;
     if !status.is_success() {
         return Err(format!(
-            "Codex token 刷新失败: status={status}, body_len={}",
+            "ChatGPT token 刷新失败: status={status}, body_len={}",
             body.len()
         ));
     }
     let token_response: OAuthTokenResponse = serde_json::from_str(&body)
-        .map_err(|error| format!("解析 Codex token 刷新响应失败: {error}"))?;
+        .map_err(|error| format!("解析 ChatGPT token 刷新响应失败: {error}"))?;
     if let Some(error) = token_response.error {
         return Err(format!(
-            "Codex token 刷新失败: {}",
+            "ChatGPT token 刷新失败: {}",
             token_response.error_description.unwrap_or(error)
         ));
     }
     let access_token = token_response
         .access_token
-        .ok_or_else(|| "Codex token 刷新响应缺少 access_token".to_string())?;
+        .ok_or_else(|| "ChatGPT token 刷新响应缺少 access_token".to_string())?;
     codex_set_token_field(account, "access_token", Value::String(access_token.clone()));
     if let Some(id_token) = token_response.id_token.or_else(|| codex_id_token(account)) {
         codex_set_token_field(account, "id_token", Value::String(id_token.clone()));
@@ -1986,7 +1986,7 @@ async fn refresh_codex_account_remote_inner(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
         .build()
-        .map_err(|error| format!("创建 Codex API 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 ChatGPT API 客户端失败: {error}"))?;
     refresh_codex_account_identity_remote(account, &client, &mut headers, &mut access_token, allow_rekey)
         .await?;
 
@@ -2795,7 +2795,7 @@ fn parse_auth_json_content(content: &str, source: &str, label: &str) -> ImportRe
         } else {
             failed.push(ImportFailure {
                 label: item_label,
-                reason: "未识别到 Codex / Antigravity 凭证字段".to_string(),
+                reason: "未识别到 ChatGPT / Antigravity 凭证字段".to_string(),
             });
         }
     }
@@ -3146,6 +3146,88 @@ fn start_antigravity_process(target_ide: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+fn antigravity_installed_version() -> Result<String, String> {
+    let executable = antigravity_executable_path(None)
+        .ok_or_else(|| "未找到 Antigravity 可执行文件".to_string())?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let executable_text = executable.to_string_lossy();
+        let app_path = executable_text
+            .find(".app")
+            .map(|index| PathBuf::from(&executable_text[..index + 4]))
+            .unwrap_or(executable);
+        let info = app_path.join("Contents/Info");
+        let output = Command::new("defaults")
+            .arg("read")
+            .arg(info)
+            .arg("CFBundleShortVersionString")
+            .output()
+            .map_err(|error| format!("读取 Antigravity 版本失败: {error}"))?;
+        if output.status.success() {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !version.is_empty() {
+                return Ok(version);
+            }
+        }
+        return Err("Antigravity Info.plist 缺少版本号".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let path = executable.to_string_lossy().replace('\'', "''");
+        let output = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("(Get-Item '{path}').VersionInfo.FileVersion"),
+            ])
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|error| format!("读取 Antigravity 版本失败: {error}"))?;
+        if output.status.success() {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !version.is_empty() {
+                return Ok(version);
+            }
+        }
+        return Err("Antigravity 可执行文件缺少版本号".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let output = Command::new(executable)
+            .arg("--version")
+            .output()
+            .map_err(|error| format!("读取 Antigravity 版本失败: {error}"))?;
+        if output.status.success() {
+            let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !version.is_empty() {
+                return Ok(version);
+            }
+        }
+        return Err("Antigravity --version 未返回版本号".to_string());
+    }
+
+    #[allow(unreachable_code)]
+    Err("当前系统不支持检测 Antigravity 版本".to_string())
+}
+
+fn antigravity_version_uses_system_credential(version: &str) -> bool {
+    version
+        .trim()
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
+fn antigravity_uses_system_credential() -> bool {
+    antigravity_installed_version()
+        .map(|version| antigravity_version_uses_system_credential(&version))
+        .unwrap_or(true)
+}
+
 fn antigravity_storage_dir() -> Result<PathBuf, String> {
     if let Some(user_data_dir) = antigravity_user_data_dir(None) {
         let path = user_data_dir.join("User").join("globalStorage");
@@ -3198,7 +3280,7 @@ fn build_codex_auth_payload(account: &ManagedAccount) -> Result<Value, String> {
         .auth_payload
         .as_ref()
         .and_then(Value::as_object)
-        .ok_or_else(|| "该账号缺少可写入的 Codex 凭证，请重新导入 auth.json".to_string())?;
+        .ok_or_else(|| "该账号缺少可写入的 ChatGPT 凭证，请重新导入 auth.json".to_string())?;
     let tokens = payload.get("tokens").and_then(Value::as_object);
     let api_key = string_field(payload.get("OPENAI_API_KEY"));
     let auth_mode = string_field(payload.get("auth_mode"))
@@ -3227,9 +3309,11 @@ fn build_codex_auth_payload(account: &ManagedAccount) -> Result<Value, String> {
     let mut token_map = serde_json::Map::new();
     token_map.insert("id_token".to_string(), Value::String(id_token));
     token_map.insert("access_token".to_string(), Value::String(access_token));
-    if let Some(refresh_token) = refresh_token {
-        token_map.insert("refresh_token".to_string(), Value::String(refresh_token));
-    }
+    // Codex CLI expects this key to exist even for short-lived access-token-only auth.
+    token_map.insert(
+        "refresh_token".to_string(),
+        Value::String(refresh_token.unwrap_or_default()),
+    );
     if let Some(account_id) = account_id {
         token_map.insert("account_id".to_string(), Value::String(account_id));
     }
@@ -3254,7 +3338,7 @@ fn build_codex_auth_payload(account: &ManagedAccount) -> Result<Value, String> {
 fn write_codex_auth(account: &ManagedAccount) -> Result<(), String> {
     let auth_payload = build_codex_auth_payload(account)?;
     let content = serde_json::to_string_pretty(&auth_payload)
-        .map_err(|error| format!("序列化 Codex auth.json 失败: {error}"))?;
+        .map_err(|error| format!("序列化 ChatGPT auth.json 失败: {error}"))?;
     let codex_home = codex_home_dir()?;
     write_string_atomic(&codex_home.join("auth.json"), &content)?;
     if auth_payload.get("tokens").is_some() {
@@ -3272,6 +3356,41 @@ fn build_codex_keychain_account(base_dir: &Path) -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn read_codex_keychain(base_dir: &Path) -> Result<Option<String>, String> {
+    let account = build_codex_keychain_account(base_dir);
+    let output = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-s")
+        .arg(CODEX_KEYCHAIN_SERVICE)
+        .arg("-a")
+        .arg(account)
+        .arg("-w")
+        .output()
+        .map_err(|error| format!("执行 security 读取 ChatGPT 凭证失败: {error}"))?;
+    if output.status.success() {
+        let content = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Ok((!content.is_empty()).then_some(content));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.code() == Some(44)
+        || stderr.to_ascii_lowercase().contains("could not be found")
+        || stderr.to_ascii_lowercase().contains("errsecitemnotfound")
+    {
+        return Ok(None);
+    }
+    Err(format!(
+        "读取 ChatGPT Keychain 凭证失败: {}",
+        stderr.trim()
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_codex_keychain(_base_dir: &Path) -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
 fn write_codex_keychain(base_dir: &Path, secret: &str) -> Result<(), String> {
     let account = build_codex_keychain_account(base_dir);
     let output = Command::new("security")
@@ -3284,12 +3403,12 @@ fn write_codex_keychain(base_dir: &Path, secret: &str) -> Result<(), String> {
         .arg("-w")
         .arg(secret)
         .output()
-        .map_err(|error| format!("执行 security 写入 Codex Keychain 失败: {error}"))?;
+        .map_err(|error| format!("执行 security 写入 ChatGPT 凭证失败: {error}"))?;
     if output.status.success() {
         return Ok(());
     }
     Err(format!(
-        "写入 Codex Keychain 失败: {}",
+        "写入 ChatGPT 凭证失败: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     ))
 }
@@ -3326,6 +3445,206 @@ fn antigravity_payload_expiry_seconds(account: &ManagedAccount) -> Option<i64> {
                 .or_else(|| token.and_then(|t| number_field(t.get("expires_at"))))
         })
         .or_else(|| account.token_meta.expires_at.map(|value| value / 1000))
+}
+
+fn antigravity_system_credential_payload(account: &ManagedAccount) -> Result<String, String> {
+    #[derive(Serialize)]
+    struct TokenDetails {
+        access_token: String,
+        token_type: String,
+        refresh_token: String,
+        expiry: String,
+    }
+
+    #[derive(Serialize)]
+    struct CredentialPayload {
+        token: TokenDetails,
+        auth_method: String,
+    }
+
+    let access_token = antigravity_payload_string(account, "access_token")
+        .ok_or_else(|| "Antigravity 账号缺少 access_token".to_string())?;
+    let refresh_token = antigravity_payload_string(account, "refresh_token")
+        .ok_or_else(|| "Antigravity 账号缺少 refresh_token".to_string())?;
+    let expiry = antigravity_payload_expiry_seconds(account)
+        .ok_or_else(|| "Antigravity 账号缺少过期时间".to_string())?;
+    let expiry = chrono::DateTime::from_timestamp(expiry, 0)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+
+    serde_json::to_string(&CredentialPayload {
+        token: TokenDetails {
+            access_token,
+            token_type: "Bearer".to_string(),
+            refresh_token,
+            expiry,
+        },
+        auth_method: "consumer".to_string(),
+    })
+    .map_err(|error| format!("序列化 Antigravity 系统凭证失败: {error}"))
+}
+
+fn antigravity_system_credential_refresh_token(raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?.trim();
+    let payload = if let Some(encoded) = text.strip_prefix("go-keyring-base64:") {
+        base64::engine::general_purpose::STANDARD.decode(encoded).ok()?
+    } else {
+        text.as_bytes().to_vec()
+    };
+    let value = serde_json::from_slice::<Value>(&payload).ok()?;
+    value
+        .get("token")
+        .and_then(Value::as_object)
+        .and_then(|token| string_field(token.get("refresh_token")))
+}
+
+#[cfg(target_os = "macos")]
+fn read_antigravity_system_refresh_token() -> Option<String> {
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "gemini",
+            "-a",
+            "antigravity",
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    antigravity_system_credential_refresh_token(&output.stdout)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn read_antigravity_system_refresh_token() -> Option<String> {
+    None
+}
+
+fn reconcile_antigravity_current_account(conn: &Connection) -> Result<(), String> {
+    let Some(refresh_token) = read_antigravity_system_refresh_token() else {
+        return Ok(());
+    };
+    let accounts = read_accounts_from_conn(conn)?;
+    let Some(account_id) = accounts
+        .iter()
+        .find(|account| {
+            account.provider == "antigravity"
+                && antigravity_payload_string(account, "refresh_token").as_deref()
+                    == Some(refresh_token.as_str())
+        })
+        .map(|account| account.id.clone())
+    else {
+        return Ok(());
+    };
+    let already_current = accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .is_some_and(|account| is_current_status(&account.status));
+    if !already_current {
+        set_account_current_state(conn, "antigravity", &account_id)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn write_antigravity_system_credential(account: &ManagedAccount) -> Result<(), String> {
+    let payload = antigravity_system_credential_payload(account)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+    let credential = format!("go-keyring-base64:{encoded}");
+    let output = Command::new("security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-s",
+            "gemini",
+            "-a",
+            "antigravity",
+            "-w",
+            &credential,
+            "-A",
+        ])
+        .output()
+        .map_err(|error| format!("执行 security 写入 Antigravity 凭证失败: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "写入 Antigravity 系统凭证失败: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn write_antigravity_system_credential(account: &ManagedAccount) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct CredentialW {
+        flags: u32,
+        credential_type: u32,
+        target_name: *const u16,
+        comment: *const u16,
+        last_written: FileTime,
+        credential_blob_size: u32,
+        credential_blob: *const u8,
+        persist: u32,
+        attribute_count: u32,
+        attributes: *const std::ffi::c_void,
+        target_alias: *const u16,
+        user_name: *const u16,
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn CredWriteW(credential: *const CredentialW, flags: u32) -> i32;
+    }
+
+    let payload = antigravity_system_credential_payload(account)?;
+    let target = OsStr::new("gemini:antigravity")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let user = OsStr::new("antigravity")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let secret = payload.as_bytes();
+    let credential = CredentialW {
+        flags: 0,
+        credential_type: 1,
+        target_name: target.as_ptr(),
+        comment: ptr::null(),
+        last_written: FileTime { low: 0, high: 0 },
+        credential_blob_size: secret.len() as u32,
+        credential_blob: secret.as_ptr(),
+        persist: 2,
+        attribute_count: 0,
+        attributes: ptr::null(),
+        target_alias: ptr::null(),
+        user_name: user.as_ptr(),
+    };
+    if unsafe { CredWriteW(&credential, 0) } != 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "写入 Antigravity 系统凭证失败: {}",
+        std::io::Error::last_os_error()
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn write_antigravity_system_credential(_account: &ManagedAccount) -> Result<(), String> {
+    Ok(())
 }
 
 fn antigravity_device_profile_from_account(
@@ -3510,7 +3829,7 @@ fn create_antigravity_oauth_info(
     oauth_info
 }
 
-fn create_antigravity_unified_state_entry(sentinel_key: &str, payload: &[u8]) -> String {
+fn create_antigravity_unified_state_entry(sentinel_key: &str, payload: &[u8]) -> Vec<u8> {
     let row = antigravity_encode_string_field(
         1,
         &base64::engine::general_purpose::STANDARD.encode(payload),
@@ -3520,8 +3839,82 @@ fn create_antigravity_unified_state_entry(sentinel_key: &str, payload: &[u8]) ->
         antigravity_encode_len_delim_field(2, &row),
     ]
     .concat();
-    base64::engine::general_purpose::STANDARD
-        .encode(antigravity_encode_len_delim_field(1, &data_entry))
+    antigravity_encode_len_delim_field(1, &data_entry)
+}
+
+fn antigravity_unified_state_entry_key(data: &[u8]) -> Option<&str> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let (tag, new_offset) = antigravity_read_varint(data, offset).ok()?;
+        let wire_type = (tag & 7) as u8;
+        let field_num = (tag >> 3) as u32;
+        if field_num == 1 && wire_type == 2 {
+            let (length, content_offset) = antigravity_read_varint(data, new_offset).ok()?;
+            let end = content_offset.checked_add(length as usize)?;
+            return std::str::from_utf8(data.get(content_offset..end)?).ok();
+        }
+        offset = antigravity_skip_field(data, new_offset, wire_type).ok()?;
+    }
+    None
+}
+
+fn antigravity_remove_unified_state_entry(
+    data: &[u8],
+    target_key: &str,
+) -> Result<Vec<u8>, String> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset < data.len() {
+        let start = offset;
+        let (tag, new_offset) = antigravity_read_varint(data, offset)?;
+        let wire_type = (tag & 7) as u8;
+        let field_num = (tag >> 3) as u32;
+        let next_offset = antigravity_skip_field(data, new_offset, wire_type)?;
+        let should_remove = if field_num == 1 && wire_type == 2 {
+            let (length, content_offset) = antigravity_read_varint(data, new_offset)?;
+            let end = content_offset
+                .checked_add(length as usize)
+                .ok_or_else(|| "Antigravity topic entry 长度溢出".to_string())?;
+            let entry = data
+                .get(content_offset..end)
+                .ok_or_else(|| "Antigravity topic entry 数据不完整".to_string())?;
+            antigravity_unified_state_entry_key(entry) == Some(target_key)
+        } else {
+            false
+        };
+        if !should_remove {
+            result.extend_from_slice(&data[start..next_offset]);
+        }
+        offset = next_offset;
+    }
+    Ok(result)
+}
+
+fn antigravity_replace_unified_state_entry(
+    conn: &Connection,
+    topic_key: &str,
+    sentinel_key: &str,
+    payload: &[u8],
+) -> Result<(), String> {
+    let current = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            params![topic_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("读取 Antigravity {topic_key} 失败: {error}"))?
+        .and_then(|value| base64::engine::general_purpose::STANDARD.decode(value).ok())
+        .unwrap_or_default();
+    let mut topic = antigravity_remove_unified_state_entry(&current, sentinel_key)?;
+    topic.extend(create_antigravity_unified_state_entry(sentinel_key, payload));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(topic);
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+        params![topic_key, encoded],
+    )
+    .map_err(|error| format!("写入 Antigravity {topic_key} 失败: {error}"))?;
+    Ok(())
 }
 
 fn create_antigravity_string_value_payload(value: &str) -> Vec<u8> {
@@ -3544,7 +3937,13 @@ fn write_antigravity_db_state(account: &ManagedAccount, db_path: &Path) -> Resul
     let expiry = antigravity_payload_expiry_seconds(account)
         .ok_or_else(|| "Antigravity 账号缺少过期时间".to_string())?;
     let email = account.email.trim().to_lowercase();
-    let is_gcp_tos = antigravity_payload_bool(account, "is_gcp_tos").unwrap_or(false);
+    let oauth_client_key = antigravity_payload_string(account, "oauth_client_key");
+    let is_personal_account = ["@gmail.com", "@outlook.com", "@hotmail.com", "@qq.com", "@163.com"]
+        .iter()
+        .any(|suffix| email.ends_with(suffix));
+    let is_gcp_tos = antigravity_payload_bool(account, "is_gcp_tos").unwrap_or(false)
+        && !is_personal_account
+        && oauth_client_key.as_deref() != Some(ANTIGRAVITY_OAUTH_CLIENT_KEY);
     let project_id = antigravity_payload_string(account, "antigravity_project_id")
         .or_else(|| antigravity_payload_string(account, "project_id"));
     let id_token = antigravity_payload_string(account, "id_token");
@@ -3568,17 +3967,17 @@ fn write_antigravity_db_state(account: &ManagedAccount, db_path: &Path) -> Resul
         is_gcp_tos,
         id_token.as_deref(),
     );
-    let oauth_entry =
-        create_antigravity_unified_state_entry("oauthTokenInfoSentinelKey", &oauth_info);
-    conn.execute(
-        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
-        params!["antigravityUnifiedStateSync.oauthToken", oauth_entry],
-    )
-    .map_err(|error| format!("写入 Antigravity oauthToken 失败: {error}"))?;
+    antigravity_replace_unified_state_entry(
+        &conn,
+        "antigravityUnifiedStateSync.oauthToken",
+        "oauthTokenInfoSentinelKey",
+        &oauth_info,
+    )?;
 
     let user_status = create_antigravity_user_status_payload(&email);
-    let user_status_entry =
-        create_antigravity_unified_state_entry("userStatusSentinelKey", &user_status);
+    let user_status_entry = base64::engine::general_purpose::STANDARD.encode(
+        create_antigravity_unified_state_entry("userStatusSentinelKey", &user_status),
+    );
     conn.execute(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
         params!["antigravityUnifiedStateSync.userStatus", user_status_entry],
@@ -3591,8 +3990,9 @@ fn write_antigravity_db_state(account: &ManagedAccount, db_path: &Path) -> Resul
         .filter(|value| !value.is_empty())
     {
         let preference_payload = create_antigravity_string_value_payload(project_id);
-        let preference_entry =
-            create_antigravity_unified_state_entry("enterpriseGcpProjectId", &preference_payload);
+        let preference_entry = base64::engine::general_purpose::STANDARD.encode(
+            create_antigravity_unified_state_entry("enterpriseGcpProjectId", &preference_payload),
+        );
         conn.execute(
             "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
             params![
@@ -3663,16 +4063,35 @@ fn write_antigravity_auth(account: &ManagedAccount) -> Result<(), String> {
         close_antigravity_processes(None)?;
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    let storage_dir = antigravity_storage_dir()?;
-    let storage_path = storage_dir.join("storage.json");
-    let db_path = storage_dir.join("state.vscdb");
-    write_antigravity_storage_json(account, &storage_path)?;
-    if db_path.exists() {
+    if antigravity_uses_system_credential() {
+        write_antigravity_system_credential(account)?;
+        if let Ok(storage_dir) = antigravity_storage_dir() {
+            let storage_path = storage_dir.join("storage.json");
+            if storage_path.exists() {
+                let _ = write_antigravity_storage_json(account, &storage_path);
+            }
+        }
+    } else {
+        let storage_dir = antigravity_storage_dir()?;
+        let storage_path = storage_dir.join("storage.json");
+        let db_path = storage_dir.join("state.vscdb");
+        if !db_path.exists() {
+            return Err(format!(
+                "未找到 Antigravity 旧版数据库: {}",
+                db_path.display()
+            ));
+        }
+        write_antigravity_storage_json(account, &storage_path)?;
+        let backup_path = db_path.with_extension("vscdb.backup");
+        std::fs::copy(&db_path, &backup_path).map_err(|error| {
+            format!(
+                "备份 Antigravity state.vscdb 失败 {}: {error}",
+                backup_path.display()
+            )
+        })?;
         write_antigravity_db_state(account, &db_path)?;
     }
-    if was_running {
-        start_antigravity_process(None)?;
-    }
+    start_antigravity_process(None)?;
     Ok(())
 }
 
@@ -3925,7 +4344,7 @@ fn reserve_callback_servers(preferred: Option<u16>) -> Result<(Vec<Server>, u16)
     let detail = last_error
         .map(|error| format!(" ({error})"))
         .unwrap_or_default();
-    Err(format!("OAuth 回调端口 {port} 已被占用。Codex OAuth 必须使用固定端口，请先退出正在占用该端口的应用后重试。{detail}"))
+    Err(format!("OAuth 回调端口 {port} 已被占用。ChatGPT OAuth 必须使用固定端口，请先退出正在占用该端口的应用后重试。{detail}"))
 }
 
 fn ensure_oauth_callback_listener(
@@ -3968,7 +4387,7 @@ fn build_codex_oauth_url(
     state: &str,
 ) -> Result<String, String> {
     let mut url = Url::parse(CODEX_OAUTH_AUTH_URL)
-        .map_err(|error| format!("构建 Codex OAuth URL 失败: {error}"))?;
+        .map_err(|error| format!("构建 ChatGPT OAuth URL 失败: {error}"))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", CODEX_OAUTH_CLIENT_ID)
@@ -3992,7 +4411,7 @@ async fn exchange_codex_oauth_code(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|error| format!("创建 Codex OAuth 客户端失败: {error}"))?;
+        .map_err(|error| format!("创建 ChatGPT OAuth 客户端失败: {error}"))?;
     let response = client
         .post(CODEX_OAUTH_TOKEN_URL)
         .form(&[
@@ -4004,12 +4423,12 @@ async fn exchange_codex_oauth_code(
         ])
         .send()
         .await
-        .map_err(|error| format!("Codex OAuth token 请求失败: {error}"))?;
+        .map_err(|error| format!("ChatGPT OAuth token 请求失败: {error}"))?;
     let status = response.status();
     let body = response
         .text()
         .await
-        .map_err(|error| format!("读取 Codex OAuth token 响应失败: {error}"))?;
+        .map_err(|error| format!("读取 ChatGPT OAuth token 响应失败: {error}"))?;
     if !status.is_success() {
         let preview = body
             .chars()
@@ -4017,16 +4436,16 @@ async fn exchange_codex_oauth_code(
             .collect::<String>()
             .replace(['\n', '\r'], " ");
         return Err(format!(
-            "Codex OAuth token 交换失败: status={status}, body_len={}, body_preview={preview}",
+            "ChatGPT OAuth token 交换失败: status={status}, body_len={}, body_preview={preview}",
             body.len(),
         ));
     }
     let token_response: Value = serde_json::from_str(&body)
-        .map_err(|error| format!("解析 Codex OAuth token 响应失败: {error}"))?;
+        .map_err(|error| format!("解析 ChatGPT OAuth token 响应失败: {error}"))?;
     let id_token = string_field(token_response.get("id_token"))
-        .ok_or_else(|| "Codex OAuth 响应缺少 id_token".to_string())?;
+        .ok_or_else(|| "ChatGPT OAuth 响应缺少 id_token".to_string())?;
     let access_token = string_field(token_response.get("access_token"))
-        .ok_or_else(|| "Codex OAuth 响应缺少 access_token".to_string())?;
+        .ok_or_else(|| "ChatGPT OAuth 响应缺少 access_token".to_string())?;
     let mut tokens = serde_json::Map::new();
     tokens.insert("id_token".to_string(), Value::String(id_token));
     tokens.insert("access_token".to_string(), Value::String(access_token));
@@ -4243,6 +4662,7 @@ fn start_window_drag(window: tauri::Window) -> Result<(), String> {
 fn list_accounts(app: tauri::AppHandle) -> Result<Vec<ManagedAccount>, String> {
     let conn = open_app_db(&app)?;
     enforce_single_current_account(&conn)?;
+    reconcile_antigravity_current_account(&conn)?;
     read_accounts_from_conn(&conn).map(accounts_for_frontend)
 }
 
@@ -4385,15 +4805,28 @@ fn delete_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<Manage
 
 #[tauri::command]
 #[allow(non_snake_case)]
-fn switch_account(app: tauri::AppHandle, accountId: String) -> Result<Vec<ManagedAccount>, String> {
-    let conn = open_app_db(&app)?;
-    let account = load_account_from_db(&conn, &accountId)?;
+async fn switch_account(
+    app: tauri::AppHandle,
+    accountId: String,
+) -> Result<Vec<ManagedAccount>, String> {
+    let mut account = {
+        let conn = open_app_db(&app)?;
+        load_account_from_db(&conn, &accountId)?
+    };
     match account.provider.as_str() {
         "codex" => write_codex_auth(&account)?,
-        "antigravity" => write_antigravity_auth(&account)?,
+        "antigravity" => {
+            refresh_antigravity_account_remote(&mut account).await?;
+            let written = upsert_existing_accounts_into_db(&app, &[account.clone()])?;
+            if written.is_empty() {
+                return Err("账号已被删除，无法启用".to_string());
+            }
+            write_antigravity_auth(&account)?;
+        }
         "superai" => return Err("SuperAI 账号切换功能已移除".to_string()),
         other => return Err(format!("不支持的账号类型: {other}")),
     }
+    let conn = open_app_db(&app)?;
     set_account_current_state(&conn, &account.provider, &account.id).map(accounts_for_frontend)
 }
 
@@ -4585,17 +5018,30 @@ fn apply_provider_hint(content: &str, provider_hint: Option<&str>) -> Option<Str
 
 #[tauri::command]
 fn import_codex_from_local(app: tauri::AppHandle) -> Result<ImportResult, String> {
-    let auth_path = codex_home_dir()?.join("auth.json");
-    if !auth_path.exists() {
-        return Err("未找到 ~/.codex/auth.json 文件".to_string());
-    }
+    let codex_home = codex_home_dir()?;
+    let auth_path = codex_home.join("auth.json");
+    let keychain_content = match read_codex_keychain(&codex_home) {
+        Ok(content) => content,
+        Err(_) if auth_path.exists() => None,
+        Err(error) => return Err(error),
+    };
+    let (content, from_keychain) = if let Some(content) = keychain_content {
+        (content, true)
+    } else if auth_path.exists() {
+        (read_to_string(&auth_path)?, false)
+    } else {
+        return Err("未找到 ChatGPT Keychain 凭证或 ~/.codex/auth.json 文件".to_string());
+    };
 
-    let content = read_to_string(&auth_path)?;
-    let mut result = parse_auth_json_content(&content, "local", "Codex 本机账号");
+    let mut result = parse_auth_json_content(&content, "local", "ChatGPT 本机账号");
+    if result.imported.is_empty() && from_keychain && auth_path.exists() {
+        let fallback_content = read_to_string(&auth_path)?;
+        result = parse_auth_json_content(&fallback_content, "local", "ChatGPT 本机账号");
+    }
     if result.imported.is_empty() {
         result.failed = vec![ImportFailure {
-            label: "Codex 本机账号".to_string(),
-            reason: "auth.json 缺少可导入的 Codex 登录信息".to_string(),
+            label: "ChatGPT 本机账号".to_string(),
+            reason: "本机凭证缺少可导入的 ChatGPT 登录信息".to_string(),
         }];
         return Ok(result);
     }
@@ -4640,7 +5086,7 @@ fn start_codex_oauth(app: tauri::AppHandle) -> Result<OAuthStartResult, String> 
         login_id,
         provider: "codex".to_string(),
         command: auth_url.clone(),
-        message: "已启动 Codex OAuth，完成浏览器授权后会自动添加。".to_string(),
+        message: "已启动 ChatGPT OAuth，完成浏览器授权后会自动添加。".to_string(),
         auth_url: Some(auth_url),
     })
 }
@@ -4661,11 +5107,11 @@ async fn complete_codex_oauth(
             });
         };
         if pending.provider != "codex" {
-            return Err("无效的 Codex OAuth 会话".to_string());
+            return Err("无效的 ChatGPT OAuth 会话".to_string());
         }
         if pending.expires_at <= now_ts() {
             guard.remove(&login_id);
-            return Err("Codex OAuth 登录已超时，请重新发起授权".to_string());
+            return Err("ChatGPT OAuth 登录已超时，请重新发起授权".to_string());
         }
         if pending.code_consumed {
             return Ok(ImportResult {
@@ -4682,7 +5128,7 @@ async fn complete_codex_oauth(
         let code_verifier = pending
             .code_verifier
             .clone()
-            .ok_or_else(|| "Codex OAuth 会话缺少 code_verifier".to_string())?;
+            .ok_or_else(|| "ChatGPT OAuth 会话缺少 code_verifier".to_string())?;
         pending.code_consumed = true;
         (code, code_verifier, pending.port)
     };
@@ -4698,7 +5144,7 @@ async fn complete_codex_oauth(
             return Err(error);
         }
     };
-    let mut result = parse_auth_json_content(&payload.to_string(), "oauth", "Codex OAuth");
+    let mut result = parse_auth_json_content(&payload.to_string(), "oauth", "ChatGPT OAuth");
     for account in &mut result.imported {
         if account.provider == "codex" {
             let mut access_token = match codex_access_token(account) {
@@ -5195,6 +5641,26 @@ mod tests {
     }
 
     #[test]
+    fn codex_auth_payload_keeps_empty_refresh_token_key() {
+        let account = ManagedAccount {
+            auth_payload: Some(serde_json::json!({
+                "tokens": {
+                    "id_token": "id-token",
+                    "access_token": "access-token"
+                }
+            })),
+            ..test_account("codex-a", "codex", "a@example.com", 10)
+        };
+
+        let payload = build_codex_auth_payload(&account).expect("build auth payload");
+
+        assert_eq!(
+            payload.pointer("/tokens/refresh_token").and_then(Value::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
     fn codex_headers_allow_missing_account_id() {
         let headers = codex_api_headers("access-token", None).unwrap();
 
@@ -5229,6 +5695,59 @@ mod tests {
         assert_eq!(quota.last_updated, existing.last_updated);
         assert_eq!(quota.metrics[0].reset_at, existing.metrics[0].reset_at);
         assert_eq!(quota.error.as_deref(), Some("刷新失败"));
+    }
+
+    #[test]
+    fn antigravity_unified_topic_replaces_only_target_entry() {
+        let keep = create_antigravity_unified_state_entry("keep", b"keep-payload");
+        let replace = create_antigravity_unified_state_entry("replace", b"old-payload");
+        let topic = [keep.clone(), replace].concat();
+
+        let mut updated =
+            antigravity_remove_unified_state_entry(&topic, "replace").expect("remove entry");
+        updated.extend(create_antigravity_unified_state_entry(
+            "replace",
+            b"new-payload",
+        ));
+
+        assert!(updated.starts_with(&keep));
+        assert_ne!(updated, topic);
+        let cleaned = antigravity_remove_unified_state_entry(&updated, "replace")
+            .expect("remove replaced entry");
+        assert_eq!(cleaned, keep);
+    }
+
+    #[test]
+    fn antigravity_system_credential_parser_accepts_macos_and_windows_formats() {
+        let payload = serde_json::json!({
+            "token": {
+                "access_token": "access-secret",
+                "refresh_token": "refresh-secret",
+                "expiry": "2026-07-10T00:00:00.000000Z"
+            },
+            "auth_method": "consumer"
+        })
+        .to_string();
+        let macos = format!(
+            "go-keyring-base64:{}",
+            base64::engine::general_purpose::STANDARD.encode(payload.as_bytes())
+        );
+
+        assert_eq!(
+            antigravity_system_credential_refresh_token(payload.as_bytes()).as_deref(),
+            Some("refresh-secret")
+        );
+        assert_eq!(
+            antigravity_system_credential_refresh_token(macos.as_bytes()).as_deref(),
+            Some("refresh-secret")
+        );
+    }
+
+    #[test]
+    fn antigravity_version_selects_one_credential_backend() {
+        assert!(!antigravity_version_uses_system_credential("1.99.0"));
+        assert!(antigravity_version_uses_system_credential("2.0.0"));
+        assert!(antigravity_version_uses_system_credential("2.2.1"));
     }
 
     #[test]

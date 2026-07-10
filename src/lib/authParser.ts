@@ -750,7 +750,7 @@ export function parseAuthJson(content: string, source: ImportSource, label = "JS
     if (account) {
       imported.push(account);
     } else {
-      failed.push({ label: itemLabel, reason: "未识别到 Codex / Antigravity 凭证字段" });
+      failed.push({ label: itemLabel, reason: "未识别到 ChatGPT / Antigravity 凭证字段" });
     }
   });
 

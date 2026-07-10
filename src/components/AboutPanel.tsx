@@ -19,7 +19,7 @@ export function AboutPanelBody({ appName, isPublicBuild, aboutInfo, onOpenStore 
           <img className="about-icon" src={logoUrl} alt="" draggable={false} />
           <div>
             <strong>{aboutInfo?.name ?? appName}</strong>
-            <p>本地 Codex / Antigravity / {appName} 账号管理</p>
+            <p>本地 ChatGPT / Antigravity / {appName} 账号管理</p>
           </div>
         </div>
       </section>
